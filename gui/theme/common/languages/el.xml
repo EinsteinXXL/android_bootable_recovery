@@ -165,6 +165,10 @@
         <string name="part_used">Χρησιμοποιούνται: %tw_partition_used%MB</string>
         <string name="part_free">Ελεύθερα: %tw_partition_free%MB</string>
         <string name="part_backup_size">Μέγεθος αντιγράφου ασφαλείας: %tw_partition_backup_size% MB</string>
+        <string name="part_size_kb">Μέγεθος: %tw_partition_size%KB</string>
+        <string name="part_used_kb">Χρησιμοποιούνται: %tw_partition_used%KB</string>
+        <string name="part_free_kb">Ελεύθερα: %tw_partition_free%KB</string>
+        <string name="part_backup_size_kb">Μέγεθος αντιγράφου ασφαλείας: %tw_partition_backup_size% KB</string>
         <string name="resize_btn">Αλλαγή μεγέθους του Αρχείου Συστήματος</string>
         <string name="resize_btn_s">Αλλαγή μεγέθους</string>
         <string name="resize_confirm">Αλλαγή μεγέθους %tw_partition_name%;</string>
@@ -606,7 +610,7 @@
         <string name="compression_on">Η συμπίεση είναι ενεργή</string>
         <string name="digest_off" version="2">Η δημιουργία Digest είναι απενεργοποιημένη</string>
         <string name="backup_fail">Η δημιουργία Αντίγραφου Ασφαλείας απέτυχε</string>
-        <string name="backup_clean">Η δημιουργία Αντίγρ. Ασφαλ. απέτυχε. Εκκαθάριση φακέλου.</string>
+        <string name="backup_error_clean">Η δημιουργία Αντίγρ. Ασφαλ. απέτυχε. Εκκαθάριση φακέλου.</string>
         <string name="running_recovery_commands">Εκτέλεση Eντολών Recovery</string>
         <string name="recovery_commands_complete">Οι Εντολές Recovery Ολοκληρώθηκαν</string>
         <string name="running_ors">Εκτέλεση OpenRecoveryScript</string>
@@ -664,5 +668,17 @@
         <string name="partition_not_found">διαδρομή: {1} δεν βρέθηκε στην λίστα τομέων</string>
         <string name="copy_kernel_log">Το log του kernel αντιγράφηκε στο {1}</string>
         <string name="include_kernel_log">Εισαγωγή Kernel Log</string>
-    </resources>
+    		<string name="adbbu_preparing">Preparing ADB backup mode...</string>
+		<string name="adbbu_ready">ADB backup mode ready. On the PC you can now run your backup or restore as usual with 'adb backup/restore'.</string>
+		<string name="adbbu_idle_hint">If no backup/restore follows, this mode turns off automatically after {1} minutes.</string>
+		<string name="adbbu_stopped">ADB backup mode stopped. Default ADB was restored.</string>
+		<string name="adbbu_stopped_timeout">ADB backup mode was stopped after timeout ({1} min). Default ADB was restored.</string>
+		<string name="adbbu_cancel_mode">Cancelling ADB backup mode...</string>
+		<string name="adbbu_stock_refused">Direct 'adb backup/restore' is disabled here: stock adbd uses a freeze-prone PTY. On the PC run:  adb shell adbbu start  then retry your backup/restore.</string>
+		<string name="adbbu_read_ab_hdr">Reading Backup</string>
+		<string name="adbbu_read_ab">Reading ADB backup file. Please wait...</string>
+		<string name="adbbu_read_ab_done">...Done.</string>
+		<string name="adbbu_invalid_ab">Unable to read the ADB backup header of '{1}'. The backup file is corrupt.</string>
+		<string name="verbose_log_chk">Enable verbose log (log all file/folder names)</string>
+</resources>
 </language>

@@ -45,7 +45,83 @@
 
 #include "android_utils.h"
 
-const unsigned long long progress_size = (unsigned long long)(T_BLOCKSIZE);
+#include <sys/resource.h>   /* fd ring: getrlimit/setrlimit */
+#include <stdlib.h>         /* fd ring: malloc/free */
+
+/* sync_file_range is declared in bionic <fcntl.h> only under _GNU_SOURCE; libtar builds C99.
+ * _GNU_SOURCE globally would be RISKY here (would pull GNU basename/dirname instead of POSIX --
+ * extract.c uses dirname()). So declare it manually: the symbol exists in libc (__INTRODUCED_IN(26),
+ * hotdog API 30); the SYNC_FILE_RANGE_* macros are unconditionally in <fcntl.h> (only the function
+ * is gated). Signature exactly as in bionic. */
+extern ssize_t sync_file_range(int fd, off64_t offset, off64_t nbytes, unsigned int flags);
+
+/* ---------------------------------------------------------------------------
+ * fd ring (restore write side) -- "defer instead of wait".
+ * Do NOT close extracted fds immediately, keep them in a ring -> when they fall
+ * out the file is written back (clean) -> posix_fadvise64(DONTNEED) REALLY drops
+ * it (instead of fizzling at close because smallfiles are still dirty).
+ * Per-segment (fresh per tar_open, drained at tar_close). File-based restore
+ * only; ADB -> fd_ring=NULL -> old behavior; dd-image/super never go through
+ * tar_extract_regfile. Cleanup net = the worker's _exit invariant (the kernel
+ * closes the fds).
+ * --------------------------------------------------------------------------- */
+
+/* Ring entry with deferred FADV+close: evict the oldest when full, then push fd. */
+static void fd_ring_push(TAR *t, int fd)
+{
+	if (t->fd_ring_count == t->fd_ring_cap)
+	{
+		int old = t->fd_ring[t->fd_ring_head];
+		posix_fadvise64(old, 0, 0, POSIX_FADV_DONTNEED);   /* now clean -> really drops */
+		close(old);
+		t->fd_ring_head = (t->fd_ring_head + 1) % t->fd_ring_cap;
+		t->fd_ring_count--;
+	}
+	t->fd_ring[(t->fd_ring_head + t->fd_ring_count) % t->fd_ring_cap] = fd;
+	t->fd_ring_count++;
+}
+
+/* Raise RLIMIT_NOFILE to hard (free, no privilege) + allocate the ring. A malloc
+ * failure -> fd_ring stays NULL -> old posix_fadvise64+close in tar_extract_regfile (safe). */
+void fd_ring_setup(TAR *t, int cap)
+{
+	struct rlimit rl;
+	if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max)
+	{
+		rl.rlim_cur = rl.rlim_max;
+		setrlimit(RLIMIT_NOFILE, &rl);
+	}
+	t->fd_ring = (int *) malloc((size_t)cap * sizeof(int));
+	if (t->fd_ring == NULL)
+		return;
+	t->fd_ring_cap   = cap;
+	t->fd_ring_count = 0;
+	t->fd_ring_head  = 0;
+}
+
+/* FADV+close + free all remaining ring fds. On ALL extractTar return paths
+ * before tar_close. NULL-safe; a double close (drain + later _exit) is harmless (EBADF). */
+void fd_ring_drain(TAR *t)
+{
+	int i;
+	if (t->fd_ring == NULL)
+		return;
+	for (i = 0; i < t->fd_ring_count; i++)
+	{
+		int fd = t->fd_ring[(t->fd_ring_head + i) % t->fd_ring_cap];
+		posix_fadvise64(fd, 0, 0, POSIX_FADV_DONTNEED);
+		close(fd);
+	}
+	free(t->fd_ring);
+	t->fd_ring       = NULL;
+	t->fd_ring_count = 0;
+	t->fd_ring_cap   = 0;
+	t->fd_ring_head  = 0;
+}
+
+/* No global progress_size here: tar_extract_regfile() computes the chunk size
+   per aggregate write and sends it as a byte count to the progress pipe, which
+   avoids a 512-byte progress-write syscall per extracted tar block. */
 
 static int
 tar_set_file_perms(TAR *t, const char *realname)
@@ -175,7 +251,7 @@ tar_extract_file(TAR *t, const char *realname, const char *prefix, const int *pr
 
 	if((t->options & TAR_STORE_POSIX_CAP) && t->th_buf.has_cap_data)
 	{
-#if 1 //def DEBUG
+#ifdef DEBUG
 		printf("tar_extract_file(): restoring posix capabilities to file %s\n", realname);
 		print_caps(&t->th_buf.cap_data);
 #endif
@@ -205,14 +281,27 @@ tar_extract_file(TAR *t, const char *realname, const char *prefix, const int *pr
 }
 
 
-/* extract regular file */
+/* extract regular file
+ *
+ * Reads tar blocks into a TAR_DATA_BUF_SIZE-sized aggregate buffer and writes
+ * them with one write() per chunk to the output fd. Short-read tolerance does
+ * NOT come from this loop but from the tartype_t readfunc (tar_io_read in
+ * block.c): each tar_block_read() demands exactly T_BLOCKSIZE; this loop only
+ * aggregates blocks into bundled writes. The progress pipe gets the actual
+ * payload byte count per chunk, so the parent accumulation stays correct.
+ *
+ * The buffer is static: in the fork() model each pipe is its own process, so
+ * there is no reentrancy problem; it saves the 128-KB stack allocation per call.
+ * Additionally __thread-qualified -- consistent with basename.c / dirname.c.
+ * Unchanged in the fork() model (1 slot/process) but robust if libtar is ever
+ * called from a thread context.
+ */
 int
 tar_extract_regfile(TAR *t, const char *realname, const int *progress_fd)
 {
-	int64_t size, i;
-	ssize_t k;
+	int64_t size, remaining;
 	int fdout;
-	char buf[T_BLOCKSIZE];
+	static __thread char buf[TAR_DATA_BUF_SIZE];
 	const char *filename;
 	char *pn;
 
@@ -233,8 +322,13 @@ tar_extract_regfile(TAR *t, const char *realname, const int *progress_fd)
 	if (mkdirhier(dirname(filename)) == -1)
 		return -1;
 
-	printf("  ==> extracting: %s (file size %" PRId64 " bytes)\n",
-			filename, size);
+	/* Privacy log (tw_verbose_log): success print per entry only with
+	 * TAR_TW_VERBOSE_LOG (applies to all "==> extracting" prints in this file);
+	 * error paths (fprintf(stderr)/failed prints) still log the name
+	 * unconditionally. */
+	if (t->options & TAR_TW_VERBOSE_LOG)
+		printf("  ==> extracting: %s (file size %" PRId64 " bytes)\n",
+				filename, size);
 
 	fdout = open(filename, O_WRONLY | O_CREAT | O_TRUNC
 #ifdef O_BINARY
@@ -249,35 +343,114 @@ tar_extract_regfile(TAR *t, const char *realname, const int *progress_fd)
 		return -1;
 	}
 
-	/* extract the file */
-	for (i = size; i > 0; i -= T_BLOCKSIZE)
+	/* extract the file -- 128 KB aggregate chunks (per Sec. 8.7) */
+	/* TWRP restore output cache trim: otherwise the extracted files are NEVER
+	 * dropped from the page cache -> the cache grows to the RAM limit during
+	 * restore. Trim large files every 128 MB inline (via output_trim_cb ->
+	 * TWFunc::Trim_Output_Cache; the worker writes fdout sequentially itself ->
+	 * lseek64 = the write position); small files via FADV_DONTNEED at close (no sync). */
+	off64_t out_trim   = 0;   /* in-file trim offset (per extracted file) */
+	int64_t since_trim = 0;   /* bytes written since the last in-file trim */
+	remaining = size;
+	while (remaining > 0)
 	{
-		k = tar_block_read(t, buf);
-		if (k != T_BLOCKSIZE)
+		/* Fill buffer: up to TAR_DATA_BUF_SIZE / T_BLOCKSIZE blocks (= 256) */
+		ssize_t blocks_to_fill = (remaining > (int64_t)TAR_DATA_BUF_SIZE)
+		                          ? (TAR_DATA_BUF_SIZE / T_BLOCKSIZE)
+		                          : (ssize_t)((remaining + T_BLOCKSIZE - 1) / T_BLOCKSIZE);
+		/* ONE robust read per chunk instead of blocks_to_fill x 512 B. The readfunc
+		 * (= tar_io_read, block.c) fills up to chunk or a real EOF -- saves up to 255
+		 * read() syscalls per 128-KB chunk on the restore pipe (data path; headers
+		 * stay 512 B via th_read). chunk = blocks_to_fill*512 <= TAR_DATA_BUF_SIZE (no
+		 * overflow of buf). errno semantics unchanged: EINVAL on truncation (got>=0),
+		 * readfunc errno on -1. */
+		ssize_t chunk = blocks_to_fill * T_BLOCKSIZE;
+		ssize_t got = (*(t->type->readfunc))(t->fd, buf, (size_t)chunk);
+		if (got != chunk)
 		{
-			if (k != -1)
+			if (got != -1)
 				errno = EINVAL;
 			close(fdout);
 			return -1;
 		}
 
-		/* write block to output file */
-		if (write(fdout, buf,
-			  ((i > T_BLOCKSIZE) ? T_BLOCKSIZE : i)) == -1)
+		/* Padding-correction: tar pads the last block of a file to T_BLOCKSIZE
+		   with zero bytes; we must not write that padding to the output file. */
+		ssize_t to_write = (chunk > remaining) ? (ssize_t)remaining : chunk;
+
+		/* Robust tar_io_write instead of bare write -- EINTR- and partial-write-safe
+		   (symmetric to the backup side, which already uses tar_io_write in
+		   tar_append_regfile). tar_io_write returns count on success / -1 on a real
+		   error -> the (!= to_write) comparison is unchanged; ENOSPC/EIO still run
+		   into the return -1 path. */
+		if (tar_io_write(fdout, buf, to_write) != to_write)
 		{
+			/* write() partial or -1 -- ENOSPC, EIO etc. Error handling in caller. */
 			close(fdout);
 			return -1;
 		}
-		else
+
+		if (progress_fd != NULL && *progress_fd != 0)
 		{
-			if (*progress_fd != 0)
-				write(*progress_fd, &progress_size, sizeof(progress_size));
+			unsigned long long ps = (unsigned long long)to_write;
+			write(*progress_fd, &ps, sizeof(ps));
+		}
+
+		remaining -= to_write;
+
+		/* In-file trim for LARGE files every 128 MB (self-paced in TWFunc: trims only
+		 * when fdout has grown >= 128 MB since out_trim). For small files this never
+		 * fires -> only the FADV at close below. */
+		since_trim += to_write;
+		if (since_trim >= (128LL << 20) && t->output_trim_cb)
+		{
+			t->output_trim_cb(fdout, &out_trim);
+			since_trim = 0;
+		}
+		/* Part 2: .win input trim, 128-MB-gated (symmetric to the backup
+		 * tar_append_regfile). The counter is cumulative over files (TAR struct) ->
+		 * covers smallfile streams too. RAW (input_fd<=0): the .win IS t->fd, the
+		 * worker reads it itself -> counter-based FADV (no lseek, like the backup).
+		 * Pipeline (input_fd>0): zstd/aes reads the .win via the shared OFD -> ONE
+		 * lseek64 at the gate (only ~every 128 MB -> no f_pos_lock contention) gives
+		 * the real read head. FADV-only (read pages clean, no sync). */
+		t->input_since += to_write;
+		if (t->input_since >= (128LL << 20))
+		{
+			if (t->input_fd > 0)
+			{
+				off64_t pos = lseek64(t->input_fd, 0, SEEK_CUR);
+				if (pos > t->input_trim_off)
+				{
+					posix_fadvise64(t->input_fd, t->input_trim_off, pos - t->input_trim_off, POSIX_FADV_DONTNEED);
+					t->input_trim_off = pos;
+				}
+			}
+			else
+			{
+				posix_fadvise64(t->fd, t->input_trim_off, t->input_since, POSIX_FADV_DONTNEED);
+				t->input_trim_off += t->input_since;
+			}
+			t->input_since = 0;
 		}
 	}
 
-	/* close output file */
-	if (close(fdout) == -1)
-		return -1;
+	/* fd ring: when active (not ADB), do NOT close fdout immediately -- start an
+	 * async writeback and put it in the ring; FADV+close happens deferred when it
+	 * falls out (then clean -> really drops, instead of fizzling at close because
+	 * smallfiles are dirty). Ring off (ADB/alloc error) -> old behavior: per-file
+	 * FADV (WITHOUT sync) + close. */
+	if (t->fd_ring != NULL)
+	{
+		sync_file_range(fdout, 0, 0, SYNC_FILE_RANGE_WRITE);   /* async, NO wait */
+		fd_ring_push(t, fdout);
+	}
+	else
+	{
+		posix_fadvise64(fdout, 0, 0, POSIX_FADV_DONTNEED);
+		if (close(fdout) == -1)
+			return -1;
+	}
 
 #ifdef DEBUG
 	printf("### done extracting %s\n", filename);
@@ -324,9 +497,17 @@ tar_extract_hardlink(TAR * t, const char *realname, const char *prefix)
 	const char *filename;
 	char *pn;
 	char *linktgt = NULL;
-	char *newtgt = NULL;
 	char *lnp;
 	libtar_hashptr_t hp;
+	/* Local buffer for the prefix-joined link target. Replaces upstream
+	 * libtar's `strdup(linktgt) + sprintf(linktgt, ...)` pattern, which
+	 * (a) mutated either the fixed 100-byte th_buf.linkname field or the
+	 * gnu_longlink heap buffer in-place — unbounded write, classic
+	 * upstream buffer-overflow — and (b) corrupted hash-stored realnames
+	 * when the same target was re-used by multiple hardlinks. We build
+	 * the joined path here, no longer touch upstream storage, and warn
+	 * on MAXPATHLEN truncation. Upstream-bug in twrp-original-ref. */
+	char joined[MAXPATHLEN];
 
 	if (!TH_ISLNK(t))
 	{
@@ -350,14 +531,31 @@ tar_extract_hardlink(TAR * t, const char *realname, const char *prefix)
 	else
 		linktgt = th_get_linkname(t);
 
-	newtgt = strdup(linktgt);
-	sprintf(linktgt, "%s/%s", prefix, newtgt);
+	/* Slash-normalising join into a bounded local buffer. Exact truncation
+	 * detection via snprintf return value inside libtar_path_join (no more
+	 * length heuristic — the previous `need = prefix_len+1+link_len+1`
+	 * estimator could false-positive when libtar_path_join collapsed
+	 * adjacent slashes, and false-negative was impossible only because the
+	 * estimator was strictly conservative). Soft-fail on truncation, same
+	 * style as the link()-failure branch below. */
+	if (libtar_path_join(joined, sizeof(joined), prefix, linktgt) != 0)
+	{
+		fprintf(stderr,
+		        "tar_extract_hardlink(): joined link target truncated "
+		        "(cap %zu B); link to '%s' skipped\n",
+		        sizeof(joined), filename);
+		t->hardlink_fail_count++;
+		return 0;
+	}
+	linktgt = joined;
 
-	printf("  ==> extracting: %s (link to %s)\n", filename, linktgt);
+	if (t->options & TAR_TW_VERBOSE_LOG)
+		printf("  ==> extracting: %s (link to %s)\n", filename, linktgt);
 
 	if (link(linktgt, filename) == -1)
 	{
 		fprintf(stderr, "tar_extract_hardlink(): failed restore of hardlink '%s' but returning as if nothing bad happened\n", filename);
+		t->hardlink_fail_count++;
 		return 0; // Used to be -1
 	}
 
@@ -386,8 +584,9 @@ tar_extract_symlink(TAR *t, const char *realname)
 	if (unlink(filename) == -1 && errno != ENOENT)
 		return -1;
 
-	printf("  ==> extracting: %s (symlink to %s)\n",
-	       filename, th_get_linkname(t));
+	if (t->options & TAR_TW_VERBOSE_LOG)
+		printf("  ==> extracting: %s (symlink to %s)\n",
+		       filename, th_get_linkname(t));
 
 	if (symlink(th_get_linkname(t), filename) == -1)
 	{
@@ -425,8 +624,9 @@ tar_extract_chardev(TAR *t, const char *realname)
 	if (mkdirhier(dirname(filename)) == -1)
 		return -1;
 
-	printf("  ==> extracting: %s (character device %ld,%ld)\n",
-	       filename, devmaj, devmin);
+	if (t->options & TAR_TW_VERBOSE_LOG)
+		printf("  ==> extracting: %s (character device %ld,%ld)\n",
+		       filename, devmaj, devmin);
 
 	if (mknod(filename, mode | S_IFCHR,
 		  compat_makedev(devmaj, devmin)) == -1)
@@ -463,8 +663,9 @@ tar_extract_blockdev(TAR *t, const char *realname)
 	if (mkdirhier(dirname(filename)) == -1)
 		return -1;
 
-	printf("  ==> extracting: %s (block device %ld,%ld)\n",
-	       filename, devmaj, devmin);
+	if (t->options & TAR_TW_VERBOSE_LOG)
+		printf("  ==> extracting: %s (block device %ld,%ld)\n",
+		       filename, devmaj, devmin);
 
 	if (mknod(filename, mode | S_IFBLK,
 		  compat_makedev(devmaj, devmin)) == -1)
@@ -496,8 +697,9 @@ tar_extract_dir(TAR *t, const char *realname)
 	if (mkdirhier(dirname(filename)) == -1)
 		return -1;
 
-	printf("  ==> extracting: %s (mode %04o, directory)\n", filename,
-	       mode);
+	if (t->options & TAR_TW_VERBOSE_LOG)
+		printf("  ==> extracting: %s (mode %04o, directory)\n", filename,
+		       mode);
 
 	if (mkdir(filename, mode) == -1)
 	{
@@ -510,13 +712,15 @@ tar_extract_dir(TAR *t, const char *realname)
 #endif
 				return -1;
 			}
-			else
-			{
-#if 1 //def DEBUG
-				puts("  *** using existing directory");
+#ifdef DEBUG
+			puts("  *** using existing directory -- applying stored metadata");
 #endif
-				return 1;
-			}
+			// Fall-through: the TAR_STORE_ANDROID_USER_XATTR setters and the fscrypt
+			// block must run for already-existing directories too, otherwise
+			// policy/xattrs are lost on a cross-pipe DIR race (pipe X creates the
+			// parent dir via mkdirhier() from tar_extract_regfile(), pipe Y later
+			// processes the DIR entry and without this would hit EEXIST + return 1
+			// before the setter block).
 		}
 		else
 		{
@@ -530,7 +734,7 @@ tar_extract_dir(TAR *t, const char *realname)
 	if (t->options & TAR_STORE_ANDROID_USER_XATTR)
 	{
 		if (t->th_buf.has_user_default) {
-#if 1 //def DEBUG
+#ifdef DEBUG
 			printf("tar_extract_file(): restoring android user.default xattr to %s\n", realname);
 #endif
 			if (setxattr(realname, "user.default", NULL, 0, 0) < 0) {
@@ -539,14 +743,14 @@ tar_extract_dir(TAR *t, const char *realname)
 			}
 		}
 		if (t->th_buf.has_user_cache) {
-#if 1 //def DEBUG
+#ifdef DEBUG
 			printf("tar_extract_file(): restoring android user.inode_cache xattr to %s\n", realname);
 #endif
 			if (write_path_inode(realname, "cache", "user.inode_cache"))
 				return -1;
 		}
 		if (t->th_buf.has_user_code_cache) {
-#if 1 //def DEBUG
+#ifdef DEBUG
 			printf("tar_extract_file(): restoring android user.inode_code_cache xattr to %s\n", realname);
 #endif
 			if (write_path_inode(realname, "code_cache", "user.inode_code_cache"))
@@ -596,7 +800,8 @@ tar_extract_dir(TAR *t, const char *realname)
 #endif
 		if (!policy_lookup_error) 
 		{
-			printf("attempting to restore policy: %s\n", policy_hex);
+			if (t->options & TAR_TW_VERBOSE_LOG)
+				printf("attempting to restore policy: %s\n", policy_hex);
 			if (!fscrypt_policy_set_struct(realname, t->th_buf.fep))
 			{
 				printf("tar_extract_file(): failed to restore fscrypt policy to dir '%s' '%s'!!!\n", realname, policy_hex);
@@ -605,7 +810,7 @@ tar_extract_dir(TAR *t, const char *realname)
 		} else
 			printf("No policy was found. Continuing restore.");
 	}
-	else
+	else if (t->options & TAR_TW_VERBOSE_LOG)
 		printf("NULL FSCRYPT\n");
 #endif
 
@@ -635,7 +840,8 @@ tar_extract_fifo(TAR *t, const char *realname)
 		return -1;
 
 
-	printf("  ==> extracting: %s (fifo)\n", filename);
+	if (t->options & TAR_TW_VERBOSE_LOG)
+		printf("  ==> extracting: %s (fifo)\n", filename);
 
 	if (mkfifo(filename, mode) == -1)
 	{

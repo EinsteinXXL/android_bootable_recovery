@@ -16,9 +16,16 @@
 	along with TWRP.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+#ifndef BUILD_TWRPTAR_MAIN
+// Standalone twrpTar: PageManager/ResourceManager/DataManager are used in this file
+// only in #ifndef BUILD_TWRPTAR_MAIN branches (otherwise ResourceLookup/DataLookup
+// fall back to name/""). But the includes pull in the GUI resource chain
+// (pages->resources->minuitwrp/truetype->FreeType) -- unnecessary in the CLI, so
+// guard them too. StringLookup lives in twmsg.h.
 #include "../data.hpp"
 #include "pages.hpp"
 #include "resources.hpp"
+#endif
 
 #include "twmsg.h"
 #include <cctype>

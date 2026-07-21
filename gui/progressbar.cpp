@@ -175,11 +175,39 @@ int GUIProgressBar::Update(void)
 	if (pos == mLastPos)
 		return 0;
 
+	int prevPos = mLastPos;
 	mLastPos = pos;
 
-	if (RenderInternal() != 0)
-		return -1;
-	return 2;
+	// No full render and no unclipped self-render; just register the damage region
+	// and return 1. RenderRegion redraws the bar (its Render() calls RenderInternal)
+	// clipped. mRenderW/mRenderH are the real bar bounds.
+	//
+	// Register ONLY the changed fill strip [prevPos..pos] as damage, not the whole
+	// bar. progress_fill is horizontally uniform in the body (solid color), only the
+	// rounded cap left/right is x-dependent -> the sliver is color-true if it also
+	// covers the cap (cap margin). Since animation + progressbar lie exactly on top
+	// of each other, in frames WITHOUT an animation tick Page::RenderRegion now clips
+	// animation + bar + fill to this narrow strip instead of full-width.
+	int lo = (prevPos < pos) ? prevPos : pos;
+	int hi = (prevPos < pos) ? pos : prevPos;
+	// AA margin, resolution-scaled. progress_fill has a 1008 px source width and is
+	// scaled to mRenderW (=mEmptyBar->GetWidth()) -> define the margin in SOURCE
+	// pixels and scale it up by the same factor mRenderW/1008. SRC_CAP=9 gives 12 px
+	// at mRenderW=1344, staying theme-/resolution-independent.
+	const int SRC_W   = 1008; // source width of the bar image
+	const int SRC_CAP = 9;    // margin in source pixels (-> 12 px @1344)
+	const int cap = (SRC_CAP * mRenderW + SRC_W / 2) / SRC_W; // +SRC_W/2 = rounding
+	int sx = mRenderX + lo - cap;
+	int sw = (hi - lo) + 2 * cap;
+	if (sx < mRenderX) { sw -= (mRenderX - sx); sx = mRenderX; }
+	if (sx + sw > mRenderX + mRenderW) sw = mRenderX + mRenderW - sx;
+	if (prevPos == 0 || pos == 0 || sw >= mRenderW || sw <= 0) {
+		// First start/reset or strip ~ full bar -> request the whole bar (safe).
+		PageManager::RequestFrameRegion(mRenderX, mRenderY, mRenderW, mRenderH);
+	} else {
+		PageManager::RequestFrameRegion(sx, mRenderY, sw, mRenderH);
+	}
+	return 1;
 }
 
 int GUIProgressBar::NotifyVarChange(const std::string& varName, const std::string& value)

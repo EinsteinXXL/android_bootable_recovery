@@ -167,7 +167,7 @@ void dump_list (char *file, char *list, ssize_t size)
 			xattr[j++] = list[i];
 		} else {
 			xattr[j] = '\0';
-			size2 = getxattr(file, xattr, value, sizeof(value));
+			size2 = lgetxattr(file, xattr, value, sizeof(value));
 			if (size2 < 0) {
 				printf("file=%s xattr=%s returned:", file, xattr);
 			} else {
@@ -187,16 +187,23 @@ char	List[1<<17];
 int main (int argc, char *argv[])
 {
 	ssize_t	size;
+	int	i;
+	int	any_err = 0;
 	if (argc < 2) {
 		usage();
 		exit(2);
 	}
-	size = listxattr(argv[1], List, sizeof(List));
-	if (size == -1) {
-		perror(argv[1]);
-		exit(2);
+	/* Multi-arg loop: process each file independently. perror+continue
+	 * (not exit) so one inaccessible file doesn't kill an entire batch. */
+	for (i = 1; i < argc; i++) {
+		size = llistxattr(argv[i], List, sizeof(List));
+		if (size == -1) {
+			perror(argv[i]);
+			any_err = 1;
+			continue;
+		}
+		printf("xattrs for %s:\n", argv[i]);
+		dump_list(argv[i], List, size);
 	}
-	printf("xattrs for %s:\n", argv[1]);
-	dump_list(argv[1], List, size);
-	return 0;
+	return any_err;
 }

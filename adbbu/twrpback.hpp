@@ -17,6 +17,7 @@
 #ifndef _TWRPBACK_HPP
 #define _TWRPBACK_HPP
 
+#include <sys/types.h>
 #include <fstream>
 #include "../twrpDigest/twrpMD5.hpp"
 
@@ -44,6 +45,7 @@ private:
 	int adb_write_fd;                                                        // adb write data stream
 	int debug_adb_fd;                                                        // fd to write debug tars
 	bool firstPart;                                                          // first partition in the stream
+	bool stream_mode;                                                        // true = via `bu --twrp stream` (GUI .ab restore) -> restore() writes ADB_RESTORE_STREAM_OP instead of ADB_RESTORE_OP so the GUI action thread owns the completion
 	FILE *adbd_fp;                                                           // file pointer for adb stream
 	char cmd[512];                                                           // store result of commands
 	char operation[512];                                                     // operation to send to ors
@@ -55,7 +57,11 @@ private:
 	void close_backup_fds();                                                 // close backup resources
 	void close_restore_fds();                                                // close restore resources
 	bool checkMD5Trailer(char adbReadStream[], uint64_t md5fnsize, twrpMD5* digest); // Check MD5 Trailer
+	bool pump_data(twrpMD5 &digest, uint64_t &totalbytes, uint64_t &fileBytes,
+	               uint64_t &dataChunkBytes, bool &firstDataPacket, bool drain);     // 128-KB frame-aware data pump FIFO->adbd (backup); drain=true: blocking until EOF (TWEOF drain)
+	static ssize_t write_all(int fd, const void *buf, size_t count);                 // EINTR-/partial-safe write (batch writes > PIPE_BUF are not atomic)
 	void printErrMsg(std::string msg, int errNum);                          // print error msg to adb log
+	bool send_adb_bu_notice(void);                                          // PTY detected (freeze-prone): TWRP GUI notice via TW_ADB_FIFO
 };
 
 #endif // _TWRPBACK_HPP

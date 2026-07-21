@@ -60,8 +60,6 @@ void InfoManager::Clear(void) {
 }
 
 int InfoManager::LoadValues(void) {
-	string str;
-
 	// Read in the file, if possible
 	FILE* in = fopen(File.c_str(), "rb");
 	if (!in) {
@@ -71,32 +69,43 @@ int InfoManager::LoadValues(void) {
 		LOGINFO("InfoManager loading from '%s'.\n", File.c_str());
 	}
 
+	// Returns 0 = file read cleanly to EOF; -1 = version mismatch or truncated/
+	// corrupt mid-record. Records parsed before the error stay loaded in mValues
+	// (mPersist/.twrps ignores the return code; the legacy .info path in
+	// Probe_Restore_Backup checks == 0 and thus rejects a truncated .info).
+	int rc = 0;
+
 	if (file_version) {
 		int read_file_version;
-		if (fread(&read_file_version, 1, sizeof(int), in) != sizeof(int))
-			goto error;
-		if (read_file_version != file_version) {
+		if (fread(&read_file_version, 1, sizeof(int), in) != sizeof(int)
+		    || read_file_version != file_version) {
 			LOGINFO("InfoManager file version has changed, not reading file\n");
-			goto error;
+			fclose(in);
+			return -1;
 		}
 	}
 
-	while (!feof(in)) {
+	while (true) {
 		string Name;
 		string Value;
 		unsigned short length;
 		char array[513];
 
-		if (fread(&length, 1, sizeof(unsigned short), in) != sizeof(unsigned short))	goto error;
-		if (length >= 512)																goto error;
-		if (fread(array, 1, length, in) != length)										goto error;
-		array[length+1] = '\0';
+		size_t got = fread(&length, 1, sizeof(unsigned short), in);
+		if (got == 0 && feof(in))
+			break;                                       // clean EOF at a record boundary
+		if (got != sizeof(unsigned short) || length >= 512)	{ rc = -1; break; }
+		if (fread(array, 1, length, in) != length)			{ rc = -1; break; }
+		// Terminate at [length] (not [length+1]) so a corrupt file missing its
+		// stored NUL is still safe. Well-formed files (SaveValues writes strlen+1
+		// including the NUL) behave identically.
+		array[length] = '\0';
 		Name = array;
 
-		if (fread(&length, 1, sizeof(unsigned short), in) != sizeof(unsigned short))	goto error;
-		if (length >= 512)																goto error;
-		if (fread(array, 1, length, in) != length)										goto error;
-		array[length+1] = '\0';
+		if (fread(&length, 1, sizeof(unsigned short), in) != sizeof(unsigned short)
+		    || length >= 512)								{ rc = -1; break; }
+		if (fread(array, 1, length, in) != length)			{ rc = -1; break; }
+		array[length] = '\0';
 		Value = array;
 
 		map<string, string>::iterator pos;
@@ -108,9 +117,10 @@ int InfoManager::LoadValues(void) {
 			mValues.insert(make_pair(Name, Value));
 		}
 	}
-error:
+	if (rc != 0)
+		LOGINFO("InfoManager: '%s' is truncated or corrupt.\n", File.c_str());
 	fclose(in);
-	return 0;
+	return rc;
 }
 
 int InfoManager::SaveValues(void) {

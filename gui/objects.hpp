@@ -67,6 +67,18 @@ public:
 	// GetRenderPos - Returns the current position of the object
 	virtual int GetRenderPos(int& x, int& y, int& w, int& h) { x = mRenderX; y = mRenderY; w = mRenderW; h = mRenderH; return 0; }
 
+	// GetClipBounds - reliable on-screen bounds for the region-render skip test
+	//  (Page::RenderRegion). Returns true + x/y/w/h when the bounds are known;
+	//  false when unknown (the caller then must NOT skip, to be sure nothing is
+	//  missed). Default: the render-pos size when > 0 (image/progressbar/fill);
+	//  objects with a dynamic size (GUIText) override this and return their cached
+	//  text bbox. Deliberately separate from GetRenderPos, which checkbox.cpp uses
+	//  for layout.
+	virtual bool GetClipBounds(int& x, int& y, int& w, int& h) {
+		if (mRenderW > 0 && mRenderH > 0) { x = mRenderX; y = mRenderY; w = mRenderW; h = mRenderH; return true; }
+		return false;
+	}
+
 	// SetRenderPos - Update the position of the object
 	//  Return 0 on success, <0 on error
 	virtual int SetRenderPos(int x, int y, int w = 0, int h = 0) { mRenderX = x; mRenderY = y; if (w || h) { mRenderW = w; mRenderH = h; } return 0; }
@@ -192,6 +204,10 @@ public:
 	// Retrieve the size of the current string (dynamic strings may change per call)
 	virtual int GetCurrentBounds(int& w, int& h);
 
+	// GetClipBounds - returns the cached text bbox for the RenderRegion skip test
+	//  once it is known (else false -> do not skip).
+	virtual bool GetClipBounds(int& x, int& y, int& w, int& h);
+
 	// Notify of a variable change
 	virtual int NotifyVarChange(const std::string& varName, const std::string& value);
 
@@ -199,6 +215,12 @@ public:
 	virtual int SetMaxWidth(unsigned width);
 
 	void SetText(string newtext);
+
+protected:
+	// From the given text width w (+ placement math as in gr_textEx_scaleW) compute
+	//  the clamped screen bbox and store it in mBounds*/mBoundsKnown. On a degenerate
+	//  rectangle mBoundsKnown becomes false.
+	void StoreBounds(int w);
 
 public:
 	bool isHighlighted;
@@ -214,6 +236,9 @@ protected:
 	int mIsStatic;
 	int mVarChanged;
 	int mFontHeight;
+	// cached character bounding box (superset old+new) for the region skip.
+	int mBoundsX, mBoundsY, mBoundsW, mBoundsH;
+	bool mBoundsKnown;
 };
 
 // GUIImage - Used for static image
@@ -306,6 +331,7 @@ protected:
 	int key(std::string arg);
 	int page(std::string arg);
 	int reload(std::string arg);
+	int savesettings(std::string arg);
 	int readBackup(std::string arg);
 	int set(std::string arg);
 	int clear(std::string arg);
@@ -329,7 +355,6 @@ protected:
 	int setbrightness(std::string arg);
 	int checkforapp(std::string arg);
 	int unmapsuperdevices(std::string arg);
-	int removedynamicgroups(std:: string arg);
 
 	// (originally) threaded actions
 	int fileexists(std::string arg);
@@ -352,6 +377,7 @@ protected:
 	int decrypt(std::string arg);
 	int adbsideload(std::string arg);
 	int adbsideloadcancel(std::string arg);
+	int adbbucancel(std::string arg);	// ends the twadbd ADB backup mode (action_page cancel slot)
 	int openrecoveryscript(std::string arg);
 	int installsu(std::string arg);
 	int fixsu(std::string arg);
@@ -363,6 +389,7 @@ protected:
 	int stopmtp(std::string arg);
 	int flashimage(std::string arg);
 	int cancelbackup(std::string arg);
+	int cancelrestore(std::string arg);  // Phase 5a (Restore_Konzept.md Sec. 9.2)
 	int checkpartitionlifetimewrites(std::string arg);
 	int mountsystemtoggle(std::string arg);
 	int setlanguage(std::string arg);
@@ -843,12 +870,22 @@ public:
 	virtual int Update(void);
 
 protected:
+	// Scan each frame's opaque-x bbox (device coordinates, relative to the surface)
+	// once, so Update() can register only the shimmer zone (old ∪ new position) as
+	// damage instead of the full animation rect.
+	void ComputeFrameBounds(void);
+
 	AnimationResource* mAnimation;
 	int mFrame;
 	int mFPS;
 	int mLoop;
 	int mRender;
 	int mUpdateCount;
+	// Frame-bounds cache
+	bool mFrameBoundsReady;          // has ComputeFrameBounds() already run?
+	bool mFrameBoundsUsable;         // false -> no alpha (RGBX) -> fallback to full rect
+	std::vector<int> mFrameMinX;     // per frame: leftmost visible x (-1 = empty)
+	std::vector<int> mFrameMaxX;     // per frame: rightmost visible x (-1 = empty)
 };
 
 class GUIProgressBar : public GUIObject, public RenderObject, public ActionObject
@@ -912,6 +949,7 @@ protected:
 	int sTouchW, sTouchH;
 	int sCurTouchX;
 	int sUpdate;
+	bool sRendered; // KS: first-paint flag (like button.cpp mRendered)
 };
 
 // these are ASCII codes reported via NotifyCharInput
@@ -1143,6 +1181,7 @@ protected:
 	COLOR mSliderColor;
 	bool mShowRange;
 	bool mShowCurr;
+	bool mValueRight;   // showcurr="right": value number to the right of the track instead of centered below
 	int mLineX;
 	int mLineY;
 	int mLineH;

@@ -1,0 +1,40 @@
+// twadbd -- short-lived TWRP mode daemon for PTY-free adb backup/restore.
+// Modeled on bootable/recovery/minadbd (own service dispatch, links the unchanged
+// libadbd; libadbd_services is deliberately NOT linked -> no symbol collision with
+// the stock daemon_service_to_fd).
+
+cc_binary {
+    name: "twadbd",
+    recovery: true,
+
+    cflags: [
+        "-DADB_HOST=0",
+        "-Wall",
+        "-Werror",
+    ],
+
+    cpp_std: "experimental",
+
+    include_dirs: [
+        "system/core/adb",
+    ],
+
+    srcs: [
+        "twadbd.cpp",
+        "twadbd_services.cpp",
+    ],
+
+    defaults: [
+        "libadbd_binary_dependencies",
+    ],
+
+    shared_libs: [
+        "libadbd",
+        "libbase",
+        "libcrypto",
+    ],
+
+    required: [
+        "adbd_system_api_recovery",
+    ],
+}

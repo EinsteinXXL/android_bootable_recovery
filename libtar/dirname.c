@@ -39,7 +39,7 @@ char *
 openbsd_dirname(path)
 	const char *path;
 {
-	static char bname[MAXPATHLEN];
+	static __thread char bname[MAXPATHLEN];
 	register const char *endp;
 
 	/* Empty or NULL string gets treated as "." */

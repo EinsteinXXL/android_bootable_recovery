@@ -163,6 +163,10 @@
 		<string name="part_used">Зайнято: %tw_partition_used%МБ</string>
 		<string name="part_free">Вільно: %tw_partition_free%МБ</string>
 		<string name="part_backup_size">Розмір РК: %tw_partition_backup_size%МБ</string>
+		<string name="part_size_kb">Розмір: %tw_partition_size%KБ</string>
+		<string name="part_used_kb">Зайнято: %tw_partition_used%КБ</string>
+		<string name="part_free_kb">Вільно: %tw_partition_free%КБ</string>
+		<string name="part_backup_size_kb">Розмір РК: %tw_partition_backup_size%КБ</string>
 		<string name="resize_btn">Змінити розмір файлової системи</string>
 		<string name="resize_btn_s">Змінити розмір</string>
 		<string name="resize_confirm">Змінити розмір %tw_partition_name%?</string>
@@ -602,7 +606,7 @@
 		<string name="compression_on">Стискання увімкнено</string>
 		<string name="digest_off" version="2">Генерація Digest вимкнена</string>
 		<string name="backup_fail">Помилка резервного копіювання</string>
-		<string name="backup_clean">Помилка резервного копіювання. Очистка папки резервного копіювання.</string>
+		<string name="backup_error_clean">Помилка резервного копіювання. Очистка папки резервного копіювання.</string>
 		<string name="running_recovery_commands">Запуск команд Recovery</string>
 		<string name="recovery_commands_complete">Команди Recovery виконані</string>
 		<string name="running_ors">Виконання OpenRecoveryScript</string>
@@ -660,5 +664,17 @@
 		<string name="partition_not_found">шлях: {1} не знайдено у списку розділів</string>
 		<string name="copy_kernel_log">Копіювання kernel log у {1}</string>
 		<string name="include_kernel_log">Увімкнути Kernel Log</string>
+		<string name="adbbu_preparing">Preparing ADB backup mode...</string>
+		<string name="adbbu_ready">ADB backup mode ready. On the PC you can now run your backup or restore as usual with 'adb backup/restore'.</string>
+		<string name="adbbu_idle_hint">If no backup/restore follows, this mode turns off automatically after {1} minutes.</string>
+		<string name="adbbu_stopped">ADB backup mode stopped. Default ADB was restored.</string>
+		<string name="adbbu_stopped_timeout">ADB backup mode was stopped after timeout ({1} min). Default ADB was restored.</string>
+		<string name="adbbu_cancel_mode">Cancelling ADB backup mode...</string>
+		<string name="adbbu_stock_refused">Direct 'adb backup/restore' is disabled here: stock adbd uses a freeze-prone PTY. On the PC run:  adb shell adbbu start  then retry your backup/restore.</string>
+		<string name="adbbu_read_ab_hdr">Reading Backup</string>
+		<string name="adbbu_read_ab">Reading ADB backup file. Please wait...</string>
+		<string name="adbbu_read_ab_done">...Done.</string>
+		<string name="adbbu_invalid_ab">Unable to read the ADB backup header of '{1}'. The backup file is corrupt.</string>
+		<string name="verbose_log_chk">Enable verbose log (log all file/folder names)</string>
 	</resources>
 </language>

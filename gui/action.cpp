@@ -34,13 +34,16 @@
 #include <dirent.h>
 #include <private/android_filesystem_config.h>
 #include <android-base/properties.h>
+#include <fstream>
 
 #include <string>
 #include <sstream>
 #include "../partitions.hpp"
 #include "../twrp-functions.hpp"
+#include "../twrpTar.hpp"
 #include "../twrpRepacker.hpp"
 #include "../openrecoveryscript.hpp"
+#include "../twrpAdbBuFifo.hpp"	// twrp_adbbu_cancel_mode/_mode_active (adbbucancel-Action)
 
 #include "twinstall/adb_install.h"
 
@@ -168,7 +171,7 @@ GUIAction::GUIAction(xml_node<>* node)
 		ADD_ACTION(key);
 		ADD_ACTION(page);
 		ADD_ACTION(reload);
-		ADD_ACTION(readBackup);
+		ADD_ACTION(savesettings);
 		ADD_ACTION(set);
 		ADD_ACTION(clear);
 		ADD_ACTION(mount);
@@ -195,10 +198,12 @@ GUIAction::GUIAction(xml_node<>* node)
 		ADD_ACTION(killterminal);
 		ADD_ACTION(checkbackupname);
 		ADD_ACTION(adbsideloadcancel);
+		ADD_ACTION(adbbucancel);	// end twadbd mode -- caller thread (kill() does not block; the lifecycle does the reap)
 		ADD_ACTION(fixsu);
 		ADD_ACTION(startmtp);
 		ADD_ACTION(stopmtp);
 		ADD_ACTION(cancelbackup);
+		ADD_ACTION(cancelrestore);     // Phase 5a (Restore_Konzept.md Sec. 9.2)
 		ADD_ACTION(checkpartitionlifetimewrites);
 		ADD_ACTION(mountsystemtoggle);
 		ADD_ACTION(setlanguage);
@@ -216,6 +221,12 @@ GUIAction::GUIAction(xml_node<>* node)
 		// These actions will run in a separate thread
 		ADD_ACTION(flash);
 		ADD_ACTION(wipe);
+		// Threaded: on an .ab selection Set_Restore_Files scans the stream -- in the
+		// caller thread that froze the GUI (a 14-GB .ab: 10-20 s of a "TWRP hung"
+		// impression). Now runs behind the restore_reading page (console+progress,
+		// like try_restore_decrypt); its watcher (tw_operation_state==1) routes on to
+		// restore_read -- routing logic there is unchanged.
+		ADD_ACTION(readBackup);
 		ADD_ACTION(refreshsizes);
 		ADD_ACTION(nandroid);
 		ADD_ACTION(fixcontexts);
@@ -365,8 +376,8 @@ void GUIAction::simulate_progress_bar(void)
 	for (int i = 0; i < 5; i++)
 	{
 		if (PartitionManager.stop_backup.get_value()) {
-			DataManager::SetValue("tw_cancel_backup", 1);
-			gui_msg("backup_cancel=Backup Cancelled");
+			//DataManager::SetValue("tw_cancel_backup", 1);
+			gui_msg(Msg(msg::kHighlight, "backup_cancel=[BACKUP CANCELLED]"));
 			DataManager::SetValue("ui_progress", 0);
 			PartitionManager.stop_backup.set_value(0);
 			return;
@@ -437,7 +448,9 @@ GUIAction::ThreadType GUIAction::getThreadType(const GUIAction::Action& action)
 	string func = gui_parse_text(action.mFunction);
 	bool needsThread = setActionsRunningInCallerThread.find(func) == setActionsRunningInCallerThread.end();
 	if (needsThread) {
-		if (func == "cancelbackup")
+		// cancelrestore uses the same cancel-thread type as cancelbackup, so the
+		// existing THREAD_CANCEL logic covers restore-cancel too.
+		if (func == "cancelbackup" || func == "cancelrestore")
 			return THREAD_CANCEL;
 		else
 			return THREAD_ACTION;
@@ -513,6 +526,14 @@ void GUIAction::operation_start(const string operation_name)
 	DataManager::SetValue("ui_progress", 0);
 	DataManager::SetValue("ui_portion_size", 0);
 	DataManager::SetValue("ui_portion_start", 0);
+	// Stale-cleanup of the text progress counters at the start of EVERY action
+	// (besides the existing ui_progress reset). Otherwise a new operation briefly
+	// flashes the previous one's final value (e.g. "14336MB of 14336MB, 100%"). Here
+	// at the START rather than the end: preserves the finished operation's final
+	// 100% and covers both completed AND cancelled (the next action always starts
+	// clean here).
+	DataManager::SetValue("tw_size_progress", "");
+	DataManager::SetValue("tw_file_progress", "");
 	DataManager::SetValue("tw_operation", operation_name);
 	DataManager::SetValue("tw_operation_state", 0);
 	DataManager::SetValue("tw_operation_status", 0);
@@ -532,12 +553,7 @@ void GUIAction::operation_end(const int operation_status)
 		else
 			DataManager::SetValue("tw_operation_status", 0);
 	} else {
-		if (operation_status != 0) {
-			DataManager::SetValue("tw_operation_status", 1);
-		}
-		else {
-			DataManager::SetValue("tw_operation_status", 0);
-		}
+		DataManager::SetValue("tw_operation_status", operation_status);
 	}
 	DataManager::SetValue("tw_operation_state", 1);
 	DataManager::SetValue(TW_ACTION_BUSY, 0);
@@ -595,12 +611,35 @@ int GUIAction::reload(std::string arg __unused)
 	return 0;
 }
 
+int GUIAction::savesettings(std::string arg __unused)
+{
+	DataManager::Flush();
+	//This action will serve to save the settings each time it is called.
+	return 0;
+}
+
 int GUIAction::readBackup(std::string arg __unused)
 {
 	string Restore_Name;
 
+	// Threaded: runs in the action thread behind the restore_reading page.
+	// operation_end(0) ALWAYS -- this path never made the success/error distinction
+	// here, restore_read does it via tw_restore_encrypted + tw_preflight_ok.
+	operation_start("Read Backup");
 	DataManager::GetValue("tw_restore", Restore_Name);
 	PartitionManager.Set_Restore_Files(Restore_Name);
+
+	// Restore preflight (unencrypted branch): Set_Restore_Files has just classified
+	// the type. If the backup is NOT encrypted, run the non-GUI validity check now
+	// -- action thread, no PBKDF2, so fast. Encrypted: tw_preflight_ok stays 0;
+	// decrypt_backup checks only AFTER password validation. restore_read routes on
+	// tw_restore_encrypted + tw_preflight_ok.
+	DataManager::SetValue("tw_preflight_ok", 0);
+	int encrypted = 0;
+	DataManager::GetValue("tw_restore_encrypted", encrypted);
+	if (!encrypted)
+		DataManager::SetValue("tw_preflight_ok", PartitionManager.Preflight_Restore_Backup(Restore_Name) ? 1 : 0);
+	operation_end(0);
 	return 0;
 }
 
@@ -921,15 +960,19 @@ int GUIAction::getpartitiondetails(std::string arg)
 		if (!part_path.empty()) {
 			TWPartition* Part = PartitionManager.Find_Partition_By_Path(part_path);
 			if (Part) {
-				unsigned long long mb = 1048576;
+				std::string unit;
 
 				DataManager::SetValue("tw_partition_name", Part->Display_Name);
 				DataManager::SetValue("tw_partition_mount_point", Part->Mount_Point);
 				DataManager::SetValue("tw_partition_file_system", Part->Current_File_System);
-				DataManager::SetValue("tw_partition_size", Part->Size / mb);
-				DataManager::SetValue("tw_partition_used", Part->Used / mb);
-				DataManager::SetValue("tw_partition_free", Part->Free / mb);
-				DataManager::SetValue("tw_partition_backup_size", Part->Backup_Size / mb);
+				DataManager::SetValue("tw_partition_size", TWFunc::Bytes_To_Readable_Size(Part->Size, unit));
+				DataManager::SetValue("tw_partition_size_kb", unit == "KB" ? 1 : 0);
+				DataManager::SetValue("tw_partition_used", TWFunc::Bytes_To_Readable_Size(Part->Used, unit));
+				DataManager::SetValue("tw_partition_used_kb", unit == "KB" ? 1 : 0);
+				DataManager::SetValue("tw_partition_free", TWFunc::Bytes_To_Readable_Size(Part->Free, unit));
+				DataManager::SetValue("tw_partition_free_kb", unit == "KB" ? 1 : 0);
+				DataManager::SetValue("tw_partition_backup_size", TWFunc::Bytes_To_Readable_Size(Part->Backup_Size, unit));
+				DataManager::SetValue("tw_partition_backup_size_kb", unit == "KB" ? 1 : 0);
 				DataManager::SetValue("tw_partition_removable", Part->Removable);
 				DataManager::SetValue("tw_partition_is_present", Part->Is_Present);
 
@@ -1138,7 +1181,7 @@ int GUIAction::wipe(std::string arg)
 			if (has_datamedia) {
 				ret_val = PartitionManager.Wipe_Media_From_Data();
 			} else {
-				ret_val = PartitionManager.Wipe_By_Path(DataManager::GetSettingsStoragePath());
+				ret_val = PartitionManager.Wipe_By_Path(DataManager::GetCurrentStoragePath());
 			}
 		} else if (arg == "EXTERNAL") {
 			string External_Path;
@@ -1188,7 +1231,7 @@ int GUIAction::wipe(std::string arg)
 							gui_msg(Msg(msg::kError, "unable_to_wipe=Unable to wipe {1}.")(wipe_path));
 							ret_val = false;
 							break;
-						} else if (wipe_path == DataManager::GetSettingsStoragePath()) {
+						} else if (wipe_path == DataManager::GetCurrentStoragePath()) {
 							arg = wipe_path;
 						}
 					} else {
@@ -1254,17 +1297,7 @@ int GUIAction::nandroid(std::string arg)
 			if (Backup_Name == auto_gen || Backup_Name == gui_lookup("curr_date", "(Current Date)") || Backup_Name == "0" || Backup_Name == "(" || PartitionManager.Check_Backup_Name(Backup_Name, true, true) == 0) {
 				ret = PartitionManager.Run_Backup(false);
 				DataManager::SetValue("tw_encrypt_backup", 0); // reset value so we don't encrypt every subsequent backup
-				if (!PartitionManager.stop_backup.get_value()) {
-					if (ret == false)
-						ret = 1; // 1 for failure
-					else
-						ret = 0; // 0 for success
-					DataManager::SetValue("tw_cancel_backup", 0);
-				} else {
-					DataManager::SetValue("tw_cancel_backup", 1);
-					gui_msg("backup_cancel=Backup Cancelled");
-					ret = 0;
-				}
+			// 0=success, 1=error, 2=cancel — passed through as operation_end status
 			} else {
 				operation_end(1);
 				return -1;
@@ -1277,18 +1310,24 @@ int GUIAction::nandroid(std::string arg)
 			DataManager::GetValue("tw_restore", Restore_Name);
 			DataManager::GetValue("tw_enable_adb_backup", gui_adb_backup);
 			if (gui_adb_backup) {
-				DataManager::SetValue("tw_operation_state", 1);
-				if (TWFunc::stream_adb_backup(Restore_Name) == 0)
-					ret = 0; // success
-				else
-					ret = 1; // failure
+				// GUI .ab restore: `bu --twrp stream <file>` drives (via the FIFO) the
+				// SAME Restore_ADB_Backup as the PC adb restore -- but here the GUI
+				// action thread owns start (operation_start above) AND end
+				// (operation_end below), like any GUI restore. The real status comes
+				// NOT from bu's exit code (which is wrongly 0 on cancel/engine error)
+				// but from the engine: Restore_ADB_Backup(gui_stream) writes op_status
+				// into tw_adbbu_stream_status BEFORE it sends TWENDADB;
+				// `stream_adb_backup` (blocking) returns only after bu ends -> the var
+				// is guaranteed set (race-free). Default 1 (error) covers bu dying early
+				// (file not readable -> engine never ran; bu still returns 0 in stream
+				// mode).
+				DataManager::SetValue("tw_adbbu_stream_status", 1);
+				TWFunc::stream_adb_backup(Restore_Name);
 				DataManager::SetValue("tw_enable_adb_backup", 0);
-				ret = 0; // assume success???
+				DataManager::GetValue("tw_adbbu_stream_status", ret);	// 0=success,1=error,2=cancel -> operation_end
 			} else {
-				if (PartitionManager.Run_Restore(Restore_Name))
-					ret = 0; // success
-				else
-					ret = 1; // failure
+				ret = PartitionManager.Run_Restore(Restore_Name);
+				// 0=success, 1=error, 2=cancel -- passed through as operation_end status
 			}
 		} else {
 			operation_end(1); // invalid arg specified, fail
@@ -1301,15 +1340,21 @@ int GUIAction::nandroid(std::string arg)
 }
 
 int GUIAction::cancelbackup(std::string arg __unused) {
-	if (simulate) {
+	if (simulate)
 		PartitionManager.stop_backup.set_value(1);
-	}
-	else {
-		int op_status = PartitionManager.Cancel_Backup();
-		if (op_status != 0)
-			op_status = 1; // failure
-	}
+	else
+		PartitionManager.Cancel_Backup();
+	return 0;
+}
 
+// Restore-cancel GUI action. Calls Cancel_Restore(), which sets stop_restore and
+// calls Kill_Restore_Children(). Kept as its own action so the GUI layout stays
+// semantically clean (the button action name matches the page).
+int GUIAction::cancelrestore(std::string arg __unused) {
+	if (simulate)
+		PartitionManager.stop_restore.set_value(1);
+	else
+		PartitionManager.Cancel_Restore();
 	return 0;
 }
 
@@ -1543,7 +1588,7 @@ int GUIAction::decrypt(std::string arg __unused)
 			// Check for a custom theme and load it if exists
 			DataManager::GetValue(TW_HAS_DATA_MEDIA, has_datamedia);
 			if (has_datamedia != 0) {
-				if (tw_get_default_metadata(DataManager::GetSettingsStoragePath().c_str()) != 0) {
+				if (tw_get_default_metadata(DataManager::GetCurrentStoragePath().c_str()) != 0) {
 					LOGINFO("Failed to get default contexts and file mode for storage files.\n");
 				} else {
 					LOGINFO("Got default contexts and file mode for storage files.\n");
@@ -1618,6 +1663,22 @@ int GUIAction::adbsideloadcancel(std::string arg __unused)
 	return 0;
 }
 
+// Ends the twadbd ADB backup mode immediately. Bound to the action_page cancel
+// slot (tw_cancel_action=adbbucancel), which the mode lifecycle enables only for
+// its runtime (tw_has_cancel) -- so the button is visible exactly while twadbd
+// runs. Replaces waiting for the idle timeout; important because during the mode
+// `adb shell adbbu cancel` from the PC does NOT work (twadbd serves only
+// backup:/restore:). SIGTERM only, NO waitpid: the reap + USB restore + GUI
+// cleanup is done by the lifecycle thread (twrpAdbBuFifo::ADB_Bu_Mode_Lifecycle),
+// which waits in waitpid(twadbd).
+int GUIAction::adbbucancel(std::string arg __unused)
+{
+	DataManager::SetValue("tw_has_cancel", 0); // hide the button immediately (double-click guard)
+	gui_msg("adbbu_cancel_mode=Cancelling ADB backup mode...");
+	twrp_adbbu_cancel_mode();
+	return 0;
+}
+
 int GUIAction::openrecoveryscript(std::string arg __unused)
 {
 	operation_start("OpenRecoveryScript");
@@ -1675,9 +1736,16 @@ int GUIAction::decrypt_backup(std::string arg __unused)
 		Restore_Path += "/";
 		DataManager::GetValue("tw_restore_password", Password);
 		TWFunc::SetPerformanceMode(true);
-		if (TWFunc::Try_Decrypting_Backup(Restore_Path, Password))
+		if (TWFunc::Try_Decrypting_Backup(Restore_Path, Password)) {
 			op_status = 0; // success
-		else
+			// Restore preflight (encrypted branch): only NOW (password valid) does the
+			// non-GUI validity check run -- in the SAME action thread, not a second one.
+			// Its /data probe also reads the ead flag (checkbox) -- no separate load.
+			// try_restore_decrypt then routes via op_status + tw_preflight_ok.
+			string Restore_Name;
+			DataManager::GetValue("tw_restore", Restore_Name);
+			DataManager::SetValue("tw_preflight_ok", PartitionManager.Preflight_Restore_Backup(Restore_Name) ? 1 : 0);
+		} else
 			op_status = 1; // fail
 		TWFunc::SetPerformanceMode(false);
 	}
@@ -2323,7 +2391,7 @@ int GUIAction::editfile(std::string arg) {
 int GUIAction::applycustomtwrpfolder(string arg __unused)
 {
 	operation_start("ChangingTWRPFolder");
-	string storageFolder = DataManager::GetSettingsStoragePath();
+	string storageFolder = DataManager::GetCurrentStoragePath();
 	string newFolder = storageFolder + '/' + arg;
 	string newBackupFolder = newFolder + "/BACKUPS/" + DataManager::GetStrValue("device_id");
 	string prevFolder = storageFolder + DataManager::GetStrValue(TW_RECOVERY_FOLDER_VAR);
@@ -2347,7 +2415,10 @@ int GUIAction::applycustomtwrpfolder(string arg __unused)
 	if (ret) {
 		DataManager::SetValue(TW_RECOVERY_FOLDER_VAR, '/' + arg);
 		DataManager::SetValue(TW_BACKUPS_FOLDER_VAR, newBackupFolder);
-		DataManager::mBackingFile = newFolder + '/' + TW_SETTINGS_FILE;
+		//Creates an empty file that marks which folder is TWRP with the renamed new name, after reboot.
+		string path = newFolder + "/.twrpcf";
+		std::ofstream twrpcf(path);
+		twrpcf.close();
 	}
 	operation_end((int)!ret);
 	return 0;

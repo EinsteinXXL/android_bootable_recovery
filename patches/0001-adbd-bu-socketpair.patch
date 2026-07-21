@@ -1,0 +1,47 @@
+--- a/adb/daemon/services.cpp
++++ b/adb/daemon/services.cpp
+@@ -258,6 +258,31 @@
+     return nullptr;
+ }
+ 
++// The __ANDROID__ guard MUST mirror the call sites (backup:/restore: in the
++// #if below): otherwise this static helper is unused in non-Android TUs
++// (host variant of services.cpp) -> -Werror,-Wunused-function.
++#if defined(__ANDROID__)
++// TWRP fix: bu (adb backup/restore) gets a real socketpair instead of the
++// forced PTY downgrade of the 4-arg StartSubprocess overload. The
++// kernel tty layer (flip buffer + flush_to_ldisc workqueue + throttle
++// wakeups) is race-prone under a sustained binary bulk stream --
++// sporadic complete freezes: bu hangs in n_tty_read, adbd waits on
++// EPOLLOUT, host waits on A_OKAY. The only documented PTY purpose
++// (SIGHUP kill for processes without read/write, e.g. screenrecord) does not
++// apply to bu: bu pumps continuously and finishes even on EOF/EPIPE
++// (SIGPIPE=SIG_IGN + fread-short hardening in twrpback.cpp).
++static unique_fd StartBuSubprocess(std::string cmd) {
++    unique_fd error_fd;
++    unique_fd fd = StartSubprocess(std::move(cmd), nullptr, SubprocessType::kRaw,
++                                   SubprocessProtocol::kNone, /*make_pty_raw=*/false,
++                                   SubprocessProtocol::kNone, &error_fd);
++    if (fd == -1) {
++        return error_fd;
++    }
++    return fd;
++}
++#endif  // defined(__ANDROID__)
++
+ unique_fd daemon_service_to_fd(std::string_view name, atransport* transport) {
+     ADB_LOG(Service) << "transport " << transport->serial_name() << " opening service " << name;
+ 
+@@ -283,10 +308,9 @@
+     } else if (android::base::ConsumePrefix(&name, "backup:")) {
+         std::string cmd = "/system/bin/bu backup ";
+         cmd += name;
+-        return StartSubprocess(cmd, nullptr, SubprocessType::kRaw, SubprocessProtocol::kNone);
++        return StartBuSubprocess(std::move(cmd));
+     } else if (name.starts_with("restore:")) {
+-        return StartSubprocess("/system/bin/bu restore", nullptr, SubprocessType::kRaw,
+-                               SubprocessProtocol::kNone);
++        return StartBuSubprocess("/system/bin/bu restore");
+     } else if (name.starts_with("disable-verity:")) {
+         return StartSubprocess("/system/bin/disable-verity", nullptr, SubprocessType::kRaw,
+                                SubprocessProtocol::kNone);

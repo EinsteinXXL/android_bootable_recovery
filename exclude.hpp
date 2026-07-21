@@ -31,13 +31,23 @@ public:
 	uint64_t Get_Folder_Size(const string& Path); // Gets the folder's size using stat
 	void add_absolute_dir(const string& Path);
 	void add_relative_dir(const string& Path);
+	// The inclusion API is intentionally tied to external app data — currently the
+	// only inclusion source. A second source would require tagging entries by consumer.
+	void Add_External_App_Data_Inclusion(const string& Path);
+	void Clear_External_App_Data_Inclusion();
+	// Strictly equal to or below an inclusion entry (no ancestor match) — used for the
+	// exact ext-app-data size accounting in the backup walk (g-header TWRP.ext_app_data_size).
+	bool Is_External_App_Data_Path(const string& path);
 	bool check_relative_skip_dirs(const string& dir);
 	bool check_absolute_skip_dirs(const string& path);
 	bool check_skip_dirs(const string& path);
 	void clear_relative_dir(string dir);
 private:
+	// True if the path (or one of its ancestors) is in the external-app-data inclusion list
+	bool Check_External_App_Data_Inclusion(const string& path);
 	vector<string> absolutedir;
 	vector<string> relativedir;
+	vector<string> external_app_data_inclusion;
 };
 
 #endif

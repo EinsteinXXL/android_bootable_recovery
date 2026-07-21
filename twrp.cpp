@@ -38,6 +38,7 @@ extern "C" {
 #include "gui/gui.h"
 }
 #include "set_metadata.h"
+#include "twrp_affinity.hpp"
 #include "gui/gui.hpp"
 #include "gui/pages.hpp"
 #include "gui/objects.hpp"
@@ -93,7 +94,7 @@ static void Decrypt_Page(bool SkipDecryption, bool datamedia) {
 		}
 	} else if (datamedia) {
 		PartitionManager.Update_System_Details();
-		if (tw_get_default_metadata(DataManager::GetSettingsStoragePath().c_str()) != 0) {
+		if (tw_get_default_metadata(DataManager::GetCurrentStoragePath().c_str()) != 0) {
 			LOGINFO("Failed to get default contexts and file mode for storage files.\n");
 		} else {
 			LOGINFO("Got default contexts and file mode for storage files.\n");
@@ -175,7 +176,14 @@ static void process_recovery_mode(twrpAdbBuFifo* adb_bu_fifo, bool skip_decrypti
 #endif
 
 // We are doing this here to allow super partition to be set up prior to overriding properties
-#if defined(TW_INCLUDE_LIBRESETPROP) && defined(TW_OVERRIDE_SYSTEM_PROPS)
+#if defined(TW_INCLUDE_LIBRESETPROP)
+	std::vector<std::string> build_date_props = {"ro.build.date.utc", "ro.bootimage.build.date.utc", "ro.vendor.build.date.utc", "ro.system.build.date.utc", "ro.system_ext.build.date.utc", "ro.product.build.date.utc", "ro.odm.build.date.utc"};
+	std::string val = "0";
+	for (auto prop : build_date_props) {
+		TWFunc::Property_Override(prop, val);
+		LOGINFO("Overriding %s with value: \"%s\"\n", prop.c_str(), val.c_str());
+	}
+#if defined(TW_OVERRIDE_SYSTEM_PROPS)
 	stringstream override_props(EXPAND(TW_OVERRIDE_SYSTEM_PROPS));
 	string current_prop;
 
@@ -233,7 +241,8 @@ static void process_recovery_mode(twrpAdbBuFifo* adb_bu_fifo, bool skip_decrypti
 		exit:
 		continue;
 	}
-#endif
+#endif // defined(TW_OVERRIDE_SYSTEM_PROPS)
+#endif // defined(TW_INCLUDE_LIBRESETPROP)
 
 	// Check for and run startup script if script exists
 	TWFunc::check_and_run_script("/system/bin/runatboot.sh", "boot");
@@ -336,7 +345,8 @@ static void process_recovery_mode(twrpAdbBuFifo* adb_bu_fifo, bool skip_decrypti
 	}
 #endif
 
-	TWFunc::Update_Log_File();
+	// Boot speed fix: log saving only needed on reboot, not boot (saves 5-15s pigz/zstd + I/O)
+	// TWFunc::Update_Log_File();
 
 	adb_bu_fifo->threadAdbBuFifo();
 
@@ -348,7 +358,6 @@ static void process_recovery_mode(twrpAdbBuFifo* adb_bu_fifo, bool skip_decrypti
 
 static void reboot() {
 	gui_msg(Msg("rebooting=Rebooting..."));
-	TWFunc::Update_Log_File();
 	string Reboot_Arg;
 
 	DataManager::GetValue("tw_reboot_arg", Reboot_Arg);
@@ -380,6 +389,13 @@ int main(int argc, char **argv) {
 	freopen(TMP_LOG_FILE, "a", stderr);
 	setbuf(stderr, NULL);
 
+	// Load the CPU affinity configuration from the BoardConfig defines. Must run
+	// before any affinity consumer (backup/restore pipelines, log zstd, GUI/MTP
+	// threads), but AFTER the stdout/stderr redirect above: init() logs its
+	// diagnostics via LOGINFO (fprintf to stdout), and before the freopen that
+	// would go to the original stdout (kmsg) instead of recovery.log.
+	tw_affinity::init();
+
 	signal(SIGPIPE, SIG_IGN);
 
 	// Handle ADB sideload
@@ -392,6 +408,24 @@ int main(int argc, char **argv) {
 		adb_main(argv[2]);
 #endif
 		return 0;
+	}
+
+	// Block SIGCHLD process-wide HERE, before any thread starts (gui_init/
+	// gui_start, twrpAdbBuFifo, MTP): the backup/restore signalfd(SIGCHLD)
+	// (twrpTar.cpp::run_pipe_poll) can only reliably detect an unexpected worker
+	// death if no other (GUI) thread steals the process-directed SIGCHLD.
+	// sigprocmask is per-thread, so the mask MUST be set before any
+	// pthread_create so all threads inherit it; the SIGCHLD then stays pending
+	// process-wide until the (single) signalfd in the action thread reads it.
+	// Safe because TWRP reaps everywhere synchronously via waitpid(pid)
+	// (__system/__popen/fuse mount_util — mask-independent) and has no SIGCHLD
+	// handler and no sigwait/sigtimedwait. Placed AFTER the --adbd early return
+	// so adbd sideload keeps its default SIGCHLD handling.
+	{
+		sigset_t chld_block;
+		sigemptyset(&chld_block);
+		sigaddset(&chld_block, SIGCHLD);
+		sigprocmask(SIG_BLOCK, &chld_block, NULL);
 	}
 
 #ifdef RECOVERY_SDCARD_ON_DATA
@@ -418,6 +452,8 @@ int main(int argc, char **argv) {
 
 	startupArgs startup;
 	startup.parse(&argc, &argv);
+	// Set the fastboot-mode property unconditionally, not only when TW_LOAD_VENDOR_MODULES is set.
+	android::base::SetProperty(TW_FASTBOOT_MODE_PROP, startup.Get_Fastboot_Mode() ? "1" : "0");
 	twrpAdbBuFifo *adb_bu_fifo = new twrpAdbBuFifo();
 	TWFunc::Clear_Bootloader_Message();
 
@@ -435,6 +471,11 @@ int main(int argc, char **argv) {
 	GUIConsole::Translate_Now();
 
 	TWFunc::checkforapp(); //Checking compatibility for TWRP app
+
+	// GUI affinity is switched at backup time by GuiAffinityGuard
+	// (partitionmanager.cpp): active backup -> efficiency core, otherwise ->
+	// performance core. No initial pinning — the scheduler chooses freely while
+	// no backup is running.
 
 	// Launch the main GUI
 	gui_start();

@@ -990,7 +990,7 @@ int Exec_vdc_cryptfs(const string& command, const string& argument, vdc_ReturnVa
 	vdcResult->ResponseCode = vdcResult->Sequence = vdcResult->Message = -1;
 
 	for (int i = 0; i < 2; ++i) {
-		if (pipe(pipe_fd[i])) {
+		if (pipe2(pipe_fd[i], O_CLOEXEC)) {
 			LOGERROR("exec_vdc_cryptfs: pipe() error!\n");
 			return -1;
 		}

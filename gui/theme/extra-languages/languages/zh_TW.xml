@@ -184,6 +184,10 @@
 		<string name="part_used">已用: %tw_partition_used%MB</string>
 		<string name="part_free">可用: %tw_partition_free%MB</string>
 		<string name="part_backup_size">備份大小: %tw_partition_backup_size%MB</string>
+		<string name="part_size_kb">大小: %tw_partition_size%KB</string>
+		<string name="part_used_kb">已用: %tw_partition_used%KB</string>
+		<string name="part_free_kb">可用: %tw_partition_free%KB</string>
+		<string name="part_backup_size_kb">備份大小: %tw_partition_backup_size%KB</string>
 		<string name="resize_btn">調整檔案系統</string>
 		<string name="resize_btn_s">調整</string>
 		<string name="resize_confirm">是否調整 %tw_partition_name%？</string>
@@ -672,7 +676,7 @@
 		<string name="compression_on">壓縮選項已開啟</string>
 		<string name="digest_off" version="2">Digest 建立已關閉</string>
 		<string name="backup_fail">備份失敗</string>
-		<string name="backup_clean">備份失敗。正在清理備份檔案夾。</string>
+		<string name="backup_error_clean">備份失敗。正在清理備份檔案夾。</string>
 		<string name="running_recovery_commands">執行 Recovery 指令</string>
 		<string name="recovery_commands_complete">Recovery 指令執行完成</string>
 		<string name="running_ors">執行 OpenRecoveryScript 腳本</string>
@@ -750,5 +754,6 @@
 		<string name="rescue_party2"> 2. 格式化 Data 分割區；</string>
 		<string name="rescue_party3"> 3. 重新刷入您的 ROM。</string>
 		<string name="rescue_party4">報告的問題為：</string>
+		<string name="verbose_log_chk">Enable verbose log (log all file/folder names)</string>
 	</resources>
 </language>

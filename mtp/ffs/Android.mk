@@ -59,12 +59,30 @@ LOCAL_SHARED_LIBRARIES += libz \
                           libcutils \
                           libutils \
                           libselinux \
-                          libbase
+                          libbase \
+                          liblog
 
 LOCAL_C_INCLUDES += bootable/recovery/twrplibusbhost/include
 
 ifneq ($(TW_MTP_DEVICE),)
 	LOCAL_CFLAGS += -DUSB_MTP_DEVICE=$(TW_MTP_DEVICE)
+endif
+
+# TWRP CPU affinity (only the two flags the MTP module reads).
+# TW_USE_CPU_AFFINITY: bool flag, compile-time eval like the main Android.mk
+# (true/1/yes/on -> -DFLAG=1, false/0/no/off -> no define, else a warning).
+ifneq ($(TW_USE_CPU_AFFINITY),)
+    _tw_mtp_use_cpu_affinity_lc := $(shell echo "$(TW_USE_CPU_AFFINITY)" | tr '[:upper:]' '[:lower:]')
+    ifneq ($(filter true 1 yes on,$(_tw_mtp_use_cpu_affinity_lc)),)
+        LOCAL_CFLAGS += -DTW_USE_CPU_AFFINITY=1
+    else
+        ifeq ($(filter false 0 no off,$(_tw_mtp_use_cpu_affinity_lc)),)
+            $(warning TW_USE_CPU_AFFINITY="$(TW_USE_CPU_AFFINITY)" not recognized (expected true/1/yes/on or false/0/no/off) -- treated as false)
+        endif
+    endif
+endif
+ifneq ($(TW_AFFINITY_MTP_CORE),)
+    LOCAL_CFLAGS += -DTW_AFFINITY_MTP_CORE=$(TW_AFFINITY_MTP_CORE)
 endif
 ifeq ($(shell test $(PLATFORM_SDK_VERSION) -gt 25; echo $$?),0)
     LOCAL_CFLAGS += -DHAS_USBHOST_TIMEOUT

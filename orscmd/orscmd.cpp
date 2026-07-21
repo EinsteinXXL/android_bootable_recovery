@@ -40,8 +40,8 @@ void print_usage(void) {
 	printf("Allows command line usage of TWRP via openrecoveryscript commands.\n");
 	printf("Some common commands include:\n");
 	printf("  install /path/to/update.zip\n");
-	printf("  backup <SDCRBAEM> [backupname]\n");
-	printf("  restore <SDCRBAEM> [backupname]\n");
+	printf("  backup [name] <SDCRBAEOMX>[:password]     (O=compress, M=skip digest, X=encrypt)\n");
+	printf("  restore <folder> [<SDCRBAEM>][:<password>]     (M=skip digest)\n");
 	printf("  wipe <partition name>\n");
 	printf("  format data\n");
 	printf("  sideload\n");

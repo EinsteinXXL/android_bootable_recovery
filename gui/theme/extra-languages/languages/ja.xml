@@ -162,6 +162,10 @@
 		<string name="part_used">使用中: %tw_partition_used%MB</string>
 		<string name="part_free">空き: %tw_partition_free%MB</string>
 		<string name="part_backup_size">バックアップサイズ: %tw_partition_backup_size%MB</string>
+		<string name="part_size_kb">サイズ: %tw_partition_size%KB</string>
+		<string name="part_used_kb">使用中: %tw_partition_used%KB</string>
+		<string name="part_free_kb">空き: %tw_partition_free%KB</string>
+		<string name="part_backup_size_kb">バックアップサイズ: %tw_partition_backup_size%KB</string>
 		<string name="resize_btn">ファイルシステムのリサイズ</string>
 		<string name="resize_btn_s">リサイズ</string>
 		<string name="resize_confirm">%tw_partition_name% をリサイズしますか?</string>
@@ -604,7 +608,7 @@
 		<string name="compression_on">圧縮は有効です</string>
 		<string name="digest_off">Digest 生成は無効です</string>
 		<string name="backup_fail">バックアップに失敗しました</string>
-		<string name="backup_clean">バックアップに失敗しました。バックアップフォルダを掃除中です。</string>
+		<string name="backup_error_clean">バックアップに失敗しました。バックアップフォルダを掃除中です。</string>
 		<string name="running_recovery_commands">リカバリコマンドの実行中</string>
 		<string name="recovery_commands_complete">リカバリコマンドを実行しました</string>
 		<string name="running_ors">OpenRecoveryScript の実行中</string>
@@ -657,5 +661,6 @@
 		<string name="theme_ver_err">カスタムテーマのバージョンが TWRP のバージョンと一致しません。標準のテーマを使用します。</string>
 		<string name="up_a_level">(上の階層へ)</string>
 		<string name="install_reboot">5秒後に再起動します</string>
+		<string name="verbose_log_chk">Enable verbose log (log all file/folder names)</string>
 	</resources>
 </language>

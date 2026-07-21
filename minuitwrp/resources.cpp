@@ -378,6 +378,36 @@ void res_free_surface(gr_surface surface) {
     }
 }
 
+// Opaque-x span of a surface. GGLSurface stores pixels as RGBA/BGRA (alpha in the
+// last byte) or RGBX (no alpha). stride is in PIXELS -> byte stride = stride * 4
+// for the 8888 formats. Only a real alpha format is scanned; RGBX_8888 (and
+// everything else) -> return 0 -> the caller falls back to the full rect.
+int gr_surface_opaque_xspan(gr_surface surface, int* minx, int* maxx) {
+    GGLSurface* s = (GGLSurface*) surface;
+    if (minx) *minx = -1;
+    if (maxx) *maxx = -1;
+    if (!s || !s->data) return 0;
+    if (s->format != GGL_PIXEL_FORMAT_RGBA_8888 &&
+        s->format != GGL_PIXEL_FORMAT_BGRA_8888)
+        return 0; // no usable alpha channel (e.g. RGBX_8888)
+    int w = (int) s->width;
+    int h = (int) s->height;
+    int stride_px = s->stride; // in pixels
+    int lo = -1, hi = -1;
+    for (int y = 0; y < h; y++) {
+        const unsigned char* row = s->data + (size_t) y * stride_px * 4;
+        for (int x = 0; x < w; x++) {
+            if (row[x * 4 + 3] > 8) { // alpha > threshold -> visible
+                if (lo < 0 || x < lo) lo = x;
+                if (x > hi) hi = x;
+            }
+        }
+    }
+    if (minx) *minx = lo;
+    if (maxx) *maxx = hi;
+    return 1;
+}
+
 // Scale image function
 int res_scale_surface(gr_surface source, gr_surface* destination, float scale_w, float scale_h) {
     GGLContext *gl = NULL;

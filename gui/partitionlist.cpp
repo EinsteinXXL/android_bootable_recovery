@@ -29,6 +29,7 @@ extern "C" {
 #include "objects.hpp"
 #include "../data.hpp"
 #include "../partitions.hpp"
+#include "../twrp-functions.hpp"
 
 GUIPartitionList::GUIPartitionList(xml_node<>* node) : GUIScrollList(node)
 {
@@ -255,11 +256,9 @@ void GUIPartitionList::NotifySelect(size_t item_selected)
 						mList.at(i).selected = 0;
 
 					if (update_size) {
-						char free_space[255];
-						sprintf(free_space, "%llu", Part->Free / 1024 / 1024);
-						mList.at(item_selected).Display_Name = Part->Storage_Name + " (";
-						mList.at(item_selected).Display_Name += free_space;
-						mList.at(item_selected).Display_Name += "MB)";
+						std::string unit;
+						std::string num = TWFunc::Bytes_To_Readable_Size(Part->Free, unit);
+						mList.at(item_selected).Display_Name = Part->Storage_Name + " (" + num + unit + ")";
 					}
 					mList.at(item_selected).selected = 1;
 					mUpdate = 1;

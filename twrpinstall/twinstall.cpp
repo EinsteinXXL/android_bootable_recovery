@@ -81,7 +81,7 @@ static int Install_Theme(const char* path, ZipArchiveHandle Zip) {
 	if (!PartitionManager.Mount_Settings_Storage(true))
 		return INSTALL_ERROR;
 	string theme_path = DataManager::GetSettingsStoragePath();
-	theme_path += "/TWRP/theme";
+	theme_path += "theme";
 	if (!TWFunc::Path_Exists(theme_path)) {
 		if (!TWFunc::Recursive_Mkdir(theme_path)) {
 			return INSTALL_ERROR;
@@ -157,7 +157,7 @@ static int Run_Update_Binary(const char *path, int* wipe_cache, zip_type ztype) 
 	int ret_val, pipe_fd[2], status, zip_verify;
 	char buffer[1024];
 	FILE* child_data;
-	pipe(pipe_fd);
+	pipe2(pipe_fd, O_CLOEXEC);
 
 	std::vector<std::string> args;
     if (ztype == UPDATE_BINARY_ZIP_TYPE) {
@@ -183,6 +183,7 @@ static int Run_Update_Binary(const char *path, int* wipe_cache, zip_type ztype) 
 	pid_t pid = fork();
 	if (pid == 0) {
 		close(pipe_fd[0]);
+		fcntl(pipe_fd[1], F_SETFD, 0); // clear O_CLOEXEC: update-binary needs this FD
 		execve(chr_args[0], const_cast<char**>(chr_args), environ);
 		printf("E:Can't execute '%s': %s\n", chr_args[0], strerror(errno));
 		_exit(-1);

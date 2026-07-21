@@ -21,6 +21,8 @@
 
 #include <string>
 #include <vector>
+#include <chrono>        // std::chrono::nanoseconds (Wait_For_File/Wait_For_Battery; in recovery it comes transitively via partitions.hpp, which is guarded out for BUILD_TWRPTAR_MAIN)
+#include <sys/types.h>   // off64_t (Trim_Output_Cache signature; partitions.hpp is absent in the twrpTarMain build)
 
 #include "twrpDigest/twrpDigest.hpp"
 
@@ -45,11 +47,35 @@ typedef enum
 	rb_fastboot
 } RebootCommand;
 
+// The enum is split between original TWRP (LEGACY_*, read only) and this build
+// (unprefixed, read + write). Original TWRP occupies indices 0-3; this build
+// writes exclusively 4-7 (directory-first processing, DFP). The indices are
+// disjoint so old backups can never be misread through colliding indices
+// (e.g. index 2 = OpenAES upstream vs BoringSSL AES here).
+// ⚠ BACKPORT WARNING: upstream TWRP names index 0/1 UNCOMPRESSED/COMPRESSED —
+// here those names mean 4/6. Any upstream patch that references Archive_Type
+// constants compiles silently against the WRONG value; map every occurrence
+// explicitly to LEGACY_* (gzip world) or unprefixed (zstd/AEAD world).
 enum Archive_Type {
-	UNCOMPRESSED = 0,
-	COMPRESSED,
-	ENCRYPTED,
-	COMPRESSED_ENCRYPTED
+	// ----- original TWRP (read only, legacy single-pipe restore path) -----
+	LEGACY_UNCOMPRESSED = 0,             // plain tar (original TWRP; 0 doubles as the pre-detection default)
+	LEGACY_COMPRESSED = 1,               // tar + gzip (pigz)
+	LEGACY_ENCRYPTED = 2,                // tar + OpenAES (TWRP <= 3.6, rejected)
+	LEGACY_COMPRESSED_ENCRYPTED = 3,     // tar + gzip + OpenAES (TWRP <= 3.6, rejected; no code refs — outer magic is always "OA")
+	// ----- this build (write + read, directory-first processing) -----
+	UNCOMPRESSED = 4,                    // plain tar
+	ENCRYPTED = 5,                       // tar + AEAD (BAES: AES-256-GCM or ChaCha20-Poly1305)
+	COMPRESSED = 6,                      // tar + zstd
+	COMPRESSED_ENCRYPTED = 7             // tar + zstd + AEAD
+};
+
+// Result of the self-describing archive-type detection.
+// DET_OK -> *out valid; otherwise the reject reason for TWFunc::emit_detect_reject().
+enum DetectResult {
+	DET_OK = 0,          // *out set and valid
+	DET_REJECT_OPENAES,  // OpenAES magic ("OA") — unsupported
+	DET_REJECT_UNKNOWN,  // header matches no known format
+	DET_WRONG_PASSWORD   // BAES, but decryption fails (password/corrupt)
 };
 
 // Partition class
@@ -65,9 +91,15 @@ public:
 	static int Wait_For_Child(pid_t pid, int *status, string Child_Name, bool Show_Errors = true); // Waits for pid to exit and checks exit status, displays an error to the GUI if Show_Errors is true which is the default
 	static int Wait_For_Child_Timeout(pid_t pid, int *status, const string& Child_Name, int timeout); // Waits for a pid to exit until the timeout is hit. If timeout is hit, kill the chilld.
 	static bool Path_Exists(string Path);                                       // Returns true if the path exists
-	static Archive_Type Get_File_Type(string fn);                               // Determines file type, 0 for unknown, 1 for gzip, 2 for OAES encrypted
-	static int Try_Decrypting_File(string fn, string password); // -1 for some error, 0 for failed to decrypt, 1 for decrypted, 3 for decrypted and found gzip format
+	// Archive-type detection lives in BackupHeaderManager (GetFileType() /
+	// Load()+getters); only is_legacy_type/emit_detect_reject remain here.
+	static bool is_legacy_type(Archive_Type t);                                // legacy (0-3, original TWRP, single-pipe) vs this build (4-7, multi-pipe DFP)
+	static void emit_detect_reject(DetectResult dr, const std::string& path);  // unified GUI reject message for non-OK DetectResult
 	static unsigned long Get_File_Size(const string& Path);                     // Returns the size of a file
+	// Generic write-behind page-cache trim of a seekable output fd: drops clean
+	// pages behind the write head while writing. trim_offset = in/out (last
+	// dropped offset, caller resets it per segment to 0). fd<0/non-seekable = no-op.
+	static void Trim_Output_Cache(int fd, off64_t& trim_offset);
 	static std::string Remove_Beginning_Slash(const std::string& path);         // Remove the beginning slash of a path
 	static std::string Remove_Trailing_Slashes(const std::string& path, bool leaveLast = false); // Normalizes the path, e.g /data//media/ -> /data/media
 	static void Strip_Quotes(char* &str);                                       // Remove leading & trailing double-quotes from a string
@@ -96,7 +128,7 @@ public:
 	static int read_file(string fn, uint64_t& results); //read from file
 	static bool write_to_file(const string& fn, const string& line);              //write single line to file with no newline
 	static bool write_to_file(const string& fn, const std::vector<string> lines); // write vector of strings line by line with newlines
-	static bool Try_Decrypting_Backup(string Restore_Path, string Password); // true for success, false for failed to decrypt
+	static bool Try_Decrypting_Backup(string Restore_Path, const string& Password); // true for success, false for failed to decrypt
 	static string System_Property_Get(string Prop_Name);                // Returns value of Prop_Name from reading /system/build.prop
 	static string Partition_Property_Get(string Prop_Name, TWPartitionManager &PartitionManager, string Mount_Point, string prop_file_name);     // Returns value of Prop_Name from reading provided prop file
 	static string Get_Current_Date(void);                               // Returns the current date in ccyy-m-dd--hh-nn-ss format
@@ -107,6 +139,7 @@ public:
 	static int Set_Brightness(std::string brightness_value); // Well, you can read, it does what it says, passing return int from TWFunc::Write_File ;)
 	static bool Toggle_MTP(bool enable);                                        // Disables MTP if enable is false and re-enables MTP if enable is true and it was enabled the last time it was toggled off
 	static std::string to_string(unsigned long value); //convert ul to string
+	static std::string Bytes_To_Readable_Size(unsigned long long bytes, std::string& unit); // returns the numeric part as string; sets unit to "KB" (< 1 MB) or "MB"
 	static void SetPerformanceMode(bool mode); // support recovery.perf.mode
 	static void Disable_Stock_Recovery_Replace(); // Disable stock ROMs from replacing TWRP with stock recovery
 	static unsigned long long IOCTL_Get_Block_Size(const char* block_device);
@@ -135,6 +168,12 @@ public:
 
 private:
 	static void Copy_Log(string Source, string Destination);
+	// Per-operation log slicing: context slice [0..ctx_end) + separator line +
+	// op slice [op_start..EOF) from Source to Destination. false on ANY error or
+	// inconsistent offsets -> the caller (Save_Recovery_Log) falls back to the
+	// full copy.
+	static bool Copy_Log_Slices(const string& Source, const string& Destination, long long ctx_end, long long op_start);
+	friend class TWPartitionManager;   // Save_Recovery_Log uses Copy_Log_Slices
 
 };
 

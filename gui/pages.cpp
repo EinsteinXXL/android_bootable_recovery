@@ -536,6 +536,48 @@ int Page::Render(void)
 	return 0;
 }
 
+int Page::RenderRegion(int rx, int ry, int rw, int rh)
+{
+	// Redraw only the rectangle area. gr_clip sets the scissor; the background fill
+	// and all object renders are thereby confined to the region. Objects outside the
+	// region produce effectively no pixels (discarded by the scissor) -> much cheaper
+	// than a full Page::Render().
+	gr_clip(rx, ry, rw, rh);
+	gr_color(mBackground.red, mBackground.green, mBackground.blue, mBackground.alpha);
+	// Fill only the region rectangle, NOT the whole framebuffer. A full-screen fill
+	// scans 4.5M px and discards ~all via the scissor -> a fixed overhead per region
+	// (~6 ms even for tiny damage). gr_fill rotates the coordinates itself
+	// (ROTATION_*_DISP), the scissor stays active for overlapping widgets.
+	gr_fill(rx, ry, rw, rh);
+
+	const int region_x1 = rx + rw;
+	const int region_y1 = ry + rh;
+
+	std::vector<RenderObject*>::iterator iter;
+	for (iter = mRenders.begin(); iter != mRenders.end(); iter++)
+	{
+		// Object skip: objects with KNOWN bounds that do not intersect the region are
+		// not rendered at all (saves draw-call/blit setup AND, for GUIText, mutating
+		// mLastValue/mVarChanged -> prevents "swallowing" value changes through
+		// invisible renders). Bounds come from GetClipBounds(): image/progressbar/fill
+		// from mRenderW/H, GUIText from its cached text bbox. If the method returns
+		// false (bounds still unknown) the object is drawn to be safe.
+		int ox = 0, oy = 0, ow = 0, oh = 0;
+		if ((*iter)->GetClipBounds(ox, oy, ow, oh)) {
+			if (ox >= region_x1 || ox + ow <= rx || oy >= region_y1 || oy + oh <= ry) {
+				continue; // known bounds, no intersection -> skip
+			}
+		}
+		// Re-set the clip before EVERY object: GUIScrollList/GUIConsole call gr_noclip()
+		// internally, which would otherwise lift the scissor for the following objects.
+		gr_clip(rx, ry, rw, rh);
+		if ((*iter)->Render())
+			LOGERR("A render request has failed.\n");
+	}
+	gr_noclip();
+	return 0;
+}
+
 int Page::Update(void)
 {
 	int retCode = 0;
@@ -929,6 +971,17 @@ int PageSet::SetPage(std::string page)
 	Page* tmp = FindPage(page);
 	if (tmp)
 	{
+		// Restore pause hook. Pause the restore pipeline children (SIGSTOP) when the
+		// user enters the cancel_restore_confirm page; resume (SIGCONT) on leaving.
+		// Central here rather than in 4 XML action sites (slider, continue button,
+		// hardware back, hardware home) because all exit paths ultimately go through
+		// SetPage. No-op when no restore is active.
+		const std::string old_name = mCurrentPage ? mCurrentPage->GetName() : "";
+		const bool entering_confirm = (page == "cancel_restore_confirm" && old_name != "cancel_restore_confirm");
+		const bool leaving_confirm  = (old_name == "cancel_restore_confirm" && page != "cancel_restore_confirm");
+		if (entering_confirm)  PartitionManager.Pause_Restore();
+		if (leaving_confirm)   PartitionManager.Resume_Restore();
+
 		if (mCurrentPage)   mCurrentPage->SetPageFocus(0);
 		mCurrentPage = tmp;
 		mCurrentPage->SetPageFocus(1);
@@ -1120,6 +1173,30 @@ int PageSet::Render(void)
 	return ret;
 }
 
+int PageSet::RenderRegion(int rx, int ry, int rw, int rh)
+{
+	// Region render is now OVERLAY-CAPABLE -- page + all overlays in Z-order (exactly
+	// like PageSet::Render), each clipped to the region via Page::RenderRegion. An
+	// overlay blends its (possibly semi-transparent) background over the freshly
+	// (opaque) drawn page region -> per-pixel identical to the full render, just
+	// confined to the region. Previously overlays were not handled here and the GUI
+	// loop forced a full-render fallback on active overlays (lock/slideout/
+	// select_storage/select_language): 75 ms/frame idle and 320-330 ms/frame under
+	// backup load per lockscreen-swipe frame -> the slider stuttered (14 and 3 fps).
+	int ret = (mCurrentPage ? mCurrentPage->RenderRegion(rx, ry, rw, rh) : -1);
+	if (ret < 0)
+		return ret;
+
+	std::vector<Page*>::iterator iter;
+
+	for (iter = mOverlays.begin(); iter != mOverlays.end(); iter++) {
+		ret = ((*iter) ? (*iter)->RenderRegion(rx, ry, rw, rh) : -1);
+		if (ret < 0)
+			return ret;
+	}
+	return ret;
+}
+
 int PageSet::Update(void)
 {
 	int ret;
@@ -1131,9 +1208,18 @@ int PageSet::Update(void)
 	std::vector<Page*>::iterator iter;
 
 	for (iter = mOverlays.begin(); iter != mOverlays.end(); iter++) {
-		ret = ((*iter) ? (*iter)->Update() : -1);
-		if (ret < 0)
-			return ret;
+		int oret = ((*iter) ? (*iter)->Update() : -1);
+		if (oret < 0)
+			return oret;
+		// max instead of overwriting (like Page::Update over all objects): a static
+		// overlay (oret=0) must not mask the 1 reported by an animating page,
+		// otherwise the GUI loop wrongly falls into the idle_frames throttle.
+		// Likewise a full-render request (oret>1) of an earlier overlay is no longer
+		// swallowed by a later 0. The region path renders overlays too
+		// (PageSet::RenderRegion, Z-order) -> each layer reports its damage rects via
+		// RequestFrameRegion itself; max only carries the render degree.
+		if (oret > ret)
+			ret = oret;
 	}
 	return ret;
 }
@@ -1306,7 +1392,7 @@ void PageManager::LoadLanguageList(ZipArchiveHandle package) {
 		TWFunc::removeDir(TWRES "customlanguages", true);
 	if (package) {
 		TWFunc::Recursive_Mkdir(TWRES "customlanguages");
-		ExtractPackageRecursive(package, "/", TWRES "customlanguages", nullptr, nullptr);
+		ExtractPackageRecursive(package, "languages/", TWRES "customlanguages/", nullptr, nullptr);
 
 		// package->ExtractRecursive("languages", TWRES "customlanguages/");
 		LoadLanguageListDir(TWRES "customlanguages/");
@@ -1511,7 +1597,7 @@ int PageManager::RunReload() {
 		ret_val = 1;
 	}
 
-	theme_path += "/TWRP/theme/ui.zip";
+	theme_path += "theme/ui.zip";
 	if (ret_val != 0 || ReloadPackage("TWRP", theme_path) != 0)
 	{
 		// Loading the custom theme failed - try loading the stock theme
@@ -1529,6 +1615,7 @@ int PageManager::RunReload() {
 		}
 	}
 
+	DataManager::ReadSettingsFile();
 	// This makes the console re-translate
 	GUIConsole::Clear_For_Retranslation();
 
@@ -1582,6 +1669,101 @@ int PageManager::Render(void)
 		return 0;
 
 	int res = (mCurrentSet ? mCurrentSet->Render() : -1);
+	if (mMouseCursor)
+		mMouseCursor->Render();
+	return res;
+}
+
+// Region accumulator as a disjoint LIST of rects. Touched only from the GUI thread
+// (no mutex). Instead of a bounding box (which becomes ~fullscreen for spatially
+// scattered widgets) we collect up to GUI_MAX_DIRTY_RECTS separate rectangles.
+// Overflow -> g_frame_overflow -> the loop does a full render.
+#define GUI_MAX_DIRTY_RECTS 12
+static GRRect g_frame_rects[GUI_MAX_DIRTY_RECTS];
+static int g_frame_rect_count = 0;
+static bool g_frame_overflow = false;
+
+static bool gui_rects_overlap(const GRRect& a, const GRRect& b)
+{
+	int ax1 = a.x + a.w, ay1 = a.y + a.h;
+	int bx1 = b.x + b.w, by1 = b.y + b.h;
+	// Touching counts as overlap (>=/<=) so adjacent rects get merged.
+	return !(b.x > ax1 || bx1 < a.x || b.y > ay1 || by1 < a.y);
+}
+
+static void gui_rect_union(GRRect& a, const GRRect& b)
+{
+	int x0 = (a.x < b.x) ? a.x : b.x;
+	int y0 = (a.y < b.y) ? a.y : b.y;
+	int ax1 = a.x + a.w, ay1 = a.y + a.h;
+	int bx1 = b.x + b.w, by1 = b.y + b.h;
+	int x1 = (ax1 > bx1) ? ax1 : bx1;
+	int y1 = (ay1 > by1) ? ay1 : by1;
+	a.x = x0; a.y = y0; a.w = x1 - x0; a.h = y1 - y0;
+}
+
+void PageManager::ResetFrameRegion()
+{
+	g_frame_rect_count = 0;
+	g_frame_overflow = false;
+}
+
+void PageManager::RequestFrameRegion(int rx, int ry, int rw, int rh)
+{
+	if (rw <= 0 || rh <= 0)
+		return;
+	if (g_frame_overflow)
+		return;
+	GRRect nr = { rx, ry, rw, rh };
+	// Merge into an overlapping existing rect (keeps the list small).
+	for (int i = 0; i < g_frame_rect_count; i++) {
+		if (gui_rects_overlap(g_frame_rects[i], nr)) {
+			gui_rect_union(g_frame_rects[i], nr);
+			return;
+		}
+	}
+	if (g_frame_rect_count >= GUI_MAX_DIRTY_RECTS) {
+		g_frame_overflow = true;
+		return;
+	}
+	g_frame_rects[g_frame_rect_count++] = nr;
+}
+
+bool PageManager::FrameHasRegion()
+{
+	return g_frame_rect_count > 0 || g_frame_overflow;
+}
+
+int PageManager::FrameRegionCount()
+{
+	return g_frame_rect_count;
+}
+
+GRRect PageManager::GetFrameRegionAt(int i)
+{
+	if (i < 0 || i >= g_frame_rect_count) {
+		GRRect z = {0, 0, 0, 0};
+		return z;
+	}
+	return g_frame_rects[i];
+}
+
+bool PageManager::FrameRegionOverflow()
+{
+	return g_frame_overflow;
+}
+
+bool PageManager::CurrentSetHasOverlays()
+{
+	return (mCurrentSet ? mCurrentSet->HasOverlays() : false);
+}
+
+int PageManager::RenderRegion(int rx, int ry, int rw, int rh)
+{
+	if (blankTimer.isScreenOff())
+		return 0;
+
+	int res = (mCurrentSet ? mCurrentSet->RenderRegion(rx, ry, rw, rh) : -1);
 	if (mMouseCursor)
 		mMouseCursor->Render();
 	return res;

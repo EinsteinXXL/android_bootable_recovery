@@ -171,6 +171,7 @@
 		<variable name="row20_y" value="1104"/>
 		<variable name="navbar_y" value="1104"/>
 		<variable name="navbar_btn_y" value="1152"/>
+		<!-- Y of the yellow RAW-cancel hint (restore_run page); scaled per DPI variant. Landscape: ABOVE the button (navbar below, no room). -->
 		<variable name="keyboard_y" value="592"/>
 		<variable name="background_color" value="#1A1A1A"/>
 		<variable name="accent_color" value="#0090CA"/>

@@ -61,6 +61,7 @@ GUISliderValue::GUISliderValue(xml_node<>* node) : GUIObject(node)
 	mValueStr = NULL;
 	mAction = NULL;
 	mShowCurr = true;
+	mValueRight = false;
 	mShowRange = false;
 	mChangeOnDrag = false;
 	mRendered = false;
@@ -157,7 +158,11 @@ GUISliderValue::GUISliderValue(xml_node<>* node) : GUIObject(node)
 
 		attr = child->first_attribute("showcurr");
 		if (attr)
-			mShowCurr = atoi(attr->value());
+		{
+			// "right" = value number to the right of the track (instead of centered below); else 0/1.
+			if (strcmp(attr->value(), "right") == 0) { mShowCurr = true; mValueRight = true; }
+			else mShowCurr = atoi(attr->value());
+		}
 
 		attr = child->first_attribute("changeondrag");
 		if (attr)
@@ -192,6 +197,9 @@ GUISliderValue::GUISliderValue(xml_node<>* node) : GUIObject(node)
 		mLinePadding += textW;
 	}
 
+	// showcurr="right": space for the value number is reserved ASYMMETRICALLY on the
+	// right only (in SetRenderPos), so the LEFT track edge stays flush with the content
+	// (e.g. checkboxes).
 	SetRenderPos(mRenderX, mRenderY, mRenderW);
 }
 
@@ -230,7 +238,7 @@ int GUISliderValue::SetRenderPos(int x, int y, int w, int h)
 	}
 
 	mRenderH = mSliderH;
-	if (mShowCurr)
+	if (mShowCurr && !mValueRight)   // number-on-right needs no extra height (sits beside the track)
 		mRenderH += mFontHeight;
 
 	if (mLabel)
@@ -260,8 +268,17 @@ int GUISliderValue::SetRenderPos(int x, int y, int w, int h)
 	else
 		mLineW = mRenderW - (mLinePadding * 2);
 
+	// showcurr="right": reserve space for the number on the RIGHT only (reserve = gap +
+	// number width + small margin) -> the track gets shorter on the right, the left edge
+	// stays flush (see mLineX below).
+	if (mValueRight)
+		mLineW -= (mFontHeight + measureText(mMaxStr));
+
 	mLineY = y + (mSliderH/2 - mLineH/2);
-	mLineX = mRenderX + (mRenderW/2 - mLineW/2);
+	if (mValueRight)
+		mLineX = mRenderX + mLinePadding;            // left edge flush with the content (checkboxes)
+	else
+		mLineX = mRenderX + (mRenderW/2 - mLineW/2); // original: track centered
 
 	return 0;
 }
@@ -337,7 +354,14 @@ int GUISliderValue::Render(void)
 	{
 		sprintf(mValueStr, "%d", mValue);
 		int textW = measureText(mValueStr);
-		gr_textEx_scaleW(mRenderX + (mRenderW/2 - textW/2), mSliderY+mSliderH, mValueStr, fontResource, mRenderW, TOP_LEFT, 0);
+		if (mValueRight)
+		{
+			// to the right of the track, vertically centered on the slider height; DPI gap via font height
+			int valY = mSliderY + (mSliderH/2 - mFontHeight/2);
+			gr_textEx_scaleW(mLineX + mLineW + (mFontHeight / 2), valY, mValueStr, fontResource, mRenderW, TOP_LEFT, 0);
+		}
+		else
+			gr_textEx_scaleW(mRenderX + (mRenderW/2 - textW/2), mSliderY+mSliderH, mValueStr, fontResource, mRenderW, TOP_LEFT, 0);
 	}
 
 	mRendered = true;
@@ -358,8 +382,15 @@ int GUISliderValue::Update(void)
 
 int GUISliderValue::valueFromPct(float pct)
 {
-	int range = abs(mMax - mMin);
-	return mMin + (pct * range) / 100;
+	// Equal-width N segments: each discrete step gets an equally wide selection band
+	// (count = number of steps, incl. endpoints). Fixes the uneven grid (a floor over
+	// (max-min) made the last step only a sliver and the first step visually offset).
+	// The resting detents stay pctFromValue.
+	int count = mMax - mMin + 1;
+	int idx = (int)(pct * count / 100.0f);
+	if (idx < 0) idx = 0;
+	if (idx >= count) idx = count - 1;
+	return mMin + idx;
 }
 
 float GUISliderValue::pctFromValue(int value)
@@ -388,11 +419,15 @@ int GUISliderValue::NotifyTouch(TOUCH_STATE state, int x, int y)
 		x = std::max(mLineX + mSliderW/2, x);
 		x = std::min(mLineX + mLineW - mSliderW/2, x);
 
-		mValuePct = float(((x - (mLineX + mSliderW/2)) * 100) / (mLineW - mSliderW));
-		int newVal = valueFromPct(mValuePct);
+		// finger position -> step (real float division: continuous, equal-width bands)
+		float fingerPct = float((x - (mLineX + mSliderW/2)) * 100) / float(mLineW - mSliderW);
+		int newVal = valueFromPct(fingerPct);
 		if (newVal != mValue) {
-			mRendered = false;
 			mValue = newVal;
+			// Snap the handle to the current step's detent IMMEDIATELY (already during the
+			// drag, not only on release) -> reaches the end as soon as step min/max is chosen.
+			mValuePct = pctFromValue(mValue);
+			mRendered = false;
 			if (mChangeOnDrag) {
 				if (!mVariable.empty())
 					DataManager::SetValue(mVariable, mValue);
@@ -407,6 +442,9 @@ int GUISliderValue::NotifyTouch(TOUCH_STATE state, int x, int y)
 		if (!mDragging)  return 0;
 		mDragging = false;
 
+		// Note: the handle snap already happens in TOUCH_DRAG (mValuePct = detent), so NO
+		// second snap is needed here. NotifyVarChange is a no-op on commit (newVal==mValue),
+		// but mValuePct is already the correct detent from the drag.
 		if (!mVariable.empty())
 			DataManager::SetValue(mVariable, mValue);
 		if (mAction)

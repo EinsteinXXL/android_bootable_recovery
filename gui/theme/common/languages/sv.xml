@@ -199,5 +199,28 @@
 		<string name="config_twrp">Konfigurerar TWRP...</string>
 		<string name="auto_gen">(Auto-generera)</string>
 		<string name="curr_date">(Dagens datum)</string>
+		<!-- Backup/Restore Exit-Marker (Operation_Cleanup, 2026-05-29) -->
+		<string name="backup_fail">[SÄKERHETSKOPIERING MISSLYCKADES]</string>
+		<string name="backup_fail_status">Säkerhetskopiering misslyckades</string>
+		<string name="backup_cancel">[SÄKERHETSKOPIERING AVBRUTEN]</string>
+		<string name="backup_cancel_status">Säkerhetskopiering avbruten</string>
+		<string name="backup_error_clean">Säkerhetskopiering misslyckades. Rensar säkerhetskopiemapp.</string>
+		<string name="backup_cancel_clean">Säkerhetskopiering avbruten! Rensar säkerhetskopiemapp.</string>
+		<string name="restore_fail">[ÅTERSTÄLLNING MISSLYCKADES]</string>
+		<string name="restore_fail_status">Återställning misslyckades</string>
+		<string name="restore_cancel">[ÅTERSTÄLLNING AVBRUTEN]</string>
+		<string name="restore_cancel_status">Återställning avbruten</string>
+		<string name="adbbu_preparing">Preparing ADB backup mode...</string>
+		<string name="adbbu_ready">ADB backup mode ready. On the PC you can now run your backup or restore as usual with 'adb backup/restore'.</string>
+		<string name="adbbu_idle_hint">If no backup/restore follows, this mode turns off automatically after {1} minutes.</string>
+		<string name="adbbu_stopped">ADB backup mode stopped. Default ADB was restored.</string>
+		<string name="adbbu_stopped_timeout">ADB backup mode was stopped after timeout ({1} min). Default ADB was restored.</string>
+		<string name="adbbu_cancel_mode">Cancelling ADB backup mode...</string>
+		<string name="adbbu_stock_refused">Direct 'adb backup/restore' is disabled here: stock adbd uses a freeze-prone PTY. On the PC run:  adb shell adbbu start  then retry your backup/restore.</string>
+		<string name="adbbu_read_ab_hdr">Reading Backup</string>
+		<string name="adbbu_read_ab">Reading ADB backup file. Please wait...</string>
+		<string name="adbbu_read_ab_done">...Done.</string>
+		<string name="adbbu_invalid_ab">Unable to read the ADB backup header of '{1}'. The backup file is corrupt.</string>
+		<string name="verbose_log_chk">Enable verbose log (log all file/folder names)</string>
 	</resources>
 </language>

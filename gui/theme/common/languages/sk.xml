@@ -159,6 +159,10 @@
 		<string name="part_used">Použité: %tw_partition_used%MB</string>
 		<string name="part_free">Voľné: %tw_partition_free%MB</string>
 		<string name="part_backup_size">Veľkosť zálohy: %tw_partition_backup_size%MB</string>
+		<string name="part_size_kb">Veľkosť: %tw_partition_size%KB</string>
+		<string name="part_used_kb">Použité: %tw_partition_used%KB</string>
+		<string name="part_free_kb">Voľné: %tw_partition_free%KB</string>
+		<string name="part_backup_size_kb">Veľkosť zálohy: %tw_partition_backup_size%KB</string>
 		<string name="resize_btn">Zväčšiť súborový systém</string>
 		<string name="resize_btn_s">Zväčšiť</string>
 		<string name="resize_confirm">Zväčšiť %tw_partition_name%?</string>
@@ -580,7 +584,7 @@
 		<string name="compression_on">Kompresia zapnutá</string>
 		<string name="digest_off" version="2">Generovanie Digest vypnuté</string>
 		<string name="backup_fail">Zálohovanie zlyhalo</string>
-		<string name="backup_clean">Zálohovanie zlyhalo. Čistenie adresára záloh.</string>
+		<string name="backup_error_clean">Zálohovanie zlyhalo. Čistenie adresára záloh.</string>
 		<string name="running_recovery_commands">Spúšťanie príkazov recovery</string>
 		<string name="recovery_commands_complete">Príkazy recovery dokončené</string>
 		<string name="running_ors">Spúšťanie OpenRecoveryScript</string>
@@ -630,5 +634,17 @@
 		<string name="cancel_sideload">Rušenie ADB sideload...</string>
 		<string name="change_fs_err">Chyba pri zmene súborového systému.</string>
 		<string name="theme_ver_err">Vlastná téma sa nezhoduje s verziou TWRP. Používa sa originál téma.</string>
+		<string name="adbbu_preparing">Preparing ADB backup mode...</string>
+		<string name="adbbu_ready">ADB backup mode ready. On the PC you can now run your backup or restore as usual with 'adb backup/restore'.</string>
+		<string name="adbbu_idle_hint">If no backup/restore follows, this mode turns off automatically after {1} minutes.</string>
+		<string name="adbbu_stopped">ADB backup mode stopped. Default ADB was restored.</string>
+		<string name="adbbu_stopped_timeout">ADB backup mode was stopped after timeout ({1} min). Default ADB was restored.</string>
+		<string name="adbbu_cancel_mode">Cancelling ADB backup mode...</string>
+		<string name="adbbu_stock_refused">Direct 'adb backup/restore' is disabled here: stock adbd uses a freeze-prone PTY. On the PC run:  adb shell adbbu start  then retry your backup/restore.</string>
+		<string name="adbbu_read_ab_hdr">Reading Backup</string>
+		<string name="adbbu_read_ab">Reading ADB backup file. Please wait...</string>
+		<string name="adbbu_read_ab_done">...Done.</string>
+		<string name="adbbu_invalid_ab">Unable to read the ADB backup header of '{1}'. The backup file is corrupt.</string>
+		<string name="verbose_log_chk">Enable verbose log (log all file/folder names)</string>
 	</resources>
 </language>

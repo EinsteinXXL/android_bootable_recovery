@@ -16,6 +16,12 @@
 #ifndef __TWADBSTREAM_H
 #define __TWADBSTREAM_H
 
+// twadbstream.h uses std::string + strnlen in the control structs (get_type()).
+// Include it self-contained so lean includers like adbbutrigger.cpp (which only
+// need the op defines) build without a prior <string> include.
+#include <string>
+#include <cstring>
+
 #define TWRPARG "--twrp"
 #define TWRP_BACKUP_ARG "backup"
 #define TWRP_RESTORE_ARG "restore"
@@ -28,6 +34,12 @@
 #define ADB_BU_MAX_ERROR 20				//Max amount of errors for while loops
 #define ADB_BACKUP_OP "adbbackup"
 #define ADB_RESTORE_OP "adbrestore"
+#define ADB_RESTORE_STREAM_OP "adbrestorestream"	//like adbrestore, but triggered by the GUI .ab restore (bu --twrp stream): the action thread owns the completion, the engine only reports status (tw_adbbu_stream_status)
+#define ADB_BU_MODE_START_OP "adbbustart"		//Trigger: start the PTY-free backup mode (twadbd)
+#define ADB_BU_MODE_CANCEL_OP "adbbucancel"		//Trigger: cancel/leave the backup mode
+#define ADB_BU_NOTICE_OP "adbbunotice"			//bu -> GUI: stock-adbd PTY (freeze-prone) refused, notify the user
+#define TWADBD_IDLE_SECS 300				//twadbd idle timeout (seconds without an accepted backup:/restore:) -- shared: twadbd.cpp (alarm) + twrpAdbBuFifo.cpp (GUI text "{1} minutes")
+#define TWADBD_EXIT_IDLE_TIMEOUT 2			//twadbd exit code from the SIGALRM handler -- lets the lifecycle tell timeout apart from one-shot end (0) and SIGTERM (cancel button)
 
 //ADB Backup Control Commands
 #define TWSTREAMHDR "twstreamheader"			//TWRP Parititon Count Control
@@ -42,6 +54,10 @@
 #define ADB_BACKUP_VERSION 3				//Backup Version
 #define DATA_MAX_CHUNK_SIZE 1048576			//Maximum size between each data header
 #define MAX_ADB_READ 512				//align with default tar size for amount to read fom adb stream
+#define ADB_DATA_BUFFER_SIZE 131072			//bulk-pump buffer (payload only, command structs stay MAX_ADB_READ):
+							//= TAR_DATA_BUF_SIZE (libtar/libtar.h) -- the chunk size the producer
+							//(tar_append_regfile bulk / zstd stdout) fills the FIFO with. Keep in
+							//sync when libtar changes it (deliberately no include coupling).
 
 /*
 structs for adb backup need to align to 512 bytes for reading 512
@@ -106,7 +122,41 @@ struct AdbBackupStreamHeader {
 	uint64_t partition_count;			//stores the number of partitions to restore in the stream
 	uint64_t version;				//stores the version of adb backup. increment ADB_BACKUP_VERSION each time the metadata is updated
 	uint32_t crc;					//stores the zlib 32 bit crc of the AdbBackupStreamHeader struct to allow for making sure we are processing metadata
-	char space[468];				//stores space to align the struct to 512 bytes
+	// Sum of the backup estimates (file_bytes + img_bytes) over ALL partitions --
+	// the denominator for the cumulative restore bar. Added in previously-zeroed
+	// reserve bytes -> NO version bump needed: old readers never read the field
+	// (offsets of the existing fields unchanged), old backups carry 0 (= unknown ->
+	// restore falls back to the per-partition incremental denominator). The bar is
+	// corrected exactly on the restore side via
+	// ProgressTracking::Finish_Partition_Exact() (P4 mirror).
+	// Stored as a lo/hi u32 pair, NOT a uint64_t: a u64 right after the u32 crc
+	// would force 4 pad bytes (u64 alignment) plus 4 tail pad => sizeof would be
+	// 520 instead of 512, the CRC would cover 8 never-sent (garbage) padding bytes,
+	// write() would push 8 excess bytes through the control channel, and external
+	// 512-byte parsers (verify_backup.py) would reject the stored CRC. On the wire
+	// the field is therefore u64 little-endian at offset 44 (accessors below).
+	// Value 0 = unknown (older backups).
+	uint32_t total_size_lo;
+	uint32_t total_size_hi;
+	char space[460];				//stores space to align the struct to 512 bytes
+
+	uint64_t get_total_size() {
+		return ((uint64_t)total_size_hi << 32) | (uint64_t)total_size_lo;
+	}
+	void set_total_size(uint64_t v) {
+		total_size_lo = (uint32_t)(v & 0xFFFFFFFFu);
+		total_size_hi = (uint32_t)(v >> 32);
+	}
 };
+
+// Wire-format canary: every command struct MUST be exactly MAX_ADB_READ (512)
+// bytes -- readers/writers copy block-wise with sizeof and the CRC is computed
+// over sizeof. An alignment slip (see the total_size comment above: u64 after
+// u32 -> sizeof 520) would otherwise silently break the on-wire format. These
+// asserts catch that at compile time.
+static_assert(sizeof(struct AdbBackupControlType) == MAX_ADB_READ, "AdbBackupControlType must be exactly 512 bytes");
+static_assert(sizeof(struct twfilehdr) == MAX_ADB_READ, "twfilehdr must be exactly 512 bytes");
+static_assert(sizeof(struct AdbBackupFileTrailer) == MAX_ADB_READ, "AdbBackupFileTrailer must be exactly 512 bytes");
+static_assert(sizeof(struct AdbBackupStreamHeader) == MAX_ADB_READ, "AdbBackupStreamHeader must be exactly 512 bytes");
 
 #endif //__TWADBSTREAM_H

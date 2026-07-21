@@ -48,6 +48,10 @@
 #define DEBUG 1
 #endif
 
+/* TAR_DATA_BUF_SIZE (128 KB) is defined in libtar/libtar.h since Phase 3 of the
+   Multi-Pipe-Restore umbau (Restore_Konzept.md Sec. 8.7) -- shared with extract.c
+   so backup write path and restore read path use the same chunk size. */
+
 struct tar_dev
 {
 	dev_t td_dev;
@@ -123,7 +127,9 @@ tar_append_file(TAR *t, const char *realname, const char *savename)
 		if (lgetfilecon(realname, &selinux_context) >= 0)
 		{
 			t->th_buf.selinux_context = strdup(selinux_context);
+#ifdef DEBUG
 			printf("  ==> set selinux context: %s\n", selinux_context);
+#endif
 			freecon(selinux_context);
 		}
 		else
@@ -172,10 +178,14 @@ tar_append_file(TAR *t, const char *realname, const char *savename)
 				|| strncmp((char *) tar_policy, SYSTEM_DE_FSCRYPT_POLICY, sizeof(SYSTEM_DE_FSCRYPT_POLICY)) == 0) {
 #ifdef USE_FSCRYPT_POLICY_V1
 					memcpy(t->th_buf.fep->master_key_descriptor, tar_policy, FS_KEY_DESCRIPTOR_SIZE);
-					printf("found fscrypt policy '%s' - '%s' - '%s'\n", realname, t->th_buf.fep->master_key_descriptor, policy_hex);
+					// Verbose log: the "found policy" line only under TAR_TW_VERBOSE_LOG (dedicated bit, NOT
+					// TAR_VERBOSE/L.316); the "failed to ..." cases below always stay visible.
+					if (t->options & TAR_TW_VERBOSE_LOG)
+						printf("found fscrypt policy '%s' - '%s' - '%s'\n", realname, t->th_buf.fep->master_key_descriptor, policy_hex);
 #else
 					memcpy(t->th_buf.fep->master_key_identifier, tar_policy, FSCRYPT_KEY_IDENTIFIER_SIZE);
-					printf("found fscrypt policy '%s' - '%s' - '%s'\n", realname, t->th_buf.fep->master_key_identifier, policy_hex);
+					if (t->options & TAR_TW_VERBOSE_LOG)   // Verbose log: see V1 branch above
+						printf("found fscrypt policy '%s' - '%s' - '%s'\n", realname, t->th_buf.fep->master_key_identifier, policy_hex);
 #endif
 				} else {
 					printf("failed to match fscrypt tar policy for '%s' - '%s'\n", realname, policy_hex);
@@ -208,7 +218,7 @@ tar_append_file(TAR *t, const char *realname, const char *savename)
 		if (getxattr(realname, XATTR_NAME_CAPS, &t->th_buf.cap_data, sizeof(struct vfs_cap_data)) >= 0)
 		{
 			t->th_buf.has_cap_data = 1;
-#if 1 //def DEBUG
+#ifdef DEBUG
 			print_caps(&t->th_buf.cap_data);
 #endif
 		}
@@ -220,21 +230,21 @@ tar_append_file(TAR *t, const char *realname, const char *savename)
 		if (getxattr(realname, "user.default", NULL, 0) >= 0)
 		{
 			t->th_buf.has_user_default = 1;
-#if 1 //def DEBUG
+#ifdef DEBUG
 			printf("storing xattr user.default\n");
 #endif
 		}
 		if (getxattr(realname, "user.inode_cache", NULL, 0) >= 0)
 		{
 			t->th_buf.has_user_cache = 1;
-#if 1 //def DEBUG
+#ifdef DEBUG
 			printf("storing xattr user.inode_cache\n");
 #endif
 		}
 		if (getxattr(realname, "user.inode_code_cache", NULL, 0) >= 0)
 		{
 			t->th_buf.has_user_code_cache = 1;
-#if 1 //def DEBUG
+#ifdef DEBUG
 			printf("storing xattr user.inode_code_cache\n");
 #endif
 		}
@@ -356,14 +366,20 @@ tar_append_eof(TAR *t)
 }
 
 
+/* Bulk I/O goes through the central tar_io_read/tar_io_write (block.c) with
+ * identical semantics. */
+
 /* add file contents to a tarchive */
 int
 tar_append_regfile(TAR *t, const char *realname)
 {
-	char block[T_BLOCKSIZE];
+	// __thread-qualified -- consistent with basename.c/dirname.c in the same libtar.
+	// Unchanged in the fork() model (1 slot/process) but robust if libtar is ever
+	// called from a thread context.
+	static __thread char data_buf[TAR_DATA_BUF_SIZE];
 	int filefd;
 	int64_t i, size;
-	ssize_t j;
+	ssize_t j, padded;
 	int rv = -1;
 
 #if defined(O_BINARY)
@@ -379,33 +395,78 @@ tar_append_regfile(TAR *t, const char *realname)
 		return -1;
 	}
 
+	/* Sequential read hint: a pure hint, no I/O. WILLNEED deliberately NOT set --
+	 * across thousands of /data smallfiles the syscall overhead would outweigh the
+	 * benefit, and a WILLNEED over the whole file can trash the page cache.
+	 * DONTNEED after success is kept below. */
+	posix_fadvise64(filefd, 0, 0, POSIX_FADV_SEQUENTIAL);
+
 	size = th_get_size(t);
-	for (i = size; i > T_BLOCKSIZE; i -= T_BLOCKSIZE)
+	/* TWRP in-file cache trim: on large files both the read input (source) AND the
+	 * output written asynchronously via zstd would otherwise accumulate untrimmed
+	 * until addFile returns -> transient page-cache spikes (~active-pipes x file
+	 * size). So trim every 128 MB INLINE, not only between files (twrpTar tarList
+	 * hook). */
+	off64_t in_trim_off = 0;       /* input: dropped via FADV_DONTNEED up to here */
+	int64_t since_trim  = 0;       /* bytes written since the last trim */
+	for (i = size; i > TAR_DATA_BUF_SIZE; i -= TAR_DATA_BUF_SIZE)
 	{
-		j = read(filefd, &block, T_BLOCKSIZE);
-		if (j != T_BLOCKSIZE)
+		j = tar_io_read(filefd, data_buf, TAR_DATA_BUF_SIZE);
+		if (j != TAR_DATA_BUF_SIZE)
 		{
 			if (j != -1)
-				errno = EINVAL;
+				errno = EIO;   /* short read = source file truncated mid-archive */
 			goto fail;
 		}
-		if (tar_block_write(t, &block) == -1)
+		if (tar_io_write(t->fd, data_buf, TAR_DATA_BUF_SIZE) != TAR_DATA_BUF_SIZE)
 			goto fail;
+		since_trim += TAR_DATA_BUF_SIZE;
+		if (since_trim >= (128LL << 20))   /* 128 MB */
+		{
+			/* Input: read source pages are clean (read-only) -> drop directly, no
+			 * sync needed. Output: self-paced via TWFunc (sync_file_range +
+			 * FADV_DONTNEED, always behind the write head); no-op when output_fd<=0. */
+			posix_fadvise64(filefd, in_trim_off, since_trim, POSIX_FADV_DONTNEED);
+			in_trim_off += since_trim;
+			since_trim = 0;
+			if (t->output_fd > 0 && t->output_trim_cb)
+				t->output_trim_cb(t->output_fd, t->output_trim_offset);
+		}
 	}
 
 	if (i > 0)
 	{
-		j = read(filefd, &block, i);
+		j = tar_io_read(filefd, data_buf, i);
 		if (j == -1)
 			goto fail;
-		memset(&(block[i]), 0, T_BLOCKSIZE - i);
-		if (tar_block_write(t, &block) == -1)
+		/* pad last chunk to T_BLOCKSIZE boundary (tar format requirement) */
+		padded = ((i + T_BLOCKSIZE - 1) / T_BLOCKSIZE) * T_BLOCKSIZE;
+		memset(&(data_buf[i]), 0, padded - i);
+		if (tar_io_write(t->fd, data_buf, padded) != padded)
 			goto fail;
 	}
 
 	/* success! */
 	rv = 0;
+
+	/* Backup progress = the content bytes ACTUALLY written (size), symmetric to
+	 * tar_extract_regfile (which sums to_write == size). Symlinks (SYMTYPE) and
+	 * hardlink duplicates (LNKTYPE) do NOT run through this function
+	 * (tar_append_file calls tar_append_regfile only for TH_ISREG) -> they report 0,
+	 * exactly like the restore. This makes the backup_size stored in the .info ==
+	 * the content sum the restore extracts -> both 100%. progress_fd == 0 ->
+	 * disabled (restore/get_size). Best-effort: an EPIPE (parent read end closed) is
+	 * harmless via SIG_IGN, no backup data loss. */
+	if (t->progress_fd > 0 && size > 0)
+	{
+		unsigned long long ps = (unsigned long long)size;
+		(void)write(t->progress_fd, &ps, sizeof(ps));
+	}
 fail:
+	/* Drop the page cache only on success -- on a read/write error the drop
+	 * achieves nothing and blocks possible retry reads. */
+	if (rv == 0)
+		posix_fadvise64(filefd, 0, 0, POSIX_FADV_DONTNEED);
 	close(filefd);
 
 	return rv;

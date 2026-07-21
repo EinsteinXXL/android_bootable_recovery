@@ -17,8 +17,18 @@
 			<font resource="font_m" color="%text_fail_color%"/>
 		</style>
 
+		<style name="text_l_fail">
+			<font resource="font_l" color="%text_fail_color%"/>
+		</style>
+
 		<style name="text_s">
 			<font resource="font_s" color="%text_color%"/>
+		</style>
+
+		<!-- Warning hint (yellow, medium size): e.g. the RAW-cancel hint on the
+		     restore_run page. #F8F8A0 = the existing warning yellow (like log warnings). -->
+		<style name="text_m_warn">
+			<font resource="font_m" color="#F8F8A0"/>
 		</style>
 
 		<style name="input">
@@ -542,7 +552,7 @@
 			</text>
 
 			<text style="text_m_fail">
-				<condition var1="tw_operation_status" op="!=" var2="0"/>
+				<condition var1="tw_operation_status" var2="1"/>
 				<placement x="%col1_x_header%" y="%row4_header_y%"/>
 				<text>{@failed=Failed}</text>
 			</text>
@@ -979,7 +989,7 @@
 			</text>
 
 			<text style="text_m_fail">
-				<condition var1="tw_operation_status" op="!=" var2="0"/>
+				<condition var1="tw_operation_status" var2="1"/>
 				<placement x="%col1_x_header%" y="%row4_header_y%"/>
 				<text>{@failed=Failed}</text>
 			</text>
@@ -1399,23 +1409,51 @@
 			</text>
 
 			<text style="text_m">
+				<condition var1="tw_partition_size_kb" var2="0"/>
 				<placement x="%col2_x_left%" y="%row7_y%"/>
 				<text>{@part_size=Size: %tw_partition_size%MB}</text>
 			</text>
 
 			<text style="text_m">
+				<condition var1="tw_partition_size_kb" var2="1"/>
+				<placement x="%col2_x_left%" y="%row7_y%"/>
+				<text>{@part_size_kb=Size: %tw_partition_size%KB}</text>
+			</text>
+
+			<text style="text_m">
+				<condition var1="tw_partition_used_kb" var2="0"/>
 				<placement x="%col1_x_right%" y="%row7_y%"/>
 				<text>{@part_used=Used: %tw_partition_used%MB}</text>
 			</text>
 
 			<text style="text_m">
+				<condition var1="tw_partition_used_kb" var2="1"/>
+				<placement x="%col1_x_right%" y="%row7_y%"/>
+				<text>{@part_used_kb=Used: %tw_partition_used%KB}</text>
+			</text>
+
+			<text style="text_m">
+				<condition var1="tw_partition_free_kb" var2="0"/>
 				<placement x="%col2_x_left%" y="%row9_y%"/>
 				<text>{@part_free=Free: %tw_partition_free%MB}</text>
 			</text>
 
 			<text style="text_m">
+				<condition var1="tw_partition_free_kb" var2="1"/>
+				<placement x="%col2_x_left%" y="%row9_y%"/>
+				<text>{@part_free_kb=Free: %tw_partition_free%KB}</text>
+			</text>
+
+			<text style="text_m">
+				<condition var1="tw_partition_backup_size_kb" var2="0"/>
 				<placement x="%col1_x_right%" y="%row9_y%"/>
 				<text>{@part_backup_size=Backup Size: %tw_partition_backup_size%MB}</text>
+			</text>
+
+			<text style="text_m">
+				<condition var1="tw_partition_backup_size_kb" var2="1"/>
+				<placement x="%col1_x_right%" y="%row9_y%"/>
+				<text>{@part_backup_size_kb=Backup Size: %tw_partition_backup_size%KB}</text>
 			</text>
 
 			<button style="main_button_half_width">
@@ -1654,6 +1692,18 @@
 		<page name="backup">
 			<template name="page"/>
 
+			<!-- tw_enable_adb_backup belongs to the RESTORE flow (Set_Restore_Files sets
+			     it when reading an .ab; restore_select + the nandroid restore consume
+			     it). On entering the backup page, unconditionally 0: a still-set flag
+			     (after an .ab selection + Back WITHOUT restore) would otherwise hide the
+			     Encryption tab, Name and Storage buttons. The backup-config path in this
+			     fork is never an adb backup (adb runs the PC FIFO backup_run) -> always 0
+			     here. No restore regression: restore_select is reachable only via
+			     readBackup, which sets the flag fresh each time. -->
+			<action>
+				<action function="set">tw_enable_adb_backup=0</action>
+			</action>
+
 			<action>
 				<conditions>
 					<condition var1="tw_is_fbe" var2="1"/>
@@ -1751,20 +1801,39 @@
 
 			<checkbox>
 				<placement x="%col1_x_right%" y="%row6_y%"/>
-				<text>{@enable_backup_comp_chk=Enable compression}</text>
+				<text>{@enable_backup_comp_chk=Enable compression (1=fast, 19=smallest)}</text>
 				<data variable="tw_use_compression"/>
 			</checkbox>
 
+			<slidervalue>
+				<placement x="%col1_x_right%" y="%row7_y%" w="%content_half_width%"/>
+				<text></text>
+				<data variable="tw_zstd_level" min="1" max="19" showcurr="right"/>
+			</slidervalue>
+
 			<checkbox>
-				<placement x="%col1_x_right%" y="%row7a_y%"/>
+				<placement x="%col1_x_right%" y="%row10_y%"/>
 				<text>{@skip_digest_backup_chk=Skip Digest generation during backup}</text>
 				<data variable="tw_skip_digest_generate"/>
 			</checkbox>
 
 			<checkbox>
-				<placement x="%col1_x_right%" y="%row9_y%"/>
+				<placement x="%col1_x_right%" y="%row12_y%"/>
+				<text>{@backup_external_app_data_chk=Backup external app data (internal storage)}</text>
+				<data variable="tw_backup_external_app_data"/>
+			</checkbox>
+
+			<checkbox>
+				<placement x="%col1_x_right%" y="%row11_y%"/>
 				<text>{@disable_backup_space_chk=Disable free space check before backup}</text>
 				<data variable="tw_disable_free_space"/>
+			</checkbox>
+
+			<checkbox>
+				<placement x="%col1_x_right%" y="%row9_y%"/>
+				<condition var1="tw_use_compression" var2="1"/>
+				<text>{@compress_super_chk=Compress super partition}</text>
+				<data variable="tw_compress_super"/>
 			</checkbox>
 
 			<button style="main_button_half_width">
@@ -1790,6 +1859,31 @@
 				<text>{@swipe_backup=Swipe to Backup}</text>
 				<action function="page">backup_run</action>
 			</slider>
+
+			<action>
+				<condition var1="tw_use_compression" op="modified"/>
+				<action function="savesettings"/>
+			</action>
+
+			<action>
+				<condition var1="tw_skip_digest_generate" op="modified"/>
+				<action function="savesettings"/>
+			</action>
+
+			<action>
+				<condition var1="tw_disable_free_space" op="modified"/>
+				<action function="savesettings"/>
+			</action>
+
+			<action>
+				<condition var1="tw_backup_external_app_data" op="modified"/>
+				<action function="savesettings"/>
+			</action>
+
+			<action>
+				<condition var1="tw_compress_super" op="modified"/>
+				<action function="savesettings"/>
+			</action>
 
 			<action>
 				<touch key="home"/>
@@ -2125,13 +2219,18 @@
 				<action function="cancelbackup"/>
 			</button>
 
+			<!-- tw_adb_bu=1: the page is used by the ADB backup (twrpAdbBuFifo), whose
+			     engine already runs in the FIFO thread -> do NOT start nandroid.
+			     Unset/0 (every GUI flow) behaves unchanged. -->
 			<action>
+				<condition var1="tw_adb_bu" op="!=" var2="1"/>
 				<action function="nandroid">backup</action>
 			</action>
 
+			<!-- Success: status=0 -->
 			<action>
 				<condition var1="tw_operation_state" var2="1"/>
-				<condition var1="tw_cancel_backup" var2="0"/>
+				<condition var1="tw_operation_status" var2="0"/>
 				<actions>
 					<action function="set">tw_back=backup</action>
 					<action function="set">tw_complete_text1={@backup_complete=Backup Complete}</action>
@@ -2140,12 +2239,25 @@
 				</actions>
 			</action>
 
+			<!-- Error: status=1 -->
 			<action>
 				<condition var1="tw_operation_state" var2="1"/>
-				<condition var1="tw_cancel_backup" var2="1"/>
+				<condition var1="tw_operation_status" var2="1"/>
 				<actions>
 					<action function="set">tw_back=backup</action>
-					<action function="set">tw_complete_text1={@backup_cancel=Backup Cancelled}</action>
+					<action function="set">tw_complete_text1={@backup_fail_status=Backup Failed}</action>
+					<action function="set">tw_show_reboot=1</action>
+					<action function="page">action_complete</action>
+				</actions>
+			</action>
+
+			<!-- Cancel: status=2 -->
+			<action>
+				<condition var1="tw_operation_state" var2="1"/>
+				<condition var1="tw_operation_status" var2="2"/>
+				<actions>
+					<action function="set">tw_back=backup</action>
+					<action function="set">tw_complete_text1={@backup_cancel_status=Backup Cancelled}</action>
 					<action function="set">tw_show_reboot=1</action>
 					<action function="page">action_complete</action>
 				</actions>
@@ -2206,8 +2318,7 @@
 			<action>
 				<condition var1="tw_restore" op="modified"/>
 				<actions>
-					<action function="readBackup"/>
-					<action function="page">restore_read</action>
+					<action function="page">restore_reading</action>
 				</actions>
 			</action>
 
@@ -2271,8 +2382,7 @@
 			<action>
 				<condition var1="tw_restore" op="modified"/>
 				<actions>
-					<action function="readBackup"/>
-					<action function="page">restore_read</action>
+					<action function="page">restore_reading</action>
 				</actions>
 			</action>
 
@@ -2287,6 +2397,38 @@
 			</action>
 		</page>
 
+		<!-- Intermediate page (pattern try_restore_decrypt): readBackup now runs
+		     threaded; the .ab scan does not freeze the GUI. The watcher jumps on to
+		     restore_read after operation_end (routing unchanged). -->
+		<page name="restore_reading">
+			<template name="page"/>
+
+			<text style="text_l">
+				<placement x="%col1_x_header%" y="%row3_header_y%"/>
+				<text>{@restore_hdr=Restore}</text>
+			</text>
+
+			<text style="text_m">
+				<placement x="%col1_x_header%" y="%row4_header_y%"/>
+				<text>{@adbbu_read_ab_hdr=Reading Backup}</text>
+			</text>
+
+			<template name="console"/>
+
+			<template name="progress_bar"/>
+
+			<action>
+				<action function="readBackup"/>
+			</action>
+
+			<action>
+				<condition var1="tw_operation_state" var2="1"/>
+				<actions>
+					<action function="page">restore_read</action>
+				</actions>
+			</action>
+		</page>
+
 		<page name="restore_read">
 			<action>
 				<condition var1="tw_restore_encrypted" var2="1"/>
@@ -2297,9 +2439,22 @@
 			</action>
 
 			<action>
+				<conditions>
 				<condition var1="tw_restore_encrypted" var2="0"/>
+				<condition var1="tw_preflight_ok" var2="1"/>
+				</conditions>
 				<actions>
-					<action function="page">restore_select</action>
+				<action function="page">restore_select</action>
+				</actions>
+			</action>
+
+			<action>
+				<conditions>
+				<condition var1="tw_restore_encrypted" var2="0"/>
+				<condition var1="tw_preflight_ok" var2="0"/>
+				</conditions>
+				<actions>
+				<action function="page">restore_preflight</action>
 				</actions>
 			</action>
 		</page>
@@ -2418,13 +2573,81 @@
 
 			<action>
 				<conditions>
-					<condition var1="tw_operation_state" var2="1"/>
-					<condition var1="tw_operation_status" op="=" var2="0"/>
+				<condition var1="tw_operation_state" var2="1"/>
+				<condition var1="tw_operation_status" op="=" var2="0"/>
+				<condition var1="tw_preflight_ok" var2="1"/>
 				</conditions>
 				<actions>
-					<action function="set">tw_page_done=1</action>
-					<action function="page">restore_select</action>
+				<action function="set">tw_page_done=1</action>
+				<action function="page">restore_select</action>
 				</actions>
+			</action>
+
+			<action>
+				<conditions>
+				<condition var1="tw_operation_state" var2="1"/>
+				<condition var1="tw_operation_status" op="=" var2="0"/>
+				<condition var1="tw_preflight_ok" var2="0"/>
+				</conditions>
+				<actions>
+				<action function="set">tw_page_done=1</action>
+				<action function="page">restore_preflight</action>
+				</actions>
+			</action>
+		</page>
+
+		<page name="restore_preflight">
+			<template name="page"/>
+
+			<text style="text_l">
+				<placement x="%col1_x_header%" y="%row3_header_y%"/>
+				<text>{@restore_hdr=Restore}</text>
+			</text>
+
+			<text style="text_m">
+				<placement x="%col1_x_header%" y="%row4_header_y%"/>
+				<text>{@restore_preflight_hdr=Backup cannot be restored}</text>
+			</text>
+
+			<template name="console"/>
+
+			<!-- Pure error display: the validity check already ran (readBackup / decrypt_backup) and
+			     wrote the reasons via gui_err/gui_msg into the global console. This page is reached ONLY
+			     when tw_preflight_ok==0. NO action here, no second action thread. -->
+			<button style="main_button_half_width">
+				<placement x="%col2_x_left%" y="%row15a_y%"/>
+				<text>{@del_backup_btn=Delete Backup}</text>
+				<actions>
+					<action function="set">tw_back=restore</action>
+					<action function="set">tw_action=cmd</action>
+					<action function="set">tw_action_param=cd %tw_backups_folder% &amp;&amp; rm -rf "%tw_restore_name%"</action>
+					<action function="set">tw_text1={@del_backup_confirm=Delete Backup?}</action>
+					<action function="set">tw_text2=%tw_restore_name%</action>
+					<action function="set">tw_text4={@del_backup_confirm2=This cannot be undone!}</action>
+					<action function="set">tw_action_text1={@deleting_backup=Deleting Backup...}</action>
+					<action function="set">tw_complete_text1={@backup_deleted=Backup Delete Complete}</action>
+					<action function="set">tw_slider_text={@swipe_delete=Swipe to Delete}</action>
+					<action function="page">confirm_action</action>
+				</actions>
+			</button>
+
+			<button style="main_button_half_width">
+				<placement x="%col2_x_right%" y="%row15a_y%"/>
+				<text>{@back_btn=Back}</text>
+				<actions>
+					<action function="set">tw_page_done=1</action>
+					<action function="page">restore</action>
+				</actions>
+			</button>
+
+			<action>
+				<touch key="home"/>
+				<action function="page">main</action>
+			</action>
+
+			<action>
+				<touch key="back"/>
+				<action function="page">restore</action>
 			</action>
 		</page>
 
@@ -2484,6 +2707,13 @@
 				<data variable="tw_skip_digest_check"/>
 			</checkbox>
 
+			<checkbox>
+				<placement x="%col1_x_right%" y="%row7_y%"/>
+				<condition var1="tw_has_external_app_data" op="=" var2="1"/>
+				<text>{@restore_external_app_data_chk=Restore external app data (internal storage)}</text>
+				<data variable="tw_restore_external_app_data"/>
+			</checkbox>
+
 			<button style="main_button_half_width">
 				<placement x="%col2_x_left%" y="%row15a_y%"/>
 				<text>{@del_backup_btn=Delete Backup}</text>
@@ -2505,6 +2735,11 @@
 				<text>{@swipe_restore=Swipe to Restore}</text>
 				<action function="page">restore_run</action>
 			</slider>
+
+			<action>
+				<condition var1="tw_skip_digest_check" op="modified"/>
+				<action function="savesettings"/>
+			</action>
 
 			<action>
 				<touch key="home"/>
@@ -2590,7 +2825,138 @@
 			</action>
 		</page>
 
-		<page name="restore_run">
+		<page name="cancel_restore_confirm">
+		<template name="page"/>
+
+		<text style="text_l">
+			<placement x="%col1_x_header%" y="%row3_header_y%"/>
+			<text>{@cancel_restore_hdr=Cancel Restore?}</text>
+		</text>
+
+		<!-- Warning text split across 3 lines (detail see the portrait.xml comment). -->
+		<text style="text_l_fail">
+			<placement x="%center_x%" y="%row5_y%" placement="5"/>
+			<text>{@cancel_restore_warning_l1=Warning: Cancelling will leave}</text>
+		</text>
+
+		<text style="text_l_fail">
+			<placement x="%center_x%" y="%row6_y%" placement="5"/>
+			<text>{@cancel_restore_warning_l2=the restore incomplete and}</text>
+		</text>
+
+		<text style="text_l_fail">
+			<placement x="%center_x%" y="%row7_y%" placement="5"/>
+			<text>{@cancel_restore_warning_l3=may cause corrupt data!}</text>
+		</text>
+
+		<text style="text_m">
+			<placement x="%center_x%" y="%row10_y%" placement="5"/>
+			<text>{@cancel_restore_info=Only cancel if you are aware of the consequences.}</text>
+		</text>
+
+		<text style="text_m">
+			<placement x="%center_x%" y="%row12_y%" placement="5"/>
+			<text>{@back_continue_restore=Press back to continue restore.}</text>
+		</text>
+
+		<slider>
+			<text>{@swipe_cancel_restore=Swipe to Cancel Restore}</text>
+			<actions>
+				<action function="cancelrestore"/>
+				<action function="page">restore_run</action>
+			</actions>
+		</slider>
+
+		<!-- Button top edge on row15a_y, left-aligned on indent -- consistent with
+		     the delete-backup button position on the restore page. -->
+		<button style="main_button_half_height">
+			<placement x="%indent%" y="%row15a_y%"/>
+			<text>{@back_btn=Back}</text>
+			<actions>
+				<action function="page">restore_run</action>
+			</actions>
+		</button>
+
+		<action>
+			<touch key="home"/>
+			<action function="page">restore_run</action>
+		</action>
+
+		<action>
+			<touch key="back"/>
+			<action function="page">restore_run</action>
+		</action>
+	</page>
+
+	<!-- Info page when cancel is locked during a RAW restore -->
+	<page name="restore_cancel_blocked_info">
+		<template name="page"/>
+
+		<text style="text_l">
+			<placement x="%col1_x_header%" y="%row3_header_y%"/>
+			<text>{@restore_cancel_blocked_hdr=Cancel not allowed}</text>
+		</text>
+
+		<!-- Warning-text split like the cancel_restore_confirm page (3 lines). -->
+		<text style="text_l_fail">
+			<placement x="%center_x%" y="%row5_y%" placement="5"/>
+			<text>{@restore_cancel_blocked_warning_l1=Cancel is locked while}</text>
+		</text>
+
+		<text style="text_l_fail">
+			<placement x="%center_x%" y="%row6_y%" placement="5"/>
+			<text>{@restore_cancel_blocked_warning_l2=a RAW partition is}</text>
+		</text>
+
+		<text style="text_l_fail">
+			<placement x="%center_x%" y="%row7_y%" placement="5"/>
+			<text>{@restore_cancel_blocked_warning_l3=being restored.}</text>
+		</text>
+
+		<!-- Info sentences: centered (like the red warning text), each sentence on 2 lines.
+		     NO w/h box -> full font_m size instead of scaled down. -->
+		<text style="text_m">
+			<placement x="%center_x%" y="%row9_y%" placement="5"/>
+			<text>{@restore_cancel_blocked_info1_l1=Aborting a raw (dd) flash mid-write would leave}</text>
+		</text>
+
+		<text style="text_m">
+			<placement x="%center_x%" y="%row10_y%" placement="5"/>
+			<text>{@restore_cancel_blocked_info1_l2=the partition half-written and softbrick the device.}</text>
+		</text>
+
+		<text style="text_m">
+			<placement x="%center_x%" y="%row12_y%" placement="5"/>
+			<text>{@restore_cancel_blocked_info2_l1=Cancel becomes available again as soon as}</text>
+		</text>
+
+		<text style="text_m">
+			<placement x="%center_x%" y="%row13_y%" placement="5"/>
+			<text>{@restore_cancel_blocked_info2_l2=a filesystem partition (e.g. /data) is being restored.}</text>
+		</text>
+
+		<!-- Button position consistent with the cancel_restore_confirm page:
+		     top edge on row15a_y, left-aligned on indent. -->
+		<button style="main_button_half_height">
+			<placement x="%indent%" y="%row15a_y%"/>
+			<text>{@back_btn=Back}</text>
+			<actions>
+				<action function="page">restore_run</action>
+			</actions>
+		</button>
+
+		<action>
+			<touch key="home"/>
+			<action function="page">restore_run</action>
+		</action>
+
+		<action>
+			<touch key="back"/>
+			<action function="page">restore_run</action>
+		</action>
+	</page>
+
+	<page name="restore_run">
 			<template name="page"/>
 
 			<text style="text_l">
@@ -2617,8 +2983,27 @@
 				<text>%tw_size_progress%</text>
 			</text>
 
+			<!-- Phase 5a (Restore_Konzept.md Sec. 9.2): cancel button with swipe-confirm.
+			     Cancel lock: see portrait.xml counterpart -- tw_restore_cancelable
+			     is set per partition in Run_Restore(). -->
+			<button style="main_button_half_width">
+				<condition var1="tw_restore_cancelable" var2="1"/>
+				<placement x="%col2_x_right%" y="%row15a_y%"/>
+				<text>{@cancel_btn=Cancel}</text>
+				<action function="page">cancel_restore_confirm</action>
+			</button>
+
+			<button style="main_button_half_width">
+				<condition var1="tw_restore_cancelable" var2="0"/>
+				<placement x="%col2_x_right%" y="%row15a_y%"/>
+				<text>{@cancel_btn=Cancel}</text>
+				<action function="page">restore_cancel_blocked_info</action>
+			</button>
+
+			<!-- Success: status=0 -->
 			<action>
 				<condition var1="tw_operation_state" var2="1"/>
+				<condition var1="tw_operation_status" var2="0"/>
 				<actions>
 					<action function="set">tw_back=restore_select</action>
 					<action function="set">tw_complete_text1={@restore_complete=Restore Complete}</action>
@@ -2627,7 +3012,35 @@
 				</actions>
 			</action>
 
+			<!-- Error: status=1 -->
 			<action>
+				<condition var1="tw_operation_state" var2="1"/>
+				<condition var1="tw_operation_status" var2="1"/>
+				<actions>
+					<action function="set">tw_back=restore_select</action>
+					<action function="set">tw_complete_text1={@restore_fail_status=Restore Failed}</action>
+					<action function="set">tw_show_reboot=0</action>
+					<action function="page">action_complete</action>
+				</actions>
+			</action>
+
+			<!-- Cancel: status=2 -->
+			<action>
+				<condition var1="tw_operation_state" var2="1"/>
+				<condition var1="tw_operation_status" var2="2"/>
+				<actions>
+					<action function="set">tw_back=restore_select</action>
+					<action function="set">tw_complete_text1={@restore_cancel_status=Restore Cancelled}</action>
+					<action function="set">tw_show_reboot=0</action>
+					<action function="page">action_complete</action>
+				</actions>
+			</action>
+
+			<!-- tw_adb_bu=1: ADB restore (twrpAdbBuFifo) drives the engine itself
+			     -> do NOT start nandroid (in addition to the tw_busy condition). -->
+			<action>
+				<condition var1="tw_busy" var2="0"/>
+				<condition var1="tw_adb_bu" op="!=" var2="1"/>
 				<action function="nandroid">restore</action>
 			</action>
 		</page>
@@ -3273,6 +3686,9 @@
 				</listitem>
 				<listitem name="{@restore_enable_digest_chk=Enable Digest verification of backup files}">
 					<data variable="tw_skip_digest_check"/>
+				</listitem>
+				<listitem name="{@verbose_log_chk=Enable verbose log (log all file/folder names)}">
+					<data variable="tw_verbose_log"/>
 				</listitem>
 				<listitem name="{@skip_digest_zip_chk=Skip Digest check before installing zip}">
 					<data variable="tw_skip_digest_check_zip"/>

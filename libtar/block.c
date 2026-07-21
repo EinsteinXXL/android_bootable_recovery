@@ -12,6 +12,7 @@
 
 #include <internal.h>
 #include <errno.h>
+#include <unistd.h>
 
 #ifdef STDC_HEADERS
 # include <string.h>
@@ -52,6 +53,72 @@
 // Used to identify Android user.inode_code_cache xattr in extended ('x')
 #define ANDROID_USER_CODE_CACHE_TAG "ANDROID.user.inode_code_cache"
 #define ANDROID_USER_CODE_CACHE_TAG_LEN strlen(ANDROID_USER_CODE_CACHE_TAG)
+
+/* ---------------------------------------------------------------------------
+ * tar_io_read / tar_io_write -- the central robust block-I/O primitive for
+ * tar fds (regular files OR pipes). Single source of truth for both the backup
+ * AND restore direction (default_type in handle.c, tar_type in twrpTar.cpp, the
+ * bulk path in append.c, write_tar_no_buffer in tarWrite.c).
+ *
+ * POSIX allows read() on a pipe to return short reads (< requested bytes) at any
+ * time whenever the writer (zstd / tw_bssl_aes stage) has not filled the pipe
+ * yet. But all libtar callers (th_read_internal, tar_extract_regfile,
+ * tar_skip_regfile, ...) treat any result != T_BLOCKSIZE as EOF/truncation ->
+ * restore abort. This is a real hazard with the multi-pipe pipelines and the DFP
+ * directory pre-run (a dense 512-B header stream with no data blocks: the reader
+ * outruns the AES stage).
+ *
+ * tar_io_read:  fills buf up to count; returns count, and 0..count-1 only on a
+ *               real EOF (writer closed fd/pipe), -1 on error. EINTR-safe.
+ *               Transient short reads are refilled (a blocking read on an open
+ *               pipe waits for data).
+ * tar_io_write: writes all count bytes; returns count or -1. EINTR- and
+ *               partial-write-safe (needed for bulk writes > PIPE_BUF in
+ *               tar_append_regfile).
+ *
+ * Happy path (pipe/file delivers full blocks) = 1 syscall per call,
+ * byte-identical to bare read/write -- no performance loss.
+ */
+ssize_t
+tar_io_read(int fd, void *buf, size_t count)
+{
+	size_t total = 0;
+
+	while (total < count)
+	{
+		ssize_t n = read(fd, (char *)buf + total, count - total);
+		if (n < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		if (n == 0)
+			break;	/* real EOF: writer closed fd/pipe */
+		total += n;
+	}
+	return (ssize_t)total;
+}
+
+ssize_t
+tar_io_write(int fd, const void *buf, size_t count)
+{
+	size_t total = 0;
+
+	while (total < count)
+	{
+		ssize_t n = write(fd, (const char *)buf + total, count - total);
+		if (n < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			return -1;
+		}
+		total += n;
+	}
+	return (ssize_t)count;
+}
+
 
 /* read a header block */
 /* FIXME: the return value of this function should match the return value
@@ -161,6 +228,11 @@ th_read(TAR *t)
 	t->th_buf.has_user_code_cache = 0;
 
 	memset(&(t->th_buf), 0, sizeof(struct tar_header));
+	/* -1 = "PAX global TWRP.* record absent". Set once per th_read here; the
+	 * skip loop below overwrites it if a 'g' header carries the record, and the
+	 * value then persists onto the file header this call ultimately returns. */
+	t->th_buf.global_tartype = -1;
+	t->th_buf.global_ead = -1;
 
 	i = th_read_internal(t);
 	if (i == 0)
@@ -172,6 +244,14 @@ th_read(TAR *t)
 		return -1;
 	}
 
+	/* Special headers (GNU 'K'/'L', ext 'x'/'p', PAX-global 'g') may precede
+	 * the real file header in ANY order. POSIX places 'g' records at archive
+	 * start, i.e. our TWRP.* segment-start records sit BEFORE the first
+	 * file's 'K'/'L' header. The ladder below is one-way (K -> L -> x/p/g
+	 * loop), so after the x/p/g loop we jump back here if it stopped on a
+	 * K/L block; otherwise a >=100-char first path lost its longname and
+	 * was extracted under the truncated 100-byte name field. */
+read_special_headers:
 	/* check for GNU long link extention */
 	if (TH_ISLONGLINK(t))
 	{
@@ -186,6 +266,8 @@ th_read(TAR *t)
 		printf("    th_read(): GNU long linkname detected "
 		       "(%zu bytes, %zu blocks)\n", sz, blocks);
 #endif
+		if (t->th_buf.gnu_longlink != NULL)
+			free(t->th_buf.gnu_longlink);	/* malformed double-'K' -- don't leak */
 		t->th_buf.gnu_longlink = (char *)malloc(blocks * T_BLOCKSIZE);
 		if (t->th_buf.gnu_longlink == NULL)
 			return -1;
@@ -236,6 +318,8 @@ th_read(TAR *t)
 		printf("    th_read(): GNU long filename detected "
 		       "(%zu bytes, %zu blocks)\n", sz, blocks);
 #endif
+		if (t->th_buf.gnu_longname != NULL)
+			free(t->th_buf.gnu_longname);	/* malformed double-'L' -- don't leak */
 		t->th_buf.gnu_longname = (char *)malloc(blocks * T_BLOCKSIZE);
 		if (t->th_buf.gnu_longname == NULL)
 			return -1;
@@ -273,7 +357,7 @@ th_read(TAR *t)
 	}
 
 	// Extended headers (selinux contexts, posix file capabilities and encryption policies)
-	while(TH_ISEXTHEADER(t) || TH_ISPOLHEADER(t))
+	while(TH_ISEXTHEADER(t) || TH_ISPOLHEADER(t) || TH_ISGLOBALHEADER(t))
 	{
 		sz = th_get_size(t);
 
@@ -396,6 +480,23 @@ th_read(TAR *t)
 				}
 			}
 #endif // USE_FSCRYPT
+
+			/* PAX GLOBAL header (typeflag 'g'): TWRP self-describing markers
+			 * (TWRP.tartype/TWRP.ead) are parsed here into t->th_buf.global_*
+			 * (archive-wide, in-memory, never serialised). NOTE: the P2 type
+			 * detector and P3 restore-peek currently run their OWN early
+			 * detection (the type is needed BEFORE th_read), so these fields are
+			 * presently unread -- kept as clean libtar-level self-describing infra.
+			 * Guarded on 'g' so an 'x' payload cannot false-match "TWRP.*". */
+			if (TH_ISGLOBALHEADER(t))
+			{
+				start = strstr(buf, TWRP_TARTYPE_TAG);
+				if (start)
+					t->th_buf.global_tartype = atoi(start + TWRP_TARTYPE_TAG_LEN);
+				start = strstr(buf, TWRP_EAD_TAG);
+				if (start)
+					t->th_buf.global_ead = atoi(start + TWRP_EAD_TAG_LEN);
+			}
 		}
 
 		i = th_read_internal(t);
@@ -406,6 +507,11 @@ th_read(TAR *t)
 			return -1;
 		}
 	}
+
+	/* The x/p/g skip loop stopped on a GNU 'K'/'L' block (segment-start 'g'
+	 * records preceded it) -> collect it too before returning a file header. */
+	if (TH_ISLONGLINK(t) || TH_ISLONGNAME(t))
+		goto read_special_headers;
 
 	return 0;
 }
@@ -453,6 +559,59 @@ th_write_extended(TAR *t, char* buf, uint64_t sz)
 	t->th_buf.typeflag = type2;
 	th_set_size(t, sz2);
 	memset(buf, 0, T_BLOCKSIZE);
+	return 0;
+}
+
+/* write a POSIX pax GLOBAL extended header (archive-wide). keyword must include
+ * the trailing '=' (e.g. "TWRP.tartype="). Standard pax "<len> keyword=value\n"
+ * framing -> GNU/bsdtar parse it and ignore unknown vendor keys, so the archive
+ * stays openable with stock tools. Single 512-byte payload block (same limit as
+ * the th_read extended-header reader). Side-effect-free on t->th_buf (saved and
+ * restored), so it may be called once at archive start before any file. */
+int
+th_write_global(TAR *t, const char *keyword, const char *value)
+{
+	struct tar_header save = t->th_buf;
+	char buf[T_BLOCKSIZE];
+	size_t body, len;
+	int i;
+
+	memset(buf, 0, T_BLOCKSIZE);
+	/* record length counts its own ascii digits: <len> + ' ' + key + value + '\n' */
+	body = 1 + strlen(keyword) + strlen(value) + 1;
+	len  = body + 1;
+	if (len >= 10)  len = body + 2;
+	if (len >= 100) len = body + 3;
+	if (len >= T_BLOCKSIZE)
+	{
+		errno = EINVAL;
+		return -1;
+	}
+	snprintf(buf, T_BLOCKSIZE, "%d %s%s\n", (int)len, keyword, value);
+
+	/* build a clean global header from scratch (deterministic regardless of any
+	 * prior th_buf state) */
+	memset(&t->th_buf, 0, sizeof(t->th_buf));
+	t->th_buf.typeflag = TH_GLOBAL_TYPE;
+	th_set_mode(t, 0644);
+	th_set_path(t, "pax_global_header");
+	th_set_user(t, 0);
+	th_set_group(t, 0);
+	th_set_mtime(t, 0);
+	th_set_size(t, len);
+	th_finish(t);
+
+	i = tar_block_write(t, &(t->th_buf));
+	if (i == T_BLOCKSIZE)
+		i = tar_block_write(t, buf);
+
+	t->th_buf = save;
+	if (i != T_BLOCKSIZE)
+	{
+		if (i != -1)
+			errno = EINVAL;
+		return -1;
+	}
 	return 0;
 }
 

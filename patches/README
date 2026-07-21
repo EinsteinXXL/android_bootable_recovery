@@ -1,0 +1,64 @@
+patches/ -- out-of-tree patches this TWRP build expects
+=======================================================
+
+These patches do NOT belong in the recovery repo (bootable/recovery), but in
+OTHER AOSP repos. They live here so a rebuilder finds them alongside the
+recovery repo and can optionally apply them. The recovery build itself
+ignores this folder (no Android.mk/Android.bp -- pure distribution).
+
+
+0001-adbd-bu-socketpair.patch
+-----------------------------
+Target repo : system/core
+              (The recovery adbd is built from system/core/adb -- Android.bp
+               `recovery_available: true` -> out/.../recovery/root/system/bin/adbd;
+               NOT packages/modules/adb.)
+File        : adb/daemon/services.cpp
+Base        : pristine   md5 d51fbc1bf2fb07bd7afcf70cc326f33d
+Result      : patched    md5 b91397ec395f58fe305825e181529c49
+
+What:
+  bu (adb backup/restore) gets a real socketpair from the recovery adbd instead
+  of the forced PTY downgrade of the 4-arg StartSubprocess overload. A new
+  static helper StartBuSubprocess() (SubprocessType::kRaw + Protocol::kNone +
+  make_pty_raw=false); the two call sites `backup:`/`restore:` use it.
+  __ANDROID__-guarded (mirrors the call sites -> no -Wunused-function in the
+  host variant of services.cpp).
+
+Why:
+  Without the patch, `adb backup`/`adb restore` freezes SPORADICALLY and
+  completely: the kernel tty layer (flip buffer + flush_to_ldisc workqueue +
+  n_tty throttle wakeups) is race-prone under a sustained binary bulk stream --
+  a lost wakeup leaves bu (n_tty_read), adbd (EPOLLOUT) and the host
+  (A_OKAY) stuck forever. The only documented PTY purpose (SIGHUP kill
+  for processes without their own read/write, e.g. screenrecord) does not apply
+  to bu: bu pumps continuously and finishes even on EOF/EPIPE (SIGPIPE=SIG_IGN +
+  fread-short hardening in twrpback.cpp).
+
+OPTIONAL -- the patch is a convenience, not a must:
+  WITHOUT it, this TWRP deliberately refuses a direct `adb backup`/`adb restore`
+  (isatty refuse, otherwise freeze-prone) and you use the manifest-pure path:
+      adb shell adbbu start          # starts the short-lived twadbd mode
+      adb backup --twrp ... > x.ab   # then runs over twadbd's socketpair
+  WITH the patch, a direct `adb backup` works without this extra step.
+
+Apply (IN THE TARGET REPO system/core, NOT in the recovery repo):
+      cd system/core
+      git apply  /path/to/bootable/recovery/patches/0001-adbd-bu-socketpair.patch
+  or:
+      cd system/core
+      patch -p1 < /path/to/bootable/recovery/patches/0001-adbd-bu-socketpair.patch
+  Both paths transform the pristine file exactly into md5 b91397ec (verified).
+
+Then rebuild adbd/recovery. NOTE:
+  - Ramdisk-stale trap: after the rebuild, verify that
+    out/.../recovery/root/system/bin/adbd was actually re-staged
+    (strings/md5), otherwise the old adbd keeps running in the ramdisk.
+  - `repo sync`/checkout in the system/core tree overwrites the patch -> then
+    apply it again.
+
+Revert:
+      cd system/core && git apply -R <patch>     (or patch -R -p1 < <patch>)
+  The host command (`adb backup --twrp ...`) and the .ab file format are
+  completely unaffected by BOTH patch and revert -- only the adbd<->bu pipe
+  changes.

@@ -21,6 +21,7 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
+#include "twrp_affinity.hpp"
 #include <dirent.h>
 #include <time.h>
 #include <errno.h>
@@ -32,15 +33,21 @@
 #include <sys/vfs.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sched.h>
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <cctype>
 #include <algorithm>
 #include <selinux/label.h>
+#include <sys/auxv.h>
+#ifndef HWCAP_AES
+#define HWCAP_AES (1 << 3)
+#endif
 #include <thread>
 
 #include <android-base/strings.h>
+#include <android-base/properties.h>
 #include <android-base/chrono_utils.h>
 
 #include "twrp-functions.hpp"
@@ -56,8 +63,15 @@
 #include <sys/reboot.h>
 #endif // ndef BUILD_TWRPTAR_MAIN
 #ifndef TW_EXCLUDE_ENCRYPTED_BACKUPS
-	#include "openaes/inc/oaes_lib.h"
+#include <openssl/evp.h>
+#include <openssl/aead.h>
+#include "tw_bssl_aes/baes_format.h"
 #endif
+// Unconditional include — the class is needed in BOTH modules (recovery +
+// twrpTarMain); the header is dual-clean (only <string>/<map>/twrp-functions.hpp).
+// The recovery-only Try_Decrypting_Backup (gated by #ifndef BUILD_TWRPTAR_MAIN)
+// additionally uses GetFileType + Load.
+#include "backupheadermanager.hpp"   // detection/g-header consolidation
 #include "set_metadata.h"
 
 extern "C" {
@@ -182,6 +196,16 @@ int TWFunc::Wait_For_Child_Timeout(pid_t pid, int *status, const string& Child_N
 		if (WIFSIGNALED(*status)) {
 			gui_msg(Msg(msg::kError, "pid_signal={1} process ended with signal: {2}")(Child_Name)(WTERMSIG(*status))); // Seg fault or some other non-graceful termination
 			return -1;
+		} else if (WEXITSTATUS(*status) != 0) {
+			// A graceful exit with code != 0 is a real error (e.g. tw_bssl_aes
+			// "truncated chunk data" / "authentication failed", zstd decompress
+			// errors). Without this check the restore reap (closeTarRestore ->
+			// finish_pipeline) would swallow sub-child errors on a clean tar EOF.
+			// Symmetric to Wait_For_Child. (Normal path: filters exit 0 on stdin
+			// EOF; an EPIPE exit only happens on cancel, classified as CANCELLED
+			// via stop_restore.)
+			gui_msg(Msg(msg::kError, "pid_error={1} process ended with ERROR: {2}")(Child_Name)(WEXITSTATUS(*status)));
+			return -1;
 		}
 	} else if (retpid < 0) { // no PID returned
 		if (errno == ECHILD)
@@ -199,122 +223,21 @@ bool TWFunc::Path_Exists(string Path) {
 	return stat(Path.c_str(), &st) == 0;
 }
 
-Archive_Type TWFunc::Get_File_Type(string fn) {
-	string::size_type i = 0;
-	int firstbyte = 0, secondbyte = 0;
-	char header[3];
+// Archive-byte detection lives encapsulated in BackupHeaderManager
+// (GetFileType() / Load()+getters); is_legacy_type/emit_detect_reject stay here
+// (type predicate and GUI glue, no archive byte readers).
 
-	ifstream f;
-	f.open(fn.c_str(), ios::in | ios::binary);
-	f.get(header, 3);
-	f.close();
-	firstbyte = header[i] & 0xff;
-	secondbyte = header[++i] & 0xff;
+// Legacy (original TWRP, single-pipe) vs this build (multi-pipe, self-describing).
+bool TWFunc::is_legacy_type(Archive_Type t) { return t <= LEGACY_COMPRESSED_ENCRYPTED; }
 
-	if (firstbyte == 0x1f && secondbyte == 0x8b)
-		return COMPRESSED;
-	else if (firstbyte == 0x4f && secondbyte == 0x41)
-		return ENCRYPTED;
-	return UNCOMPRESSED; // default
-}
-
-int TWFunc::Try_Decrypting_File(string fn, string password) {
-#ifndef TW_EXCLUDE_ENCRYPTED_BACKUPS
-	OAES_CTX * ctx = NULL;
-	uint8_t _key_data[32] = "";
-	FILE *f;
-	uint8_t buffer[4096];
-	uint8_t *buffer_out = NULL;
-	uint8_t *ptr = NULL;
-	size_t read_len = 0, out_len = 0;
-	int firstbyte = 0, secondbyte = 0;
-	size_t _j = 0;
-	size_t _key_data_len = 0;
-
-	// mostly kanged from OpenAES oaes.c
-	for ( _j = 0; _j < 32; _j++ )
-		_key_data[_j] = _j + 1;
-	_key_data_len = password.size();
-	if ( 16 >= _key_data_len )
-		_key_data_len = 16;
-	else if ( 24 >= _key_data_len )
-		_key_data_len = 24;
+// Unified GUI rejection message for a non-OK DetectResult.
+void TWFunc::emit_detect_reject(DetectResult dr, const std::string &path) {
+	if (dr == DET_REJECT_OPENAES)
+		gui_err("restore_openaes_rejected=This backup is encrypted with OpenAES and is no longer supported. OpenAES was removed from TWRP v3.7+ by the core developers.");
+	else if (dr == DET_WRONG_PASSWORD)
+		gui_msg(Msg(msg::kError, "fail_decrypt_tar=Failed to decrypt tar file '{1}'")(path));
 	else
-		_key_data_len = 32;
-	memcpy(_key_data, password.c_str(), password.size());
-
-	ctx = oaes_alloc();
-	if (ctx == NULL) {
-		LOGERR("Failed to allocate OAES\n");
-		return -1;
-	}
-
-	oaes_key_import_data(ctx, _key_data, _key_data_len);
-
-	f = fopen(fn.c_str(), "rb");
-	if (f == NULL) {
-		LOGERR("Failed to open '%s' to try decrypt: %s\n", fn.c_str(), strerror(errno));
-		oaes_free(&ctx);
-		return -1;
-	}
-	read_len = fread(buffer, sizeof(uint8_t), 4096, f);
-	if (read_len <= 0) {
-		LOGERR("Read size during try decrypt failed: %s\n", strerror(errno));
-		fclose(f);
-		oaes_free(&ctx);
-		return -1;
-	}
-	if (oaes_decrypt(ctx, buffer, read_len, NULL, &out_len) != OAES_RET_SUCCESS) {
-		LOGERR("Error: Failed to retrieve required buffer size for trying decryption.\n");
-		fclose(f);
-		oaes_free(&ctx);
-		return -1;
-	}
-	buffer_out = (uint8_t *) calloc(out_len, sizeof(char));
-	if (buffer_out == NULL) {
-		LOGERR("Failed to allocate output buffer for try decrypt.\n");
-		fclose(f);
-		oaes_free(&ctx);
-		return -1;
-	}
-	if (oaes_decrypt(ctx, buffer, read_len, buffer_out, &out_len) != OAES_RET_SUCCESS) {
-		LOGERR("Failed to decrypt file '%s'\n", fn.c_str());
-		fclose(f);
-		free(buffer_out);
-		oaes_free(&ctx);
-		return 0;
-	}
-	fclose(f);
-	oaes_free(&ctx);
-	if (out_len < 2) {
-		LOGINFO("Successfully decrypted '%s' but read length too small.\n", fn.c_str());
-		free(buffer_out);
-		return 1; // Decrypted successfully
-	}
-	ptr = buffer_out;
-	firstbyte = *ptr & 0xff;
-	ptr++;
-	secondbyte = *ptr & 0xff;
-	if (firstbyte == 0x1f && secondbyte == 0x8b) {
-		LOGINFO("Successfully decrypted '%s' and file is compressed.\n", fn.c_str());
-		free(buffer_out);
-		return 3; // Compressed
-	}
-	if (out_len >= 262) {
-		ptr = buffer_out + 257;
-		if (strncmp((char*)ptr, "ustar", 5) == 0) {
-			LOGINFO("Successfully decrypted '%s' and file is tar format.\n", fn.c_str());
-			free(buffer_out);
-			return 2; // Tar
-		}
-	}
-	free(buffer_out);
-	LOGINFO("No errors decrypting '%s' but no known file format.\n", fn.c_str());
-	return 1; // Decrypted successfully
-#else
-	LOGERR("Encrypted backup support not included.\n");
-	return -1;
-#endif
+		gui_err("restore_unknown_segment=Backup segment has an unknown format -- header not recognized.");
 }
 
 unsigned long TWFunc::Get_File_Size(const string& Path) {
@@ -323,6 +246,57 @@ unsigned long TWFunc::Get_File_Size(const string& Path) {
 	if (stat(Path.c_str(), &st) != 0)
 		return 0;
 	return st.st_size;
+}
+
+// Generic write-behind page-cache trim of a SEEKABLE output fd. Drops clean
+// pages BEHIND the write head while the file is still being written — bounds
+// the page-cache peak (otherwise written-back clean pages accumulate until
+// close). lseek64(SEEK_CUR) reads the write progress (on an OFD SHARED via
+// fork+dup2 = how far the writing sub-child has come; on direct self-write =
+// our own position). From THRESHOLD on: first sync_file_range (range safely on
+// disk), THEN posix_fadvise64 DONTNEED (drops ONLY clean pages), always
+// TAIL_MARGIN behind the head. trim_offset = in/out (last dropped offset; the
+// caller resets it per segment to 0). fd<0 or non-seekable (lseek64 ESPIPE) =>
+// no-op. off64_t/lseek64/posix_fadvise64 are 64-bit independent of
+// arch/_FILE_OFFSET_BITS (output may exceed 2 GB). The adbbackup gating and the
+// output_fd/t->fd choice are done by the twrpTar caller; only the mechanics
+// live here. Shared trim mechanics (output + input): flush=true (output,
+// written) syncs the range to disk first, then drops; flush=false (input/.win,
+// read) — pages are clean anyway -> FADV only, no flush wait.
+static void trim_cache_impl(int fd, off64_t& trim_offset, bool flush) {
+	static const off64_t THRESHOLD   = 128LL * 1024 * 1024;
+	static const off64_t TAIL_MARGIN =  16LL * 1024 * 1024;
+	if (fd < 0)
+		return;
+	off64_t cur = lseek64(fd, 0, SEEK_CUR);
+	if (cur < 0)
+		return;                                  // ESPIPE (FIFO) etc. -> not seekable, no trim
+	if (cur - trim_offset < THRESHOLD)
+		return;
+	off64_t flush_to = cur - TAIL_MARGIN;
+	if (flush_to <= trim_offset)
+		return;
+	off64_t len = flush_to - trim_offset;
+	// Order is mandatory (output only): flush the range to disk first, THEN drop clean-only.
+	if (flush)
+		sync_file_range(fd, trim_offset, len,
+			SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);
+	posix_fadvise64(fd, trim_offset, len, POSIX_FADV_DONTNEED);
+	trim_offset = flush_to;
+}
+
+void TWFunc::Trim_Output_Cache(int fd, off64_t& trim_offset) {
+	trim_cache_impl(fd, trim_offset, /*flush=*/true);
+}
+
+// C wrapper for libtar/append.c (tar_append_regfile, in-file output trim every
+// 128 MB). extern "C" -> C linkage (libtar is C); calls the C++ mechanics
+// above, no duplication. trim_offset points at the twrpTar member
+// output_trim_offset (shared with the tarList hook). (The restore input trim
+// needs no wrapper — extract.c calls FADV directly.)
+extern "C" void twrp_trim_output_cache(int fd, off64_t *trim_offset) {
+	if (trim_offset)
+		TWFunc::Trim_Output_Cache(fd, *trim_offset);
 }
 
 std::string TWFunc::Remove_Beginning_Slash(const std::string& path) {
@@ -490,29 +464,107 @@ void TWFunc::GUI_Operation_Text(string Read_Value, string Partition_Name, string
 	DataManager::SetValue("tw_partition", Partition_Name);
 }
 
+// Per-operation log slicing: writes the boot/decrypt context [0..ctx_end) +
+// separator line + the current operation [op_start..EOF) from Source
+// (/tmp/recovery.log) to Destination (O_TRUNC, 0644). ctx_end == op_start
+// (first operation of the session) => no separator, result == full copy
+// (byte-identical). Returns false on ANY error or inconsistent offsets — the
+// caller (Save_Recovery_Log) then falls back to the full copy. If the log keeps
+// growing during the copy (MTP/GUI threads), the fstat snapshot applies — the
+// same tolerance as a plain full copy.
+bool TWFunc::Copy_Log_Slices(const string& Source, const string& Destination, long long ctx_end, long long op_start) {
+	if (ctx_end < 0 || op_start < ctx_end)
+		return false;
+
+	int src_fd = open(Source.c_str(), O_RDONLY | O_CLOEXEC);
+	if (src_fd < 0)
+		return false;
+	struct stat st;
+	if (fstat(src_fd, &st) != 0 || (long long)st.st_size < op_start) {
+		close(src_fd);
+		return false;
+	}
+	int dst_fd = open(Destination.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+	if (dst_fd < 0) {
+		close(src_fd);
+		return false;
+	}
+
+	char buf[65536];
+	bool ok = true;
+	long long ranges[2][2] = { {0, ctx_end}, {op_start, (long long)st.st_size} };
+	for (int r = 0; r < 2 && ok; r++) {
+		if (r == 1 && op_start > ctx_end) {
+			// Separator only when something was actually skipped (never for the
+			// first operation of the session).
+			char sep[256];
+			// Points at the LIVE session log under /tmp (TMP_LOG_FILE): it carries
+			// the complete current session. The persistent /data/recovery/log.zstd
+			// is only written at reboot (Update_Log_File) and does not yet contain
+			// the running session.
+			int sep_len = snprintf(sep, sizeof(sep),
+				"\n=== per-operation log: %lld KB skipped (earlier operations this session; full session log: " TMP_LOG_FILE ") ===\n\n",
+				(op_start - ctx_end + 1023) / 1024);
+			if (sep_len <= 0 || sep_len >= (int)sizeof(sep) || write(dst_fd, sep, sep_len) != sep_len) {
+				ok = false;
+				break;
+			}
+		}
+		if (lseek64(src_fd, ranges[r][0], SEEK_SET) < 0) {
+			ok = false;
+			break;
+		}
+		long long remaining = ranges[r][1] - ranges[r][0];
+		while (remaining > 0 && ok) {
+			ssize_t rd = read(src_fd, buf, (remaining < (long long)sizeof(buf)) ? (size_t)remaining : sizeof(buf));
+			if (rd < 0) {
+				if (errno == EINTR) continue;
+				ok = false;
+				break;
+			}
+			if (rd == 0)
+				break;   // EOF earlier than the snapshot (defensive; a tmpfs log never shrinks)
+			ssize_t off = 0;
+			while (off < rd) {
+				ssize_t wr = write(dst_fd, buf + off, rd - off);
+				if (wr < 0) {
+					if (errno == EINTR) continue;
+					ok = false;
+					break;
+				}
+				off += wr;
+			}
+			remaining -= rd;
+		}
+	}
+	close(src_fd);
+	close(dst_fd);
+	return ok;
+}
+
 void TWFunc::Copy_Log(string Source, string Destination) {
 	int logPipe[2];
-	int pigz_pid;
+	int comp_pid;
 	int destination_fd;
 	std::string destLogBuffer;
 
 	PartitionManager.Mount_By_Path(Destination, false);
 
-	size_t extPos = Destination.find(".gz");
+	size_t extPos = Destination.find(".zstd");
 	std::string uncompressedLog(Destination);
 	uncompressedLog.replace(extPos, Destination.length(), "");
 
 	if (Path_Exists(Destination)) {
-		Archive_Type type = Get_File_Type(Destination);
-		if (type == COMPRESSED) {
-			std::string destFileBuffer;
-			std::string getCompressedContents = "pigz -c -d " + Destination;
-			if (Exec_Cmd(getCompressedContents, destFileBuffer, false) < 0) {
-				LOGINFO("Unable to get destination logfile contents.\n");
-				return;
-			}
-			destLogBuffer.append(destFileBuffer);
+		// The persistent recovery log is ALWAYS zstd (write side below: zstd -1
+		// -T0; Update_Log_File always passes log.zstd/last_log.zstd) — no
+		// Get_File_Type detour, decompress directly with zstd -c -d.
+		std::string destFileBuffer;
+		std::string getCompressedContents = "zstd -c -d " + Destination;
+		if (Exec_Cmd(getCompressedContents, destFileBuffer, false) < 0) {
+			LOGINFO("Unable to get destination logfile contents.\n");
+			return;
 		}
+		destLogBuffer.append(destFileBuffer);
 	} else if (Path_Exists(uncompressedLog)) {
 		std::ifstream uncompressedIfs(uncompressedLog.c_str());
 		std::stringstream uncompressedSS;
@@ -529,23 +581,43 @@ void TWFunc::Copy_Log(string Source, string Destination) {
 	std::string srcLogBuffer(ss.str());
 	ifs.close();
 
-	if (pipe(logPipe) < 0) {
+	// Hard cap: do not let the persistent log grow without bound. If old history
+	// (destLogBuffer) + current session (srcLogBuffer) would exceed the limit,
+	// drop the old history and start fresh with ONLY the current session — the
+	// newest log is never lost (TW_MAX_PERSISTENT_LOG_SIZE).
+	if (destLogBuffer.size() + srcLogBuffer.size() > TW_MAX_PERSISTENT_LOG_SIZE) {
+		LOGINFO("Persistent log would exceed %d MB -- resetting history, keeping current session only.\n",
+		        (int)(TW_MAX_PERSISTENT_LOG_SIZE / (1024 * 1024)));
+		destLogBuffer.clear();
+	}
+
+	if (pipe2(logPipe, O_CLOEXEC) < 0) {
 		LOGINFO("Unable to open pipe to write to persistent log file: %s\n", Destination.c_str());
+		return;
 	}
 
 	destination_fd = open(Destination.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+	if (destination_fd < 0) {
+		LOGINFO("Cannot open %s: %s\n", Destination.c_str(), strerror(errno));
+		close(logPipe[0]);
+		close(logPipe[1]);
+		return;
+	}
 
-	pigz_pid = fork();
-	if (pigz_pid < 0) {
+	comp_pid = fork();
+	if (comp_pid < 0) {
 		LOGINFO("fork() failed\n");
 		close(destination_fd);
 		close(logPipe[0]);
 		close(logPipe[1]);
-	} else if (pigz_pid == 0) {
+	} else if (comp_pid == 0) {
 		close(logPipe[1]);
 		dup2(logPipe[0], fileno(stdin));
 		dup2(destination_fd, fileno(stdout));
-		if (execlp("pigz", "pigz", "-", NULL) < 0) {
+		// The persistent log is a single compressor fork (no multi-pipe). Pinning
+		// + dynamic -T<size> would be overkill for the tiny log file: fixed -T0
+		// (zstd uses all cores), no sched_setaffinity.
+		if (execlp("zstd", "zstd", "-1", "-T0", "-c", "-", NULL) < 0) {
 			close(destination_fd);
 			close(logPipe[0]);
 			_exit(-1);
@@ -556,15 +628,18 @@ void TWFunc::Copy_Log(string Source, string Destination) {
 			LOGINFO("Unable to append to persistent log: %s\n", Destination.c_str());
 			close(logPipe[1]);
 			close(destination_fd);
+			waitpid(comp_pid, nullptr, 0);
 			return;
 		}
 		if (write(logPipe[1], srcLogBuffer.c_str(), srcLogBuffer.size()) < 0) {
 			LOGINFO("Unable to append to persistent log: %s\n", Destination.c_str());
 			close(logPipe[1]);
 			close(destination_fd);
+			waitpid(comp_pid, nullptr, 0);
 			return;
 		}
 		close(logPipe[1]);
+		waitpid(comp_pid, nullptr, 0);
 	}
 	close(destination_fd);
 }
@@ -585,8 +660,8 @@ void TWFunc::Update_Log_File(void) {
 		}
 	}
 
-	std::string logCopy = recoveryDir + "log.gz";
-	std::string lastLogCopy = recoveryDir + "last_log.gz";
+	std::string logCopy = recoveryDir + "log.zstd";
+	std::string lastLogCopy = recoveryDir + "last_log.zstd";
 	copy_file(logCopy, lastLogCopy, 0600);
 	Copy_Log(TMP_LOG_FILE, logCopy);
 	chown(logCopy.c_str(), 1000, 1000);
@@ -734,17 +809,36 @@ int TWFunc::copy_file(string src, string dst, int mode, bool mount_paths) {
 	}
 	std::ifstream srcfile(src.c_str(), ios::binary);
 	std::ofstream dstfile(dst.c_str(), ios::binary);
+	/* Check source/destination stream state BEFORE rdbuf streams: checking only
+	 * dstfile.bad() (as upstream does) silently produces a 0-byte copy when the
+	 * source exists but is unreadable (permission denied, IO). Callers
+	 * (especially the repacker) rely on the return code. */
+	if (!srcfile.is_open()) {
+		LOGINFO("Unable to open source %s for read: %s\n", src.c_str(), strerror(errno));
+		return -1;
+	}
+	if (!dstfile.is_open()) {
+		LOGINFO("Unable to open destination %s for write: %s\n", dst.c_str(), strerror(errno));
+		return -1;
+	}
 	dstfile << srcfile.rdbuf();
-	if (dstfile.bad()) {
-		LOGINFO("Unable to copy file %s to %s\n", src.c_str(), dst.c_str());
+	/* srcfile.bad() = badbit after an IO error during the rdbuf stream;
+	 * dstfile.bad() = write error. Both must be clean. */
+	if (srcfile.bad() || dstfile.bad()) {
+		LOGINFO("Unable to copy file %s to %s (src.bad=%d dst.bad=%d)\n",
+		        src.c_str(), dst.c_str(), (int)srcfile.bad(), (int)dstfile.bad());
 		return -1;
 	}
 
 	srcfile.close();
 	dstfile.close();
-	if (chmod(dst.c_str(), mode) != 0) {
-		LOGERR("Unable to chmod file: %s. Error: %s\n", dst.c_str(), strerror(errno));
+	if (!Path_Exists(dst)) {
+		LOGINFO("Destination %s does not exist after copy. Skipping chmod.\n", dst.c_str());
 		return -1;
+	}
+	if (chmod(dst.c_str(), mode) != 0) {
+		if (errno != EOPNOTSUPP)
+			LOGINFO("Unable to chmod file: %s. (Filesystem does not support it?)\n", dst.c_str());
 	}
 	return 0;
 }
@@ -842,7 +936,7 @@ bool TWFunc::write_to_file(const string& fn, const std::vector<string> lines) {
 }
 
 
-bool TWFunc::Try_Decrypting_Backup(string Restore_Path, string Password) {
+bool TWFunc::Try_Decrypting_Backup(string Restore_Path, const string& Password) {
 	DIR* d;
 
 	string Filename;
@@ -857,13 +951,16 @@ bool TWFunc::Try_Decrypting_Backup(string Restore_Path, string Password) {
 	while ((de = readdir(d)) != NULL) {
 		Filename = Restore_Path;
 		Filename += de->d_name;
-		if (TWFunc::Get_File_Type(Filename) == ENCRYPTED) {
-			if (TWFunc::Try_Decrypting_File(Filename, Password) < 2) {
+		if (BackupHeaderManager::GetFileType(Filename) == ENCRYPTED) {   // outer magic only
+			BackupHeaderManager hdr;
+			hdr.Load(Filename, Password);                       // decrypt probe
+			if (hdr.GetStatus() != DET_OK) {
 				DataManager::SetValue("tw_restore_password", ""); // Clear the bad password
 				DataManager::SetValue("tw_restore_display", "");  // Also clear the display mask
 				closedir(d);
 				return false;
 			}
+			break;   // homogeneous: one successfully probed segment suffices (OpenAES is always rejected)
 		}
 	}
 	closedir(d);
@@ -1189,6 +1286,21 @@ std::string TWFunc::to_string(unsigned long value) {
 	return os.str();
 }
 
+// Splits a byte count into a human-readable number + unit: < 1 MB is rendered in KB,
+// everything else in MB (>= 1 MB stays byte-identical to the previous plain-MB output).
+// Returns the numeric part as a string; sets unit to "KB" or "MB".
+std::string TWFunc::Bytes_To_Readable_Size(unsigned long long bytes, std::string& unit) {
+	std::ostringstream os;
+	if (bytes < 1048576ULL) {
+		unit = "KB";
+		os << (bytes / 1024ULL);
+	} else {
+		unit = "MB";
+		os << (bytes / 1048576ULL);
+	}
+	return os.str();
+}
+
 void TWFunc::Disable_Stock_Recovery_Replace(void) {
 	if (PartitionManager.Mount_By_Path(PartitionManager.Get_Android_Root_Path(), false)) {
 		// Disable flashing of stock recovery
@@ -1454,7 +1566,7 @@ string TWFunc::Check_For_TwrpFolder() {
 	DIR* d;
 	struct dirent* de;
 
-	if (DataManager::GetIntValue(TW_IS_ENCRYPTED)) {
+	if (DataManager::GetIntValue(TW_IS_ENCRYPTED) && DataManager::GetIntValue(TW_CRYPTO_PWTYPE)) {
 		goto exit;
 	}
 
@@ -1475,7 +1587,7 @@ string TWFunc::Check_For_TwrpFolder() {
 			type = Get_D_Type_From_Stat(fullPath);
 		}
 
-		if (type == DT_DIR && Path_Exists(fullPath + '/' + TW_SETTINGS_FILE)) {
+		if (type == DT_DIR && Path_Exists(fullPath + "/.twrpcf")) {
 			if ('/' + name == TW_DEFAULT_RECOVERY_FOLDER) {
 				oldFolder = name;
 			} else {
@@ -1488,6 +1600,14 @@ string TWFunc::Check_For_TwrpFolder() {
 
 	if (oldFolder == "" && customTWRPFolders.empty()) {
 		LOGINFO("No recovery folder found. Using default folder.\n");
+		// Do not mount/mkdir in fastboot mode (it would break fastbootd startup).
+		if (android::base::GetProperty(TW_FASTBOOT_MODE_PROP, "0") != "1") {
+			TWPartition* SDCard = PartitionManager.Find_Partition_By_Path(DataManager::GetCurrentStoragePath());
+			if (SDCard->Mount(true)) {
+				mainPath += TW_DEFAULT_RECOVERY_FOLDER;
+				mkdir(mainPath.c_str(), 0777);
+			}
+		}
 		goto exit;
 	} else if (customTWRPFolders.empty()) {
 		LOGINFO("No custom recovery folder found. Using TWRP as default.\n");

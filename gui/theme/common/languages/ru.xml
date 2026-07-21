@@ -184,6 +184,10 @@
 		<string name="part_used">Использовано: %tw_partition_used% МБ</string>
 		<string name="part_free">Свободно: %tw_partition_free% МБ</string>
 		<string name="part_backup_size">Размер резервных копий: %tw_partition_backup_size% МБ</string>
+		<string name="part_size_kb">Размер: %tw_partition_size% КБ</string>
+		<string name="part_used_kb">Использовано: %tw_partition_used% КБ</string>
+		<string name="part_free_kb">Свободно: %tw_partition_free% КБ</string>
+		<string name="part_backup_size_kb">Размер резервных копий: %tw_partition_backup_size% КБ</string>
 		<string name="resize_btn">Измен. размер</string>
 		<string name="resize_btn_s">Изм. размер</string>
 		<string name="resize_confirm">Изменить размер %tw_partition_name%?</string>
@@ -683,7 +687,7 @@
 		<string name="compression_on">Сжатие включено</string>
 		<string name="digest_off" version="2">Вычисление контрольных сумм выключено</string>
 		<string name="backup_fail">Ошибка резервного копирования</string>
-		<string name="backup_clean">Ошибка резервного копирования. Очистка папки с резервной копией.</string>
+		<string name="backup_error_clean">Ошибка резервного копирования. Очистка папки с резервной копией.</string>
 		<string name="running_recovery_commands">Выполнение команд рекавери</string>
 		<string name="recovery_commands_complete">Команды рекавери завершены</string>
 		<string name="running_ors">Выполнение OpenRecoveryScript</string>
@@ -793,5 +797,17 @@
 		<string name="restore_with_pattern1">Графический пароль включен</string>
 		<string name="restore_with_pattern2">Графический пароль должен быть отключён перед восстановлением</string>
 		<string name="reboot_after_restore">Рекомендуется перезагрузить Android один раз после первой загрузки.</string>
+		<string name="adbbu_preparing">Preparing ADB backup mode...</string>
+		<string name="adbbu_ready">ADB backup mode ready. On the PC you can now run your backup or restore as usual with 'adb backup/restore'.</string>
+		<string name="adbbu_idle_hint">If no backup/restore follows, this mode turns off automatically after {1} minutes.</string>
+		<string name="adbbu_stopped">ADB backup mode stopped. Default ADB was restored.</string>
+		<string name="adbbu_stopped_timeout">ADB backup mode was stopped after timeout ({1} min). Default ADB was restored.</string>
+		<string name="adbbu_cancel_mode">Cancelling ADB backup mode...</string>
+		<string name="adbbu_stock_refused">Direct 'adb backup/restore' is disabled here: stock adbd uses a freeze-prone PTY. On the PC run:  adb shell adbbu start  then retry your backup/restore.</string>
+		<string name="adbbu_read_ab_hdr">Reading Backup</string>
+		<string name="adbbu_read_ab">Reading ADB backup file. Please wait...</string>
+		<string name="adbbu_read_ab_done">...Done.</string>
+		<string name="adbbu_invalid_ab">Unable to read the ADB backup header of '{1}'. The backup file is corrupt.</string>
+		<string name="verbose_log_chk">Enable verbose log (log all file/folder names)</string>
 	</resources>
 </language>

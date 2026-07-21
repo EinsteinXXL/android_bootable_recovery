@@ -482,15 +482,36 @@ static GRSurface* drm_init(minui_backend* backend __unused) {
 
 static GRSurface* drm_flip(minui_backend* backend __unused) {
     int ret;
-    memcpy(drm_surfaces[current_buffer]->base.data,
-            draw_buf->data, draw_buf->height * draw_buf->row_bytes);
-
+    // Copy only the display rows reported as damage into the scanout buffer.
+    // gr_flip_consume_damage returns 0 => full copy (fallback, original behavior),
+    // 1 => partial copy [top, bottom). draw_buf is always the full, correct image;
+    // we copy only a row slice of it.
+    int top = 0, bottom = 0;
+    if (gr_flip_consume_damage(&top, &bottom) &&
+        top >= 0 && bottom <= (int)draw_buf->height && bottom > top) {
+        size_t off = (size_t)top * draw_buf->row_bytes;
+        size_t len = (size_t)(bottom - top) * draw_buf->row_bytes;
+        memcpy((unsigned char*)drm_surfaces[current_buffer]->base.data + off,
+                (unsigned char*)draw_buf->data + off, len);
+    } else {
+        memcpy(drm_surfaces[current_buffer]->base.data,
+                draw_buf->data, draw_buf->height * draw_buf->row_bytes);
+    }
 
     ret = drmModePageFlip(drm_fd, main_monitor_crtc->crtc_id,
                           drm_surfaces[current_buffer]->fb_id, 0, NULL);
     if (ret < 0) {
-        printf("drmModePageFlip failed ret=%d\n", ret);
-        return NULL;
+        // Do NOT return NULL on a transient flip error. Above all EBUSY(-16) -- a
+        // still-pending flip, typical when the display was power-saving/blanked
+        // during a long operation -- must not kill minui: gr_flip() would otherwise
+        // set gr_draw=NULL and the next draw call would dereference NULL -> segfault.
+        // Instead KEEP the current buffer (no current_buffer swap) and return the
+        // valid draw_buf: this frame is skipped (scanout shows the previous image),
+        // the next flip retries and recovers once the display delivers vblanks again.
+        // The root cause in the ADB path is fixed separately (Wake-on-End,
+        // twrpAdbBuFifo); this is the generic safety net.
+        printf("drmModePageFlip failed ret=%d (frame skipped, not fatal)\n", ret);
+        return draw_buf;
     }
     current_buffer = 1 - current_buffer;
     return draw_buf;

@@ -18,6 +18,7 @@
 #include <string>
 #include <fcntl.h>
 #include <sys/wait.h>
+#include <sched.h>
 #include <pthread.h>
 #include <utils/Errors.h>
 #include <utils/threads.h>
@@ -100,7 +101,19 @@ pid_t twrpMtp::forkserver(int mtppipe[2]) {
 		return 0;
 	}
 	if (pid == 0) {
-		// Child process
+		// CPU affinity via BoardConfig flags (TW_USE_CPU_AFFINITY +
+		// TW_AFFINITY_MTP_CORE). Pinning is skipped entirely if the master switch is
+		// false or the MTP core flag is not set. Bool evaluation happens in the
+		// Android.mk (makefile filter); here only an existence check via #if defined.
+		// See CPU_Affinity_Settings_Documentation.md.
+#if defined(TW_USE_CPU_AFFINITY) && defined(TW_AFFINITY_MTP_CORE)
+		if ((int)(TW_AFFINITY_MTP_CORE) >= 0) {
+			cpu_set_t cpuset;
+			CPU_ZERO(&cpuset);
+			CPU_SET((int)(TW_AFFINITY_MTP_CORE), &cpuset);
+			sched_setaffinity(0, sizeof(cpuset), &cpuset);
+		}
+#endif
 		close(mtppipe[1]); // Child closes write side
 		mtp_read_pipe = mtppipe[0];
 		start();

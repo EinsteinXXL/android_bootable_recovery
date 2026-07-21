@@ -45,3 +45,27 @@ LOCAL_MODULE_TAGS:= optional
 LOCAL_MODULE_CLASS := RECOVERY_EXECUTABLES
 LOCAL_MODULE_PATH := $(TARGET_RECOVERY_ROOT_OUT)/system/bin
 include $(BUILD_EXECUTABLE)
+
+# adbbu -- trigger CLI for the PTY-free ADB backup mode (adb shell adbbu start|cancel).
+# Tiny binary: only writes an opcode into TW_ADB_FIFO (see adbbutrigger.cpp).
+include $(CLEAR_VARS)
+
+LOCAL_SRC_FILES:= \
+        adbbutrigger.cpp
+
+LOCAL_SHARED_LIBRARIES += libstdc++
+
+ifeq ($(shell test $(PLATFORM_SDK_VERSION) -lt 23; echo $$?),0)
+    LOCAL_C_INCLUDES += external/stlport/stlport
+    LOCAL_SHARED_LIBRARIES += libstlport
+else
+    LOCAL_SHARED_LIBRARIES += libc++
+endif
+
+LOCAL_C_INCLUDES += bionic
+LOCAL_CFLAGS:= -c -W
+LOCAL_MODULE:= adbbu
+LOCAL_MODULE_TAGS:= optional
+LOCAL_MODULE_CLASS := RECOVERY_EXECUTABLES
+LOCAL_MODULE_PATH := $(TARGET_RECOVERY_ROOT_OUT)/system/bin
+include $(BUILD_EXECUTABLE)

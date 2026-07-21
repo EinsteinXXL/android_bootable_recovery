@@ -42,11 +42,24 @@ int gr_fb_width(void);
 int gr_fb_height(void);
 gr_pixel *gr_fb_data(void);
 void gr_flip(void);
+// Set the damage for the NEXT gr_flip (logical coordinates, before rotation -- like
+// gr_clip/gr_fill). If the call is omitted before gr_flip, the backend copies the
+// full frame (original behavior). Enables partial flipping (only the changed
+// display rows) instead of the full framebuffer memcpy.
+void gr_set_flip_damage(int x, int y, int w, int h);
 void gr_fb_blank(bool blank);
 
 void gr_color(unsigned char r, unsigned char g, unsigned char b, unsigned char a);
 void gr_clip(int x, int y, int w, int h);
 void gr_noclip();
+// Set the scissor to the INTERSECTION of (x,y,w,h) with the currently active
+// gr_clip rect (without an active clip identical to gr_clip). For widgets that clip
+// internally (GUIScrollList/GUIInput), so they do not break out of the page's
+// region scissor in the region-render path. 1-slot save, NOT nestable: exactly ONE
+// gr_clip_intersect() ... gr_clip_restore() pair per widget render (restores the
+// prior state).
+void gr_clip_intersect(int x, int y, int w, int h);
+void gr_clip_restore();
 void gr_fill(int x, int y, int w, int h);
 void gr_line(int x0, int y0, int x1, int y1, int width);
 gr_surface gr_render_circle(int radius, unsigned char r, unsigned char g, unsigned char b, unsigned char a);
@@ -68,6 +81,12 @@ void gr_ttf_dump_stats(void);
 void gr_blit(gr_surface source, int sx, int sy, int w, int h, int dx, int dy);
 unsigned int gr_get_width(gr_surface surface);
 unsigned int gr_get_height(gr_surface surface);
+// Opaque-x span of a surface (leftmost/rightmost visible pixel, alpha > 8).
+// Return 1 + minx/maxx (surface pixel coordinates) for an alpha-capable format
+// (RGBA/BGRA_8888); 0 if no usable alpha channel (e.g. RGBX_8888) -> the caller
+// must then use the full rect. For an empty (fully transparent) surface minx/maxx
+// are set to -1 (return stays 1).
+int gr_surface_opaque_xspan(gr_surface surface, int* minx, int* maxx);
 int gr_get_surface(gr_surface* surface);
 int gr_free_surface(gr_surface surface);
 

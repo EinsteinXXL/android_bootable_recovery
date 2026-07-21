@@ -175,6 +175,10 @@
 		<string name="part_used">Használt: %tw_partition_used%MB</string>
 		<string name="part_free">Szabad: %tw_partition_free%MB</string>
 		<string name="part_backup_size">Biztonsági mentés mérete: %tw_partition_backup_size%MB</string>
+		<string name="part_size_kb">Méret: %tw_partition_size%KB</string>
+		<string name="part_used_kb">Használt: %tw_partition_used%KB</string>
+		<string name="part_free_kb">Szabad: %tw_partition_free%KB</string>
+		<string name="part_backup_size_kb">Biztonsági mentés mérete: %tw_partition_backup_size%KB</string>
 		<string name="resize_btn">Fájlrendszer átméretezése</string>
 		<string name="resize_btn_s">Átméretezés</string>
 		<string name="resize_confirm">Átméretezi: %tw_partition_name%?</string>
@@ -625,7 +629,7 @@
 		<string name="compression_on">Tömörítés bekapcsolva</string>
 		<string name="digest_off" version="3">Digest generálás kikapcsolva</string>
 		<string name="backup_fail">Biztonsági mentés készítése sikertelen</string>
-		<string name="backup_clean">Biztonsági mentés nem sikerült. Mentési mappa tisztítása.</string>
+		<string name="backup_error_clean">Biztonsági mentés nem sikerült. Mentési mappa tisztítása.</string>
 		<string name="running_recovery_commands">Recovery parancsok futtatása</string>
 		<string name="recovery_commands_complete">Recovery parancsok készen vannak</string>
 		<string name="running_ors">OpenRecoveryScript futtatása</string>
@@ -685,5 +689,17 @@
 		<string name="copy_kernel_log">Kernel log másolva: {1}</string>
 		<string name="include_kernel_log">Emellett Kernel Log másolása</string>
 		<string name="unable_set_boot_slot">Hiba a boot slot váltása során erre: {1}</string>
+		<string name="adbbu_preparing">Preparing ADB backup mode...</string>
+		<string name="adbbu_ready">ADB backup mode ready. On the PC you can now run your backup or restore as usual with 'adb backup/restore'.</string>
+		<string name="adbbu_idle_hint">If no backup/restore follows, this mode turns off automatically after {1} minutes.</string>
+		<string name="adbbu_stopped">ADB backup mode stopped. Default ADB was restored.</string>
+		<string name="adbbu_stopped_timeout">ADB backup mode was stopped after timeout ({1} min). Default ADB was restored.</string>
+		<string name="adbbu_cancel_mode">Cancelling ADB backup mode...</string>
+		<string name="adbbu_stock_refused">Direct 'adb backup/restore' is disabled here: stock adbd uses a freeze-prone PTY. On the PC run:  adb shell adbbu start  then retry your backup/restore.</string>
+		<string name="adbbu_read_ab_hdr">Reading Backup</string>
+		<string name="adbbu_read_ab">Reading ADB backup file. Please wait...</string>
+		<string name="adbbu_read_ab_done">...Done.</string>
+		<string name="adbbu_invalid_ab">Unable to read the ADB backup header of '{1}'. The backup file is corrupt.</string>
+		<string name="verbose_log_chk">Enable verbose log (log all file/folder names)</string>
 	</resources>
 </language>

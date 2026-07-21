@@ -22,6 +22,7 @@
 #define TW_SETTINGS_FILE            ".twrps"
 #define TW_RECOVERY_NAME            "TWRP"
 #define TW_DEFAULT_RECOVERY_FOLDER  "/" TW_RECOVERY_NAME
+#define TW_STORAGE_PATH             "/data/recovery/"
 #define TW_USE_COMPRESSION_VAR      "tw_use_compression"
 #define TW_FILENAME                 "tw_filename"
 #define TW_ZIP_INDEX                "tw_zip_index"
@@ -135,6 +136,7 @@
 #define TW_DOWNLOAD_MODE            "tw_download_mode"
 #define TW_EDL_MODE                 "tw_edl_mode"
 #define TW_FASTBOOT_MODE            "tw_fastboot_mode"
+#define TW_FASTBOOT_MODE_PROP       "ro.twrp.fastbootd"
 #define TW_IS_ENCRYPTED             "tw_is_encrypted"
 #define TW_IS_DECRYPTED             "tw_is_decrypted"
 #define TW_CRYPTO_PWTYPE            "tw_crypto_pwtype"
@@ -172,8 +174,28 @@
 #define MAX_ARCHIVE_SIZE 1610612736LLU
 //#define MAX_ARCHIVE_SIZE 52428800LLU // 50MB split for testing
 
+// Size-ladder unit: one pipe per started LADDER_UNIT of data to process
+// (compute_pipe_count(used_bytes), capped by MAX_PIPES). Deliberately separate
+// from MAX_ARCHIVE_SIZE (the segment split size): LADDER_UNIT is a pure
+// performance/scaling constant, MAX_ARCHIVE_SIZE the technical file-size limit
+// (100s naming scheme). They currently share the same value (1.5GB) but may
+// grow independently.
+#define LADDER_UNIT 1610612736LLU
+
+// Hard cap for the persistent recovery log (<log_dir>/recovery/log.zstd),
+// measured on the DECOMPRESSED content — Copy_Log() decompresses the whole
+// history into RAM on every reboot anyway. If old history + current session
+// would exceed the limit, the old history is dropped and only the current
+// session kept (the newest log is never lost). Bounds both disk size and the
+// per-reboot RAM/CPU cost. ~200MB decompressed is roughly the last ~10 sessions
+// at ~20MB each (~10-20MB compressed on disk). Override via BoardConfig
+// -DTW_MAX_PERSISTENT_LOG_SIZE=<bytes>.
+#ifndef TW_MAX_PERSISTENT_LOG_SIZE
+#define TW_MAX_PERSISTENT_LOG_SIZE (200 * 1024 * 1024)   // ~200 MB
+#endif
+
 #ifndef CUSTOM_LUN_FILE
-#define CUSTOM_LUN_FILE "/sys/class/android_usb/android0/f_mass_storage/lun%d/file"
+#define CUSTOM_LUN_FILE "/config/usb_gadget/g1/functions/mass_storage.0/lun.%d/file"
 #endif
 
 #define SCRIPT_FILE_TMP "/tmp/openrecoveryscript"

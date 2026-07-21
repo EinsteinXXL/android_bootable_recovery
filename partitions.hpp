@@ -25,6 +25,7 @@
 #include <sys/poll.h>
 #include "exclude.hpp"
 #include "tw_atomic.hpp"
+#include <atomic>
 #include "progresstracking.hpp"
 #ifdef TW_INCLUDE_CRYPTO
 #include "fscrypt_policy.h"
@@ -37,6 +38,21 @@
 #define REPACK_NEW_DIR "/tmp/repacknew/"
 
 using namespace std;
+
+// Restore-preflight classification of a FILE-BASED backup's validity from ONE
+// BackupHeaderManager load (+ legacy .info). Source = TWPartition::
+// Probe_Restore_Backup; used by Get_Restore_Size (reject before the wipe) AND
+// TWPartitionManager::Preflight_Restore_Backup (early GUI firewall, specific
+// console message per reason). The reject subtypes only change the MESSAGE,
+// not the valid/invalid decision (which mirrors Get_Restore_Size 1:1).
+enum Restore_Validity {
+	RV_VALID = 0,            // restorable: DFP backup_size>0 / legacy gzip / legacy plain-tar .info>0
+	RV_NO_BACKUP_SIZE,       // this build (4-7) without g-header backup_size -> self-describing incomplete
+	RV_LEGACY_NO_INFO,       // legacy plain tar (0) without a usable .info backup_size
+	RV_REJECT_OPENAES,       // OpenAES (removed from TWRP 3.7+) -> unsupported (probe detects it via the outer type)
+	RV_REJECT_UNKNOWN,       // unknown/corrupt format (no ustar / 'g' without tartype)
+	RV_WRONG_PASSWORD        // decrypt probe failed (not expected post-decrypt; defensive)
+};
 
 // BasePartition is used for overriding so we can run custom, device
 // specific code.
@@ -86,23 +102,29 @@ enum PartitionManager_Op {                                                    //
 
 class TWPartition;
 
+// All fields are default-initialized: indeterminate bool/pointer/integer
+// members would be a time bomb for any new code path that misses a field.
 struct PartitionSettings {                                                    // Settings for backup session
-	TWPartition* Part;                                                        // Partition to pass to the partition backup loop
+	TWPartition* Part = nullptr;                                              // Partition to pass to the partition backup loop
 	std::string Backup_Folder;                                                // Path to restore folder
-	bool adbbackup;                                                           // tell the system we are backing up over adb
-	bool adb_compression;                                                     // 0 == uncompressed, 1 == compressed
-	bool generate_digest;                                                     // tell system to create digest for partitions
-	bool generate_md5;                                                        // tell system to create md5 for partitions
-	uint64_t total_restore_size;                                              // Total size of restored backup
-	uint64_t img_bytes_remaining;                                             // remaining img/emmc bytes to backup for progress indicator
-	uint64_t file_bytes_remaining;                                            // remaining file bytes to backup for progress indicator
-	uint64_t img_time;                                                        // used to calculate how fast we backup images
-	uint64_t file_time;                                                       // used to calculate how fast we backup files
-	uint64_t img_bytes;                                                       // total image bytes of all emmc partitions
-	uint64_t file_bytes;                                                      // total file bytes of all file based partitions
-	int partition_count;                                                      // Number of partitions to restore
-	ProgressTracking *progress;                                               // Keep track of progress in GUI
-	enum PartitionManager_Op PM_Method;                                       // Current operation of backup or restore
+	bool adbbackup = false;                                                   // tell the system we are backing up over adb
+	bool adb_compression = false;                                             // 0 == uncompressed, 1 == compressed
+	bool generate_digest = false;                                             // tell system to create digest for partitions
+	bool generate_md5 = false;                                                // tell system to create md5 for partitions
+	uint64_t total_restore_size = 0;                                          // Restore GRAND TOTAL across all partitions (ProgressTracking denominator in Run_Restore). Do NOT misuse per partition — that is partition_size.
+	uint64_t partition_size = 0;                                              // Size of the ONE partition currently processed (image/dd path): set by Backup_Image/Restore_Image/Restore_Image_Test/adb TWIMG, read by Raw_Read_Write for SetPartitionSize(). Direction-neutral (backup + restore).
+	uint64_t img_bytes_remaining = 0;                                         // remaining img/emmc bytes to backup for progress indicator
+	uint64_t file_bytes_remaining = 0;                                        // remaining file bytes to backup for progress indicator
+	uint64_t img_time = 0;                                                    // used to calculate how fast we backup images
+	uint64_t file_time = 0;                                                   // used to calculate how fast we backup files
+	uint64_t img_bytes = 0;                                                   // total image bytes of all emmc partitions
+	uint64_t file_bytes = 0;                                                  // total file bytes of all file based partitions
+	uint64_t external_app_data_size = 0;                                          // Size of /data/media/0/Android in MB for GUI display
+	bool external_app_data_included = false;                                      // True iff /data/media/0/Android was actually added to the inclusion list (single source of truth for both size accounting and .info flag)
+	int partition_count = 0;                                                  // Number of partitions to restore
+	Restore_Validity backup_validity = RV_VALID;                              // Strict restore preflight: Get_Restore_Size sets the reject reason (!= RV_VALID) when a backup is self-describing-incomplete/damaged/OpenAES (Run_Restore aborts BEFORE the wipe — with a specific message via Emit_Restore_Validity_Error). Reset on entry to Get_Restore_Size.
+	ProgressTracking *progress = nullptr;                                     // Keep track of progress in GUI
+	enum PartitionManager_Op PM_Method = PM_BACKUP;                           // Current operation of backup or restore
 };
 
 enum Backup_Method_enum {
@@ -127,6 +149,7 @@ public:
 	bool ReMount(bool Display_Error);                                         // Remounts the partition
 	bool ReMount_RW(bool Display_Error);                                      // Remounts the partition with read/write access
 	bool Bind_Mount(bool Display_Error);                                      // Bind mount partition if symlink mountpoint is populated
+	bool BlkDiscard();                                                        // Clear the partition using BLKDISCARD ioctl
 	bool Wipe(string New_File_System);                                        // Wipes the partition
 	bool Wipe();                                                              // Wipes the partition
 	bool Wipe_AndSec();                                                       // Wipes android secure
@@ -136,9 +159,10 @@ public:
 	bool Repair();                                                            // Repairs the current file system
 	bool Can_Resize();                                                        // Checks to see if we have everything needed to be able to resize the current file system
 	bool Resize();                                                            // Resizes the current file system
-	bool Backup(PartitionSettings *part_settings, pid_t *tar_fork_pid);       // Backs up the partition to the folder specified
+	bool Backup(PartitionSettings *part_settings, std::atomic<pid_t> *tar_fork_pid); // Backs up the partition to the folder specified
 	bool Restore(PartitionSettings *part_settings);                           // Restores the partition using the backup folder provided
 	unsigned long long Get_Restore_Size(PartitionSettings *part_settings);    // Returns the overall restore size of the backup
+	Restore_Validity Probe_Restore_Backup(PartitionSettings *part_settings, unsigned long long *out_size = nullptr, unsigned long long *out_ext_app = nullptr, int *out_ead = nullptr); // Classifies backup validity (ONE HeaderManager load + legacy .info) and returns the self-described size facts + the ead marker (out_ead, /data checkbox). Get_Restore_Size delegates here (reject); Preflight_Restore_Backup uses it for the early GUI firewall + ead. Pure logic (LOGINFO reason, no gui_err/DataManager)
 	string Backup_Method_By_Name();                                           // Returns a string of the backup method for human readable output
 	bool Decrypt(string Password);                                            // Decrypts the partition, return 0 for failure and -1 for success
 	bool Wipe_Encryption();                                                   // Ignores wipe commands for /data/media devices and formats the original block device
@@ -162,6 +186,7 @@ public:
 	void Set_Can_Be_Wiped(bool val);										  // Update whether the partition can be wiped or not
 	std::string Get_Display_Name();                                           // Get the display name in the gui for the partition
 	bool Is_SlotSelect();                                                     // Return whether the partition is a slot partition or not
+	void Refresh_External_App_Data_Inclusion(bool include);                       // Toggle inclusion of /data/media/0/Android in backup_exclusions; idempotent
 
 public:
 	string Current_File_System;                                               // Current file system
@@ -210,13 +235,21 @@ private:
 	bool Wipe_Data_Without_Wiping_Media();                                    // Uses rm -rf to wipe but does not wipe /data/media
 	bool Wipe_Data_Without_Wiping_Media_Func(const string& parent);           // Uses rm -rf to wipe but does not wipe /data/media
 	void Wipe_Crypto_Key();                                                   // Wipe crypto key from either footer or block device
-	bool Backup_Tar(PartitionSettings *part_settings, pid_t *tar_fork_pid);   // Backs up using tar for file systems
+	bool Backup_Tar(PartitionSettings *part_settings, std::atomic<pid_t> *tar_fork_pid); // Backs up using tar for file systems
 	bool Backup_Image(PartitionSettings *part_settings);                      // Backs up using raw read/write for emmc memory types
-	bool Raw_Read_Write(PartitionSettings *part_settings);
+	bool Raw_Read_Write(PartitionSettings *part_settings, bool compress = false); // dd copy (both directions); compress=true (GUI backup only): zstd single-pipe for /super image
 	bool Backup_Dump_Image(PartitionSettings *part_settings);                 // Backs up using dump_image for MTD memory types
 	string Get_Restore_File_System(PartitionSettings *part_settings);         // Returns the file system that was in place at the time of the backup
 	bool Restore_Tar(PartitionSettings *part_settings);                       // Restore using tar for file systems
 	bool Restore_Image(PartitionSettings *part_settings);                     // Restore using dd for images
+#ifdef TWRP_RESTORE_DEMO_MODE
+	string Ensure_TestRestore_Root();                                        // Demo-only: ensure+return <tw_storage_path>/TWRP/TestRestore (SSoT root for all test-restores; "" on hard mkdir failure)
+	bool Restore_Image_Test(PartitionSettings *part_settings);          // Demo-only Phase A: image test-restore (super/boot/modem/dtbo/...) to <root>/<Backup_Name>/<file>.raw + inline SHA256 (never writes block device)
+	bool Verify_Image_Test();                                          // Demo-only Phase B (UNGETIMT): hash live partition (O_RDONLY) and compare to Phase-A hash
+	string   Demo_Test_Hash;                                                 // Demo-only: SHA256 of the decompressed test image (set in Phase A, checked in Phase B)
+	uint64_t Demo_Test_Size = 0;                                             // Demo-only: number of bytes to hash from the live partition in Phase B
+	bool     Demo_Test_Pending = false;                                      // Demo-only: true after Phase A succeeds -> Run_Restore triggers Phase B AFTER rStop
+#endif
 	bool Check_Restore_File_MD5(const string& Filename);                      // Verifies MD5 matches for a file before restoration
 	bool Get_Size_Via_statfs(bool Display_Error);                             // Get Partition size, used, and free space using statfs
 	bool Get_Size_Via_df(bool Display_Error);                                 // Get Partition size, used, and free space using df command
@@ -285,6 +318,7 @@ private:
 	string Key_Directory;                                                     // Metadata key directory needed for mounting FBE encrypted data partitions using metadata encryption
 	string Original_Path;
 	bool Use_Original_Path;
+	bool Needs_Fs_Compress;
 
 	struct partition_fs_flags_struct {                                        // This struct is used to store mount flags and options for different file systems for the same partition
 		string File_System;
@@ -300,6 +334,9 @@ friend class DataManager;
 friend class GUIPartitionList;
 friend class GUIAction;
 friend class PageManager;
+#ifdef TWRP_RESTORE_DEMO_MODE
+friend class twrpAdbBuFifo;   // Demo phase B: reads Demo_Test_Pending + calls Verify_Image_Test() after the ADB stream (mirrors Run_Restore). Demo-only -> guarded.
+#endif
 };
 
 struct users_struct {
@@ -331,10 +368,12 @@ public:
 	TWPartition* Find_Partition_By_Block_Device(const string& Block_Device);  // Returns a pointer to a partition based on block device
 	int Check_Backup_Name(const std::string& Backup_Name, bool Display_Error, bool Must_Be_Unique); // Checks the current backup name to ensure that it is valid and optionally that a backup with that name doesn't already exist
 	int Run_Backup(bool adbbackup);                                           // Initiates a backup in the current storage
+	bool Sync_Backup_Inclusions();                                            // Decides AND applies the /data/media/0/Android inclusion completely: true iff /data is in the backup set + Has_Data_Media + checkbox + path (SSoT, callers need no extra gate)
 	int Run_Restore(const string& Restore_Name);                              // Restores a backup
-	bool Write_ADB_Stream_Header(uint64_t partition_count);                   // Write ADB header over twrpbu FIFO
-	bool Write_ADB_Stream_Trailer();                                          // Write ADB trailer over twrpbu FIFO
+	void Save_ADB_Recovery_Log(const std::string& op);                        // ADB backup/restore ONLY: stores /tmp/recovery.log as <BackupRoot>/ADB_<op>_<Get_Current_Date()>_Recovery.log (op = "Backup"|"Restore"; date-based name because the ADB path has no user-nameable backup folder). Public because twrpAdbBuFifo::Restore_ADB_Backup calls it too. The 4 GUI log sites (intra-folder + sibling) are unaffected.
+	void Mark_Operation_Log_Start();                                          // Per-operation log slicing: records the byte offset in /tmp/recovery.log as the start of the current backup/restore operation; the FIRST call of the session additionally freezes the boot/decrypt context end (log_ctx_end). Callers = all 3 operation funnels: Run_Backup (GUI/ORS/adb), Run_Restore (GUI/ORS), twrpAdbBuFifo::Restore_ADB_Backup (hence public). Basis for the slicing in Save_Recovery_Log.
 	void Set_Restore_Files(string Restore_Name);                              // Used to gather a list of available backup partitions for the user to select for a restore
+	bool Preflight_Restore_Backup(const string& Restore_Name);                // Early GUI firewall — validates ALL file-based partitions of the backup (mirrors Run_Restore loop 1) BEFORE partition selection; specific gui_err per broken partition. true = all restorable
 	int Wipe_By_Path(string Path);                                            // Wipes a partition based on path
 	int Wipe_By_Path(string Path, string New_File_System);                    // Wipes a partition based on path
 	int Factory_Reset();                                                      // Performs a factory reset
@@ -356,8 +395,10 @@ public:
 	int Partition_SDCard(void);                                               // Repartitions the sdcard
 	TWPartition *Get_Default_Storage_Partition();                             // Returns a pointer to a default storage partition
 	int Check_Backup_Cancel();                                                // Returns the value of stop_backup
-	int Cancel_Backup();                                                      // Signals partition backup to cancel
-	void Clean_Backup_Folder(string Backup_Folder);                           // Clean Backup Folder on Error
+	int Cancel_Backup();                                                      // Signals active backup to cancel (sets stop_backup, kills children; Run_Backup runs cleanup)
+	int Cancel_Restore();                                                     // Signals active restore to cancel (sets stop_restore, kill children)
+	void Pause_Restore();                                                     // SIGSTOP to the restore pipeline children while the user is on the cancel_restore_confirm page
+	void Resume_Restore();                                                    // SIGCONT to the restore pipeline children when the user leaves the confirm page
 	int Fix_Contexts();
 	void Get_Partition_List(string ListType, std::vector<PartitionList> *Partition_List);
 	int Fstab_Processed();                                                    // Indicates if the fstab has been processed or not
@@ -379,6 +420,16 @@ public:
 	bool Flash_Image(string& path, string& filename);                         // Flashes an image to a selected partition from the partition list
 	bool Restore_Partition(struct PartitionSettings *part_settings);          // Restore the partitions based on type
 	TWAtomicInt stop_backup;
+	TWAtomicInt stop_restore;
+	// 1 = the currently running restore is filesystem-based (Restore_Tar) and
+	// may be cancelled by user action. 0 = RAW/image (Restore_Image, dd) or no
+	// restore active — cancel is locked, because aborting mid-dd would leave a
+	// half-flashed image and a softbrick. Set per partition in Run_Restore(),
+	// queried as a hard lock by Cancel_Restore(), and mirrored as the
+	// DataManager variable "tw_restore_cancelable" so the GUI can show/lock the
+	// cancel button accordingly.
+	TWAtomicInt restore_cancelable;
+	void Set_Restore_Cancelable(int v);                                       // Sets restore_cancelable (atomic) + tw_restore_cancelable (DataManager mirror) together — the two must never diverge. Public: the ADB restore loop (twrpAdbBuFifo) also sets the lock per stream partition (TWFN=1/TWIMG=0), same SSoT as Run_Restore.
 	void Override_Active_Slot(const string& Slot);                            // Override the active slot for repacking
 	void Set_Active_Slot(const string& Slot);                                 // Sets the active slot to A or B
 	string Get_Active_Slot_Suffix();                                          // Returns active slot _a or _b
@@ -410,6 +461,19 @@ private:
 	void Setup_Settings_Storage_Partition(TWPartition* Part);                 // Sets up settings storage
 	void Setup_Android_Secure_Location(TWPartition* Part);                    // Sets up .android_secure if needed
 	bool Backup_Partition(struct PartitionSettings *part_settings);           // Backup the partitions based on type
+	enum class OpType { Backup, Restore };                                    // Discriminator for Operation_Cleanup — the backup path cleans sibling log + removeDir; the restore path cleans restore_cancelable + sibling log + Update_System_Details. Both pass status (1=error, 2=cancel) through.
+	void Save_Recovery_Log(const std::string& log_path);                      // Copies /tmp/recovery.log to log_path + tw_set_default_metadata. Per-operation slicing: boot/decrypt context [0..log_ctx_end) + separator + current operation [log_op_start..EOF) instead of a full copy; with unset/inconsistent marks or an IO error it FALLS BACK to the full copy. The caller constructs the path (intra-folder vs sibling). NO Path_Exists guard — that belongs in the caller; success paths need none (the folder is guaranteed to exist).
+	// Per-operation log-slicing marks (byte offsets in /tmp/recovery.log; -1 =
+	// unset -> full copy). log_ctx_end: end of the boot/decrypt context, set
+	// once by the session's first Mark_Operation_Log_Start(). log_op_start:
+	// start of the current operation, renewed on every mark. No lock:
+	// backup/restore operations run sequentially (GUI action thread or adb FIFO
+	// thread, never in parallel — tw_action_busy/mode daemon prevent overlap).
+	long long log_ctx_end = -1;
+	long long log_op_start = -1;
+	int Operation_Cleanup(OpType op, int status, const std::string& path, bool adbbackup = false); // Generic backup/restore exit helper: SetPerformanceMode(false) + status-specific gui_msg + sibling log + (backup: removeDir / restore: restore_cancelable=0 + Update_System_Details) + return status. Only called for status==1 (error) or status==2 (cancel). adbbackup (backup path only, default false keeps Run_Restore callers untouched): log via Save_ADB_Recovery_Log instead of the folder-name sibling, NO removeDir/"Cleaning" message (no folder exists; the backup materializes on the PC).
+	static void Emit_Restore_Validity_Error(Restore_Validity rv, const TWPartition* Part); // Specific reject message (partition label e.g. /data + .info name) for preflight + the Run_Restore loop-1 guard (DRY). Member -> friend access to private TWPartition members (Mount_Point/Backup_Name).
+	std::vector<TWPartition*> Get_SubPartitions_Of(TWPartition* parent, bool require_can_be_backed_up); // Subpartitions of parent (Is_SubPartition + SubPartition_Of==); require_can_be_backed_up additionally filters Can_Be_Backed_Up (backup). Shared by Backup_Partition/Restore_Partition.
 	TWPartition* Find_Partition_By_MTP_Storage_ID(unsigned int Storage_ID);   // Returns a pointer to a partition based on MTP Storage ID
 	bool Add_Remove_MTP_Storage(TWPartition* Part, int message_type);         // Adds or removes an MTP Storage partition
 	TWPartition* Find_Next_Storage(string Path, bool Exclude_Data_Media);
@@ -421,10 +485,7 @@ private:
 	pid_t mtppid;
 	bool mtp_was_enabled;
 	int mtp_write_fd;
-	pid_t tar_fork_pid;                                                       // PID of twrpTar fork
-	Backup_Method_enum Backup_Method;                                         // Method used for backup
-	std::string original_ramdisk_format;                                      // Ramdisk format of boot partition
-	std::string repacked_ramdisk_format;                                      // Ramdisk format of boot image to repack from
+	std::atomic<pid_t> tar_fork_pid{0};                                       // PID of twrpTar fork
 	void Mark_User_Decrypted(int userID);                                     // Marks given user ID in Users_List as decrypted
 	void Check_Users_Decryption_Status();                                     // Checks to see if all users are decrypted
 

@@ -41,4 +41,11 @@ minui_backend* open_adf();
 minui_backend* open_drm();
 minui_backend* open_overlay();
 
+// Called by the flip backend (e.g. drm_flip) to query the display row range
+// [*top, *bottom) needed for this flip. Return 1 + filled top/bottom => a partial
+// copy suffices; return 0 => a full copy is needed. Accounts for rotation and
+// double buffering (union with the previous frame's damage). Advances the 1-frame
+// damage history (call exactly once per flip).
+int gr_flip_consume_damage(int* top, int* bottom);
+
 #endif

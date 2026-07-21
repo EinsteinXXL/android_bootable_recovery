@@ -822,6 +822,11 @@ int GUITerminal::Update(void)
 		// try to keep the cursor in view
 		SetVisibleListLocation(engine->getCursorY());
 		updateCounter = engine->getUpdateCounter();
+		// The engine has new content (readPty output, cursor move, ...; see the
+		// updateCounter comment). Set mUpdate so the render-gated GUI loop actually
+		// draws the output -- otherwise it only appears on keyboard/touch input.
+		// Analogous to GUIConsole::Update() (console.cpp), which sets mUpdate=1 on new text.
+		mUpdate = 1;
 	}
 
 	GUIScrollList::Update();

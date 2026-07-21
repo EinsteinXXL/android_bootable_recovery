@@ -319,9 +319,13 @@ int GUIInput::Render(void)
 	if (mInputText) {
 		mInputText->SetRenderPos(mRenderX + scrollingX, mFontY);
 		mInputText->SetText(displayValue);
-		gr_clip(mRenderX, mRenderY, mRenderW, mRenderH);
+		// intersect/restore instead of gr_clip/gr_noclip -- in the region-render path
+		// this respects the page's region scissor (no escape) and restores it
+		// afterwards, so the cursor gr_fill below stays clipped too. In the full
+		// render byte-identical to the previous behavior.
+		gr_clip_intersect(mRenderX, mRenderY, mRenderW, mRenderH);
 		ret = mInputText->Render();
-		gr_noclip();
+		gr_clip_restore();
 	}
 	if (ret < 0)
 		return ret;

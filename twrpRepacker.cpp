@@ -17,6 +17,8 @@
 */
 
 #include <string>
+#include <cerrno>
+#include <cstring>
 
 #include "data.hpp"
 #include "partitions.hpp"
@@ -57,7 +59,7 @@ bool twrpRepacker::Backup_Image_For_Repack(TWPartition* Part, const std::string&
 	part_settings.generate_md5 = false;
 	part_settings.PM_Method = PM_BACKUP;
 	part_settings.progress = NULL;
-	pid_t not_a_pid = 0;
+	std::atomic<pid_t> not_a_pid{0};
 	if (!Part->Backup(&part_settings, &not_a_pid))
 		return false;
 	std::string backed_up_image = part_settings.Backup_Folder;
@@ -191,7 +193,12 @@ bool twrpRepacker::Repack_Image_And_Flash(const std::string& Target_Image, const
 			gui_msg(Msg(msg::kError, "repack_error=Error repacking image."));
 			return false;
 		}
-		std::rename(copy_compressed_image.c_str(), orig_compressed_image.c_str());
+		if (std::rename(copy_compressed_image.c_str(), orig_compressed_image.c_str()) != 0) {
+			LOGERR("rename '%s' -> '%s' failed: %s\n",
+			       copy_compressed_image.c_str(), orig_compressed_image.c_str(), strerror(errno));
+			gui_msg(Msg(msg::kError, "repack_error=Error repacking image."));
+			return false;
+		}
 	}
 
 	if (TWFunc::Exec_Cmd(command) != 0) {
@@ -208,6 +215,11 @@ bool twrpRepacker::Repack_Image_And_Flash(const std::string& Target_Image, const
 	}
 	DataManager::SetProgress(1);
 	TWFunc::removeDir(REPACK_ORIG_DIR, false);
+	// Capture the slot before the Is_SlotSelect block; it is restored at the end
+	// of the function only if it actually changed. An unconditional slot switch
+	// here would break the slot on non-A/B devices, or whenever the block is
+	// skipped (Type != REPLACE_RAMDISK*).
+	string Original_Active_Slot = PartitionManager.Get_Active_Slot_Display();
 	if (part->Is_SlotSelect()) {
 		if (Repack_Options.Type == REPLACE_RAMDISK || Repack_Options.Type == REPLACE_RAMDISK_UNPACKED) {
 			LOGINFO("Switching slots to flash ramdisk to both partitions\n");
@@ -237,7 +249,12 @@ bool twrpRepacker::Repack_Image_And_Flash(const std::string& Target_Image, const
 					gui_msg(Msg(msg::kError, "repack_error=Error repacking image."));
 					return false;
 				}
-				std::rename(copy_compressed_image.c_str(), orig_compressed_image.c_str());
+				if (std::rename(copy_compressed_image.c_str(), orig_compressed_image.c_str()) != 0) {
+					LOGERR("rename '%s' -> '%s' failed: %s\n",
+					       copy_compressed_image.c_str(), orig_compressed_image.c_str(), strerror(errno));
+					gui_msg(Msg(msg::kError, "repack_error=Error repacking image."));
+					return false;
+				}
 			}
 
 			if (TWFunc::Exec_Cmd(command) != 0) {
@@ -257,11 +274,12 @@ bool twrpRepacker::Repack_Image_And_Flash(const std::string& Target_Image, const
 	}
 	TWFunc::removeDir(REPACK_NEW_DIR, false);
 	gui_msg(Msg(msg::kWarning, "repack_overwrite_warning=If device was previously rooted, then root has been overwritten and will need to be reinstalled."));
-	string Current_Slot = PartitionManager.Get_Active_Slot_Display();
-		if (Current_Slot == "A")
-			PartitionManager.Override_Active_Slot("B");
-		else
-			PartitionManager.Override_Active_Slot("A");
+	// Restore the slot only if it actually changed (which only happens in the
+	// Is_SlotSelect block above for REPLACE_RAMDISK*). On non-A/B devices
+	// Get_Active_Slot_Display returns a consistent value, so the compare is equal
+	// and no override happens.
+	if (PartitionManager.Get_Active_Slot_Display() != Original_Active_Slot)
+		PartitionManager.Override_Active_Slot(Original_Active_Slot);
 	return true;
 }
 

@@ -119,6 +119,7 @@ GUISlider::GUISlider(xml_node<>* node) : GUIObject(node)
 
 	sCurTouchX = mRenderX;
 	sUpdate = 1;
+	sRendered = false; // forces the first full render (like button.cpp)
 }
 
 GUISlider::~GUISlider()
@@ -130,7 +131,10 @@ GUISlider::~GUISlider()
 int GUISlider::Render(void)
 {
 	if (!isConditionTrue())
+	{
+		sRendered = false; // force a full render again on re-showing
 		return 0;
+	}
 
 	if (!sSlider || !sSlider->GetResource())
 		return -1;
@@ -152,6 +156,7 @@ int GUISlider::Render(void)
 	}
 
 	sUpdate = 0;
+	sRendered = true; // from now on incremental updates can be regional
 	return 0;
 }
 
@@ -160,8 +165,29 @@ int GUISlider::Update(void)
 	if (!isConditionTrue())
 		return 0;
 
-	if (sUpdate)
+	// First paint (or re-showing) -> full page render (safe, like button.cpp).
+	if (!sRendered)
 		return 2;
+
+	// Incremental update (swipe gesture) -> register only the slider bounds as
+	// damage instead of the whole page. The bounds cover the base (mRenderH), used
+	// fill, label AND the moving touch arrow (sTouchH, possibly taller than the
+	// base). RenderRegion redraws the slider (Render() paints it fully) clipped.
+	if (sUpdate)
+	{
+		int top = mRenderY;
+		int bot = mRenderY + mRenderH;
+		if (sTouch && sTouch->GetResource())
+		{
+			int ay = mRenderY + (mRenderH - sTouchH) / 2;
+			if (ay < top)            top = ay;
+			if (ay + sTouchH > bot)  bot = ay + sTouchH;
+		}
+		if (top < 0)
+			top = 0;
+		PageManager::RequestFrameRegion(mRenderX, top, mRenderW, bot - top);
+		return 1;
+	}
 	return 0;
 }
 

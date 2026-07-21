@@ -49,6 +49,9 @@ static std::vector<std::string> gConsole;
 static std::vector<std::string> gConsoleColor;
 static FILE* ors_file = NULL;
 
+static bool g_msg_pipe_active = false;
+static int g_msg_pipe_fd = -1;
+
 struct InitMutex
 {
 	InitMutex() { pthread_mutex_init(&console_lock, NULL); }
@@ -124,6 +127,21 @@ extern "C" void gui_set_FILE(FILE* f)
 	ors_file = f;
 }
 
+void gui_activate_msg_pipe(int fd)
+{
+	g_msg_pipe_active = true;
+	g_msg_pipe_fd = fd;
+}
+
+void gui_deactivate_msg_pipe(void)
+{
+	g_msg_pipe_active = false;
+	if (g_msg_pipe_fd >= 0) {
+		close(g_msg_pipe_fd);
+		g_msg_pipe_fd = -1;
+	}
+}
+
 void gui_msg(const char* text)
 {
 	if (text) {
@@ -158,6 +176,31 @@ void gui_highlight(const char* text)
 
 void gui_msg(Message msg)
 {
+	if (g_msg_pipe_active && g_msg_pipe_fd >= 0) {
+		std::string text = msg;
+		uint8_t hdr[4];
+		hdr[0] = 0xAA;                    // magic
+		hdr[1] = (uint8_t)msg.GetKind();  // severity
+		/* Check truncation against text.size(), NOT against the 'len' already
+		 * narrowed to uint16_t -- otherwise a text >65535 bytes could, via the
+		 * size_t->uint16_t overflow, wrongly slip under the 4091 check. Irrelevant in
+		 * practice (GUI messages never reach 64 KB) but semantically correct. */
+		uint16_t len;
+		if (text.size() > 4091) {
+			LOGINFO("gui_msg: text truncated from %zu to 4091 bytes (PIPE_BUF-safe)\n", text.size());
+			len = 4091;
+		} else {
+			len = (uint16_t)text.size();
+		}
+		hdr[2] = len & 0xFF;
+		hdr[3] = (len >> 8) & 0xFF;
+		char frame[4095];
+		memcpy(frame, hdr, 4);
+		memcpy(frame + 4, text.data(), len);
+		write(g_msg_pipe_fd, frame, 4 + len);
+		return;
+	}
+
 	std::string output = msg;
 	output += "\n";
 	fputs(output.c_str(), stdout);
@@ -323,6 +366,13 @@ int GUIConsole::Update(void)
 		scrollToEnd = true;
 	}
 
+	// Decouple the message flush from the render. gui_msg() writes to gMessages; only
+	// Translate_Now() flushes gMessages->gConsole (previously ran ONLY in
+	// RenderConsole). Since the console now renders only on genuinely new text, the
+	// flush must happen here in Update -- otherwise AddLines never sees new text and
+	// "Backing Up"/progress lines pile up in gMessages (the console would stall).
+	Translate_Now();
+
 	pthread_mutex_lock(&console_lock);
 	bool addedNewText = AddLines(&gConsole, &gConsoleColor, &mLastCount, &rConsole, &rConsoleColor);
 	pthread_mutex_unlock(&console_lock);
@@ -341,8 +391,11 @@ int GUIConsole::Update(void)
 
 	if (mUpdate) {
 		mUpdate = 0;
-		if (Render() == 0)
-			return 2;
+		// No full render; just register the console damage region and return 1.
+		// RenderRegion redraws the console (its Render()) clipped. mRenderX/Y/W/H are
+		// the real console bounds (from the placement).
+		PageManager::RequestFrameRegion(mRenderX, mRenderY, mRenderW, mRenderH);
+		return 1;
 	}
 	return 0;
 }

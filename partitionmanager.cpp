@@ -59,18 +59,25 @@
 #include <liblp/builder.h>
 #include <libsnapshot/snapshot.h>
 
+#include <sys/auxv.h>
+#ifndef HWCAP_AES
+#define HWCAP_AES (1 << 3)
+#endif
 #include "variables.h"
 #include "twcommon.h"
 #include "partitions.hpp"
 #include "data.hpp"
 #include "startupArgs.hpp"
 #include "twrp-functions.hpp"
+#include "infomanager.hpp"
+#include "backupheadermanager.hpp"   // GetFileType() (outer magic detection)
 #include "fixContexts.hpp"
 #include "exclude.hpp"
 #include "set_metadata.h"
 #include "tw_atomic.hpp"
 #include "gui/gui.hpp"
 #include "progresstracking.hpp"
+#include "twrpTar.hpp"
 #include "twrpDigestDriver.hpp"
 #include "twrpRepacker.hpp"
 #include "adbbu/libtwadbbu.hpp"
@@ -128,6 +135,7 @@ TWPartitionManager::TWPartitionManager(void) {
 	mtp_write_fd = -1;
 	uevent_pfd.fd = -1;
 	stop_backup.set_value(0);
+	stop_restore.set_value(0);
 #ifdef AB_OTA_UPDATER
 	char slot_suffix[PROPERTY_VALUE_MAX];
 	property_get("ro.boot.slot_suffix", slot_suffix, "error");
@@ -281,7 +289,8 @@ void TWPartitionManager::Setup_Fstab_Partitions(bool Display_Error) {
 		std::vector<TWPartition*>::iterator iter;
 		unsigned int storageid = 1 << 16;	// upper 16 bits are for physical storage device, we pretend to have only one
 
-		for (iter = Partitions.begin(); iter != Partitions.end(); iter++) {
+		iter = Partitions.begin();
+		while (iter != Partitions.end()) {
 			(*iter)->Partition_Post_Processing(Display_Error);
 
 			if ((*iter)->Is_Storage) {
@@ -299,8 +308,12 @@ void TWPartitionManager::Setup_Fstab_Partitions(bool Display_Error) {
 			else
 				(*iter)->Has_Android_Secure = false;
 
-			if ((*iter)->Is_Super)
-				Prepare_Super_Volume((*iter));
+			if ((*iter)->Is_Super && !Prepare_Super_Volume(*iter)) {
+				LOGINFO("Logical partition '%s' does not exist in super, skipping\n", (*iter)->Get_Mount_Point().c_str());
+				iter = Partitions.erase(iter);
+				continue;
+			}
+			++iter;
 		}
 
 		Unlock_Block_Partitions();
@@ -490,9 +503,7 @@ void TWPartitionManager::Decrypt_Data() {
 }
 
 void TWPartitionManager::Setup_Settings_Storage_Partition(TWPartition* Part) {
-	DataManager::SetValue("tw_settings_path", Part->Storage_Path);
 	DataManager::SetValue("tw_storage_path", Part->Storage_Path);
-	LOGINFO("Settings storage is '%s'\n", Part->Storage_Path.c_str());
 }
 
 void TWPartitionManager::Setup_Android_Secure_Location(TWPartition* Part) {
@@ -773,145 +784,256 @@ int TWPartitionManager::Check_Backup_Name(const std::string& Backup_Name, bool D
 	return 0;
 }
 
+namespace {
+// RAII guard for GUI affinity during a backup OR restore. The constructor moves
+// the GUI to an efficiency core, the destructor restores the performance core —
+// guaranteed on all exit paths of Backup_Partition()/Restore_Partition().
+// Single source of truth: identical pin logic for both paths.
+struct GuiAffinityGuard {
+	GuiAffinityGuard()  { twrpTar::Set_GUI_Efficiency(true);  } // operation running -> efficiency core
+	~GuiAffinityGuard() { twrpTar::Set_GUI_Efficiency(false); } // operation done    -> performance core
+};
+
+// RAII guard for the CPU performance mode, like GuiAffinityGuard. The C++
+// destructor guarantee on every scope exit (normal return, early return,
+// exception) makes the reset forget-proof. Usage: one `PerformanceModeGuard
+// perf;` at the top of the function.
+struct PerformanceModeGuard {
+	PerformanceModeGuard()  { TWFunc::SetPerformanceMode(true);  }
+	~PerformanceModeGuard() { TWFunc::SetPerformanceMode(false); }
+};
+}  // namespace
+
+// Shared subpartition walk: returns all subpartitions of `parent`
+// (Is_SubPartition + SubPartition_Of == parent->Mount_Point).
+// require_can_be_backed_up=true additionally filters Can_Be_Backed_Up (backup);
+// restore takes all.
+std::vector<TWPartition*> TWPartitionManager::Get_SubPartitions_Of(TWPartition* parent, bool require_can_be_backed_up) {
+	std::vector<TWPartition*> out;
+	for (TWPartition* sub : Partitions) {
+		if (sub->Is_SubPartition && sub->SubPartition_Of == parent->Mount_Point
+		    && (!require_can_be_backed_up || sub->Can_Be_Backed_Up))
+			out.push_back(sub);
+	}
+	return out;
+}
+
 bool TWPartitionManager::Backup_Partition(PartitionSettings *part_settings) {
 	time_t start, stop;
 	int use_compression;
-	string backup_log = part_settings->Backup_Folder + "/recovery.log";
 
 	if (part_settings->Part == NULL)
 		return true;
 
 	DataManager::GetValue(TW_USE_COMPRESSION_VAR, use_compression);
 
-	TWFunc::SetPerformanceMode(true);
 	time(&start);
+	double digest_secs = 0.0; // total digest generation time — subtracted from backup_time (MB/s rate)
+	// RAII: both guards restore automatically on every return (normal, cancel, error).
+	GuiAffinityGuard     gui_affinity_guard;
+	PerformanceModeGuard perf_mode_guard;
 
 	if (part_settings->Part->Backup(part_settings, &tar_fork_pid)) {
+		if (stop_backup.get_value() != 0) {
+			// Convention of the backup chain (Backup_Partition, Backup_Tar,
+			// twrpTar): true=success, false=failure-or-cancel. The error-vs-
+			// cancel classification is done exclusively by Run_Backup via
+			// stop_backup. Even if the partition technically landed on disk,
+			// from the user's perspective the operation was aborted, so report
+			// false and leave the final verdict to Run_Backup.
+			return false;
+		}
 		sync();
 		sync();
 		string Full_Filename = part_settings->Backup_Folder + "/" + part_settings->Part->Backup_FileName;
 		if (!part_settings->adbbackup && part_settings->generate_digest) {
-			if (!twrpDigestDriver::Make_Digest(Full_Filename))
-				goto backup_error;
+			time_t d_start, d_stop;
+			time(&d_start);
+			if (!twrpDigestDriver::Make_Digest(Full_Filename)) {
+				return false;
+			}
+			time(&d_stop);
+			digest_secs += difftime(d_stop, d_start);
 		}
 
 		if (part_settings->Part->Has_SubPartition) {
-			std::vector<TWPartition*>::iterator subpart;
 			TWPartition *parentPart = part_settings->Part;
-
-			for (subpart = Partitions.begin(); subpart != Partitions.end(); subpart++) {
-				if ((*subpart)->Can_Be_Backed_Up && (*subpart)->Is_SubPartition && (*subpart)->SubPartition_Of == parentPart->Mount_Point) {
-					part_settings->Part = *subpart;
-					if (!(*subpart)->Backup(part_settings, &tar_fork_pid)) {
-						goto backup_error;
+			for (TWPartition* subpart : Get_SubPartitions_Of(parentPart, /*require_can_be_backed_up=*/true)) {
+				part_settings->Part = subpart;
+				if (!subpart->Backup(part_settings, &tar_fork_pid)) {
+					return false;
+				}
+				sync();
+				sync();
+				string Full_Filename = part_settings->Backup_Folder + "/" + part_settings->Part->Backup_FileName;
+				if (!part_settings->adbbackup && part_settings->generate_digest) {
+					time_t d_start, d_stop;
+					time(&d_start);
+					if (!twrpDigestDriver::Make_Digest(Full_Filename)) {
+						return false;
 					}
-					sync();
-					sync();
-					string Full_Filename = part_settings->Backup_Folder + "/" + part_settings->Part->Backup_FileName;
-					if (!part_settings->adbbackup && part_settings->generate_digest) {
-						if (!twrpDigestDriver::Make_Digest(Full_Filename)) {
-							goto backup_error;
-						}
-					}
+					time(&d_stop);
+					digest_secs += difftime(d_stop, d_start);
 				}
 			}
 		}
 
 		time(&stop);
-		int backup_time = (int) difftime(stop, start);
-		LOGINFO("Partition Backup time: %d\n", backup_time);
+		int backup_time = (int) difftime(stop, start) - (int) digest_secs; // digest time excluded -> rate = pure backup throughput
+		if (backup_time < 0) backup_time = 0; // seconds rounding guard
+		LOGINFO("Partition Backup time: %d (digest %d s excluded)\n", backup_time, (int) digest_secs);
 
 		if (part_settings->Part->Backup_Method == BM_FILES) {
 			part_settings->file_time += backup_time;
 		} else {
 			part_settings->img_time += backup_time;
-
 		}
 
-		TWFunc::SetPerformanceMode(false);
 		return true;
 	}
-backup_error:
-	Clean_Backup_Folder(part_settings->Backup_Folder);
-	TWFunc::copy_file("/tmp/recovery.log", backup_log, 0644);
-	tw_set_default_metadata(backup_log.c_str());
-	TWFunc::SetPerformanceMode(false);
+	// Cleanup lives in Run_Backup because the error and cancel paths do
+	// identical work (full removeDir + sibling recovery.log). The performance-
+	// mode reset is handled automatically by the PerformanceModeGuard RAII.
 	return false;
 }
 
-void TWPartitionManager::Clean_Backup_Folder(string Backup_Folder) {
-	DIR *d = opendir(Backup_Folder.c_str());
-	struct dirent *p;
-	int r;
-	vector<string> ext;
-
-	//extensions we should delete when cleaning
-	ext.push_back("win");
-	ext.push_back("md5");
-	ext.push_back("sha2");
-	ext.push_back("info");
-
-	gui_msg("backup_clean=Backup Failed. Cleaning Backup Folder.");
-
-	if (d == NULL) {
-		gui_msg(Msg(msg::kError, "error_opening_strerr=Error opening: '{1}' ({2})")(Backup_Folder)(strerror(errno)));
-		return;
-	}
-
-	while ((p = readdir(d))) {
-		if (!strcmp(p->d_name, ".") || !strcmp(p->d_name, ".."))
-			continue;
-
-		string path = Backup_Folder + "/" + p->d_name;
-
-		size_t dot = path.find_last_of(".") + 1;
-		for (vector<string>::const_iterator i = ext.begin(); i != ext.end(); ++i) {
-			if (path.substr(dot) == *i) {
-				r = unlink(path.c_str());
-				if (r != 0)
-					LOGINFO("Unable to unlink '%s: %s'\n", path.c_str(), strerror(errno));
-			}
-		}
-	}
-	closedir(d);
-}
 
 int TWPartitionManager::Check_Backup_Cancel() {
 	return stop_backup.get_value();
 }
 
 int TWPartitionManager::Cancel_Backup() {
-	string Backup_Folder, Backup_Name, Full_Backup_Path;
-
+	// Signaling only. Cleanup (recovery.log + removeDir + gui_msg) is
+	// single-sourced in Run_Backup's cancel-exit handler. Here: set stop_backup,
+	// kill the children, wait synchronously for the reap (so Run_Backup does not
+	// continue while tar_fork_pid is still alive).
 	stop_backup.set_value(1);
 
 	if (tar_fork_pid != 0) {
-		DataManager::GetValue(TW_BACKUP_NAME, Backup_Name);
-		DataManager::GetValue(TW_BACKUPS_FOLDER_VAR, Backup_Folder);
-		Full_Backup_Path = Backup_Folder + "/" + Backup_Name;
-		LOGINFO("Killing pid: %d\n", tar_fork_pid);
-		kill(tar_fork_pid, SIGUSR2);
-		while (kill(tar_fork_pid, 0) == 0) {
-			usleep(1000);
+		LOGINFO("Cancelling backup, killing all children\n");
+		twrpTar::Kill_Backup_Children();
+		// Bounded wait instead of an endless loop. SIGUSR2 -> _exit(0) in the
+		// pipe children, then createTarFork() reaps and sets *tar_fork_pid=0.
+		// If a child hangs in the kernel (uninterruptible D-state, blocked IO),
+		// a plain while(tar_fork_pid != 0) busywait would freeze the GUI
+		// forever. 10s hard timeout, then SIGKILL as fallback + a short extra
+		// wait.
+		const int max_wait_iter = 100; // 100 x 100ms = 10s
+		int wait_iter = 0;
+		while (tar_fork_pid != 0 && wait_iter < max_wait_iter) {
+			usleep(100000);
+			wait_iter++;
 		}
-		LOGINFO("Backup_Run stopped and returning false, backup cancelled.\n");
-		LOGINFO("Removing directory %s\n", Full_Backup_Path.c_str());
-		TWFunc::removeDir(Full_Backup_Path, false);
-		tar_fork_pid = 0;
+		if (tar_fork_pid != 0) {
+			pid_t stuck_pid = tar_fork_pid;
+			LOGERR("Cancel_Backup: SIGUSR2 wait timed out after 10s, sending SIGKILL to pid %d\n",
+			       (int)stuck_pid);
+			kill(stuck_pid, SIGKILL);
+			for (wait_iter = 0; tar_fork_pid != 0 && wait_iter < 20; wait_iter++)
+				usleep(100000); // +2s after SIGKILL
+			if (tar_fork_pid != 0)
+				LOGERR("Cancel_Backup: tar_fork_pid still non-zero after SIGKILL -- Run_Backup will clean up anyway\n");
+		}
+		LOGINFO("Cancel_Backup: children reaped, control returns to Run_Backup for cleanup\n");
 	}
 
 	return 0;
 }
 
+int TWPartitionManager::Cancel_Restore() {
+	// Hard lock: during a RAW/image restore (Restore_Image -> Raw_Read_Write) a
+	// mid-flight abort would leave the block device half-written -> softbrick.
+	// restore_cancelable is set per partition in Run_Restore(); if it is 0,
+	// either a RAW partition is running or no restore is active — in both cases
+	// refuse the cancel. The GUI locks the cancel button in parallel via
+	// tw_restore_cancelable; the check here is the safeguard against
+	// ADB/theme/script bypass.
+	if (restore_cancelable.get_value() == 0) {
+		gui_msg(Msg(msg::kError, "restore_cancel_blocked=Cancel blocked: RAW partition in progress -- aborting would damage the device."));
+		LOGINFO("Cancel_Restore: ignored -- restore_cancelable=0 (RAW partition or no restore active)\n");
+		return -1;
+	}
+	stop_restore.set_value(1);
+	LOGINFO("Cancelling restore, killing all children");
+	twrpTar::Kill_Restore_Children();
+	LOGINFO("Restore_Run stopped and returning 1, restore cancelled.\n");
+	return 0;
+}
+
+// Pause/resume wrappers, called by the page-entry hook in PageSet::SetPage when
+// the user enters/leaves the cancel_restore_confirm page. SIGSTOPs the restore
+// pipeline children while the user thinks on the confirm page, so restore IO
+// does not continue in the background; SIGCONT on leaving. Idempotent: repeated
+// calls are harmless (POSIX no-op on an already stopped/running process). With
+// no active restore (g_restore_children empty) both methods are no-ops.
+void TWPartitionManager::Pause_Restore(void) {
+	LOGINFO("Pausing restore -- user on cancel_restore_confirm\n");
+	twrpTar::Pause_Restore_Children();
+}
+
+void TWPartitionManager::Resume_Restore(void) {
+	LOGINFO("Resuming restore -- user back from cancel_restore_confirm\n");
+	twrpTar::Resume_Restore_Children();
+}
+
+// Forward declaration (defined below): Sync_Backup_Inclusions() needs the
+// backup-set list to include external_app_data only when /data is in the set.
+static std::vector<std::string> split_partition_list(const std::string& list);
+
+bool TWPartitionManager::Sync_Backup_Inclusions() {
+	TWPartition* data = Find_Partition_By_Path("/data");
+	if (!data || !data->Has_Data_Media)
+		return false;
+
+	// external_app_data is /data-specific: only when /data is actually in THIS
+	// backup set (otherwise e.g. a metadata-only backup would trigger the
+	// "Counting..." message + size accounting). This function encapsulates the
+	// COMPLETE decision — the caller (Run_Backup) needs no extra flag.
+	string backup_list;
+	DataManager::GetValue("tw_backup_list", backup_list);
+	bool data_in_set = false;
+	for (const string& bp : split_partition_list(backup_list))
+		if (Find_Partition_By_Path(bp) == data) { data_in_set = true; break; }
+	if (!data_in_set)
+		return false;
+
+	bool include = (DataManager::GetIntValue("tw_backup_external_app_data") == 1);
+	if (include) {
+		string p = data->Mount_Point + "/media/0/Android";
+		if (TWFunc::Path_Exists(p)) {
+			gui_msg(Msg("counting_external= * Counting external app data size..."));
+			LOGINFO("Including %s in /data backup\n", p.c_str());
+		} else {
+			gui_msg(Msg(msg::kWarning, "external_app_data_skip=External app data requested but folder '{1}' not found -- skipping.")(p));
+			include = false;
+		}
+	}
+	data->Refresh_External_App_Data_Inclusion(include);
+	return include;
+}
+
+// Tokenizes a ';'-separated partition/image list: every ';'-terminated segment
+// becomes an entry; a trailing token without ';' is deliberately ignored.
+// Single source for the 4 walks in Run_Backup/Run_Restore.
+static std::vector<std::string> split_partition_list(const std::string& list) {
+	std::vector<std::string> out;
+	size_t start_pos = 0, end_pos = list.find(";", start_pos);
+	while (end_pos != std::string::npos && start_pos < list.size()) {
+		out.push_back(list.substr(start_pos, end_pos - start_pos));
+		start_pos = end_pos + 1;
+		end_pos = list.find(";", start_pos);
+	}
+	return out;
+}
+
 int TWPartitionManager::Run_Backup(bool adbbackup) {
 	PartitionSettings part_settings;
 	int partition_count = 0, disable_free_space_check = 0, skip_digest = 0;
-	string Backup_Name, Backup_List, backup_path;
+	string Backup_Name, Backup_List;
 	unsigned long long total_bytes = 0, free_space = 0;
 	TWPartition* storage = NULL;
 	struct tm *t;
 	time_t seconds, total_start, total_stop;
-	size_t start_pos = 0, end_pos = 0;
 	stop_backup.set_value(0);
 	seconds = time(0);
 	t = localtime(&seconds);
@@ -922,15 +1044,28 @@ int TWPartitionManager::Run_Backup(bool adbbackup) {
 	part_settings.file_time = 0;
 	part_settings.img_bytes = 0;
 	part_settings.file_bytes = 0;
+	part_settings.external_app_data_size = 0;
+	part_settings.external_app_data_included = false;
 	part_settings.PM_Method = PM_BACKUP;
 
 	part_settings.adbbackup = adbbackup;
 	time(&total_start);
 
+	// Per-op log: record the start offset of this backup operation (slicing in
+	// Save_Recovery_Log; covers GUI, ORS and adb — all call Run_Backup).
+	Mark_Operation_Log_Start();
+
+	// Clear stale inclusion from previous backup run so Update_Size()
+	// always sees a clean baseline (without external data). Sync_Backup_
+	// Inclusions() re-applies it after the enumeration loop.
+	TWPartition* data_part = Find_Partition_By_Path("/data");
+	if (data_part)
+		data_part->Refresh_External_App_Data_Inclusion(false);
+
 	Update_System_Details();
 
 	if (!Mount_Current_Storage(true))
-		return false;
+		return 1;   // must be 1, not false (false would cast to 0 = success)
 
 	DataManager::GetValue(TW_SKIP_DIGEST_GENERATE_VAR, skip_digest);
 	if (skip_digest == 0)
@@ -952,13 +1087,17 @@ int TWPartitionManager::Run_Backup(bool adbbackup) {
 
 	LOGINFO("Backup_Folder is: '%s'\n", part_settings.Backup_Folder.c_str());
 
+	// Pre-calc cancel check #1: the user pressed cancel during the
+	// Mount_Current_Storage or GetValue phase. Backup_Folder is valid from here
+	// on — an early check avoids needless Get_Folder_Size/Recursive_Mkdir work.
+	if (stop_backup.get_value() != 0)
+		return Operation_Cleanup(OpType::Backup, 2, part_settings.Backup_Folder, adbbackup);
+
 	LOGINFO("Calculating backup details...\n");
 	DataManager::GetValue("tw_backup_list", Backup_List);
 	LOGINFO("Backup_List: %s\n", Backup_List.c_str());
 	if (!Backup_List.empty()) {
-		end_pos = Backup_List.find(";", start_pos);
-		while (end_pos != string::npos && start_pos < Backup_List.size()) {
-			backup_path = Backup_List.substr(start_pos, end_pos - start_pos);
+		for (const string& backup_path : split_partition_list(Backup_List)) {
 			LOGINFO("backup_path: %s\n", backup_path.c_str());
 			part_settings.Part = Find_Partition_By_Path(backup_path);
 			if (part_settings.Part != NULL) {
@@ -983,21 +1122,56 @@ int TWPartitionManager::Run_Backup(bool adbbackup) {
 			} else {
 				gui_msg(Msg(msg::kError, "unable_to_locate_partition=Unable to locate '{1}' partition for backup calculations.")(backup_path));
 			}
-			start_pos = end_pos + 1;
-			end_pos = Backup_List.find(";", start_pos);
 		}
 	}
 
+	// External data (/data/media/0/Android): inclusion + size accounting AFTER
+	// Update_System_Details() to avoid blocking the main thread with a multi-GB
+	// walk inside Update_Size() (would starve the MTP thread → USB timeout → crash).
+	// Sync_Backup_Inclusions() sets the inclusion flag for the later forked
+	// Generate_TarList() backup walk and returns whether inclusion was actually
+	// applied (Checkbox + Path_Exists). That decision becomes the single source
+	// of truth — used both for size accounting here and for the .info flag in
+	// twrpTar.cpp via part_settings->external_app_data_included.
+	part_settings.external_app_data_included = Sync_Backup_Inclusions();
+	if (part_settings.external_app_data_included) {
+		string android_path = "/data/media/0/Android";
+		TWExclude tmp;
+		unsigned long long ext_size = tmp.Get_Folder_Size(android_path);
+		part_settings.external_app_data_size = ext_size / 1048576ULL;
+		part_settings.file_bytes += ext_size;
+		// tar.setsize(Backup_Size) in Backup_Partition uses the partition
+		// object's Backup_Size, which was computed WITHOUT the inclusion.
+		// Update it so Total_Backup_Size (sent via progress pipe) matches
+		// what tarList actually backs up.
+		if (data_part)
+			data_part->Backup_Size += ext_size;
+		LOGINFO("External data size: %llu MB added to backup total\n", ext_size / 1048576ULL);
+		gui_msg("counting_external_done= * ...done");
+	}
+
+	// Pre-calc cancel check #2: Get_Folder_Size on /data/media/0/Android can
+	// take several seconds for a large Android folder — the only potentially
+	// long-running pre-calc operation. An early exit here keeps the cancel
+	// reaction snappy.
+	if (stop_backup.get_value() != 0)
+		return Operation_Cleanup(OpType::Backup, 2, part_settings.Backup_Folder, adbbackup);
+
 	if (partition_count == 0) {
 		gui_msg("no_partition_selected=No partitions selected for backup.");
-		return false;
+		return 1;
 	}
+	// Compute total_bytes BEFORE the stream header: the ADB stream header
+	// carries the estimate sum as the restore grand-total denominator
+	// (file_bytes/img_bytes are fully accumulated here, incl.
+	// external_app_data). The per-partition exact correction is done by the
+	// restore itself (Finish_Partition_Exact).
+	total_bytes = part_settings.file_bytes + part_settings.img_bytes;
 	if (adbbackup) {
-		if (twadbbu::Write_ADB_Stream_Header(partition_count) == false) {
-			return false;
+		if (twadbbu::Write_ADB_Stream_Header(partition_count, total_bytes) == false) {
+			return 1;
 		}
 	}
-	total_bytes = part_settings.file_bytes + part_settings.img_bytes;
 	ProgressTracking progress(total_bytes);
 	part_settings.progress = &progress;
 
@@ -1009,7 +1183,7 @@ int TWPartitionManager::Run_Backup(bool adbbackup) {
 		gui_msg(Msg("available_space= * Available space: {1}MB")(free_space / 1024 / 1024));
 	} else {
 		gui_err("unable_locate_storage=Unable to locate storage device.");
-		return false;
+		return 1;
 	}
 
 	DataManager::GetValue(TW_DISABLE_FREE_SPACE_VAR, disable_free_space_check);
@@ -1018,10 +1192,12 @@ int TWPartitionManager::Run_Backup(bool adbbackup) {
 		disable_free_space_check = true;
 
 	if (!disable_free_space_check) {
-		if (free_space - (32 * 1024 * 1024) < total_bytes) {
+		// Addition form instead of subtraction: with free_space < 32 MB an
+		// unsigned subtraction would wrap to a huge value and defeat the check.
+		if (free_space < total_bytes + (32ULL * 1024 * 1024)) {
 			// We require an extra 32MB just in case
 			gui_err("no_space=Not enough free space on storage.");
-			return false;
+			return 1;
 		}
 	}
 	part_settings.img_bytes_remaining = part_settings.img_bytes;
@@ -1034,39 +1210,69 @@ int TWPartitionManager::Run_Backup(bool adbbackup) {
 
 	DataManager::GetValue(TW_IS_DECRYPTED, is_decrypted);
 	DataManager::GetValue(TW_IS_ENCRYPTED, is_encrypted);
-	if (!adbbackup || (!is_encrypted || (is_encrypted && is_decrypted))) {
+	if (is_encrypted && !is_decrypted)
+		gui_msg((getauxval(AT_HWCAP) & HWCAP_AES) ? "aes_hw" : "aes_sw");
+	// ADB backup creates NO backup folder: the stream goes to the PC; nothing
+	// but the recovery.log would land in it on-device (that goes directly into
+	// the backup root as ADB_Backup_<date>_Recovery.log, see
+	// Save_ADB_Recovery_Log). GUI backups behave as before.
+	if (!adbbackup) {
 		gui_msg(Msg("backup_folder= * Backup Folder: {1}")(part_settings.Backup_Folder));
 		if (!TWFunc::Recursive_Mkdir(part_settings.Backup_Folder)) {
 			gui_err("fail_backup_folder=Failed to make backup folder.");
-			return false;
+			return 1;
 		}
 	}
+
+	// Pre-calc cancel check #3: the user pressed cancel between mkdir and loop
+	// start. Clean pre-loop entry guarantee — all expensive pre-calc steps are
+	// done, the backup folder exists (GUI; adb creates none), but nothing
+	// destructive has happened yet.
+	if (stop_backup.get_value() != 0)
+		return Operation_Cleanup(OpType::Backup, 2, part_settings.Backup_Folder, adbbackup);
 
 	DataManager::SetProgress(0.0);
 
-	start_pos = 0;
-	end_pos = Backup_List.find(";", start_pos);
-	while (end_pos != string::npos && start_pos < Backup_List.size()) {
-		if (stop_backup.get_value() != 0)
-			return -1;
-		backup_path = Backup_List.substr(start_pos, end_pos - start_pos);
+	// Hard abort: every real per-partition failure — not found OR a
+	// Backup_Partition error (e.g. pipe collapse, digest failure) — aborts the
+	// ENTIRE backup, symmetric to Run_Restore. A graceful skip would report
+	// partial/total failures as success-with-warning (return 0) and could not
+	// distinguish "partition missing" from a corrupt archive.
+	// Operation_Cleanup(status=1) discards the backup folder via removeDir +
+	// reports [BACKUP FAILED]. Cancel takes precedence.
+	for (const string& backup_path : split_partition_list(Backup_List)) {
+		if (stop_backup.get_value() != 0) {
+			break;
+		}
 		part_settings.Part = Find_Partition_By_Path(backup_path);
 		if (part_settings.Part != NULL) {
-			if (!Backup_Partition(&part_settings))
-				return false;
+			if (!Backup_Partition(&part_settings)) {
+				// Cancel-first classification: Backup_Partition returns false
+				// for both error and cancel. Run_Backup decides via stop_backup
+				// which final marker applies — cancel wins, so the user does not
+				// wrongly see [BACKUP FAILED] after cancelling themselves.
+				if (stop_backup.get_value() != 0) {
+					return Operation_Cleanup(OpType::Backup, 2, part_settings.Backup_Folder, adbbackup);
+				}
+				return Operation_Cleanup(OpType::Backup, 1, part_settings.Backup_Folder, adbbackup);
+			}
 		} else {
+			// Partition not found -> hard abort (no silent skip). kError matches
+			// the pre-calc loop (same message).
 			gui_msg(Msg(msg::kError, "unable_to_locate_partition=Unable to locate '{1}' partition for backup calculations.")(backup_path));
+			return Operation_Cleanup(OpType::Backup, 1, part_settings.Backup_Folder, adbbackup);
 		}
-		start_pos = end_pos + 1;
-		end_pos = Backup_List.find(";", start_pos);
 	}
 
+	if (stop_backup.get_value() != 0)
+		return Operation_Cleanup(OpType::Backup, 2, part_settings.Backup_Folder, adbbackup);
+	
 	// Average BPS
 	if (part_settings.img_time == 0)
 		part_settings.img_time = 1;
 	if (part_settings.file_time == 0)
 		part_settings.file_time = 1;
-	int img_bps = (int)part_settings.img_bytes / (int)part_settings.img_time;
+	int img_bps = (int)(part_settings.img_bytes / part_settings.img_time);
 	unsigned long long file_bps = part_settings.file_bytes / (int)part_settings.file_time;
 
 	if (part_settings.file_bytes != 0)
@@ -1083,8 +1289,8 @@ int TWPartitionManager::Run_Backup(bool adbbackup) {
 		actual_backup_size = twe.Get_Folder_Size(part_settings.Backup_Folder);
 	} else
 		actual_backup_size = part_settings.file_bytes + part_settings.img_bytes;
+	
 	actual_backup_size /= (1024LLU * 1024LLU);
-
 	int prev_img_bps = 0, use_compression = 0;
 	unsigned long long prev_file_bps = 0;
 	DataManager::GetValue(TW_BACKUP_AVG_IMG_RATE, prev_img_bps);
@@ -1096,33 +1302,150 @@ int TWPartitionManager::Run_Backup(bool adbbackup) {
 		DataManager::GetValue(TW_BACKUP_AVG_FILE_COMP_RATE, prev_file_bps);
 	else
 		DataManager::GetValue(TW_BACKUP_AVG_FILE_RATE, prev_file_bps);
+	
 	file_bps += (prev_file_bps * 4);
 	file_bps /= 5;
-
 	DataManager::SetValue(TW_BACKUP_AVG_IMG_RATE, img_bps);
+	
 	if (use_compression)
 		DataManager::SetValue(TW_BACKUP_AVG_FILE_COMP_RATE, file_bps);
 	else
 		DataManager::SetValue(TW_BACKUP_AVG_FILE_RATE, file_bps);
 
 	gui_msg(Msg("total_backed_size=[{1} MB TOTAL BACKED UP]")(actual_backup_size));
+	// Write recovery.log BEFORE Update_System_Details — otherwise the ~2 MB
+	// recovery.log is not counted in the freshly measured storage/free size
+	// (displayed value would be wrong). ADB: no backup folder -> date-named log
+	// into the backup root (Save_ADB_Recovery_Log); GUI path stays intra-folder.
+	if (part_settings.adbbackup)
+		Save_ADB_Recovery_Log("Backup");
+	else
+		Save_Recovery_Log(part_settings.Backup_Folder + "/recovery.log");
 	Update_System_Details();
 	UnMount_Main_Partitions();
 	gui_msg(Msg(msg::kHighlight, "backup_completed=[BACKUP COMPLETED IN {1} SECONDS]")(total_time)); // the end
-	string backup_log = part_settings.Backup_Folder + "/recovery.log";
-	TWFunc::copy_file("/tmp/recovery.log", backup_log, 0644);
-	tw_set_default_metadata(backup_log.c_str());
 
 	if (part_settings.adbbackup) {
 		if (twadbbu::Write_ADB_Stream_Trailer() == false) {
-			return false;
+			return 1;
 		}
 	}
 	part_settings.adbbackup = false;
 	DataManager::SetValue("tw_enable_adb_backup", 0);
 
-	return true;
+	return 0;
 }
+
+// ---------- Backup/restore exit helper ----------
+// Generic cleanup helper for both operations: the OpType discriminator
+// (Backup|Restore) picks the path, the rest is shared.
+//
+// Only called for error/cancel exits (status==1 / status==2). Success paths
+// (status==0) save the recovery log inline because they write INTRA the backup
+// folder (with '/') instead of as a SIBLING ('_').
+//
+// The Path_Exists guard wraps the cleanup block (sibling log + removeDir), NOT
+// the gui_msg — early-failed backups (mkdir errors) must still show the error.
+//
+// adbbackup (backup path only; default false keeps Run_Restore callers and GUI
+// semantics untouched): the ADB path has NO backup folder (mkdir is adb-gated)
+// and nothing to clean on the device (the backup materializes on the PC) ->
+// log via Save_ADB_Recovery_Log (date name instead of folder-name sibling), no
+// removeDir/"Cleaning backup folder." message.
+
+int TWPartitionManager::Operation_Cleanup(OpType op, int status, const string& path, bool adbbackup) {
+	TWFunc::SetPerformanceMode(false);
+
+	if (op == OpType::Backup) {
+		if (adbbackup) {
+			Save_ADB_Recovery_Log("Backup");
+		} else {
+			// ALWAYS write the sibling log — recovery.log contains system/mount/
+			// init events from before the mkdir, diagnostically valuable even for
+			// early-failed backups. The sibling path sits at parent level (backup
+			// root), not inside the Backup_Folder — the write works whether or
+			// not mkdir ran. On storage/mount issues copy_file swallows the
+			// open() error silently (no crash, no file).
+			Save_Recovery_Log(path + "_Backup_Recovery.log");	// sibling NEXT TO the folder (underscore, no slash)
+
+			// Announce + removeDir only if the backup folder exists. Early-
+			// failed/-cancelled backups (mkdir never ran) would otherwise
+			// misleadingly report "Cleaning...", and removeDir would additionally
+			// throw gui_msg("error_opening_strerr").
+			if (TWFunc::Path_Exists(path)) {
+				if (status == 1)
+					gui_msg(Msg("backup_error_clean=Backup failed. Cleaning backup folder."));
+				else if (status == 2)
+					gui_msg(Msg("backup_cancel_clean=Backup cancelled! Cleaning backup folder."));
+				TWFunc::removeDir(path, false);	// remove folder + contents entirely (false = delete the parent too)
+			}
+		}
+
+		// Final marker (always)
+		if (status == 1)
+			gui_msg(Msg(msg::kError,     "backup_fail=[BACKUP FAILED]"));
+		else if (status == 2)
+			gui_msg(Msg(msg::kHighlight, "backup_cancel=[BACKUP CANCELLED]"));
+	} else { // OpType::Restore
+		Set_Restore_Cancelable(0);
+		// ALWAYS write the sibling log (same reasoning as the backup branch);
+		// with an invalid path copy_file swallows the open() error silently.
+		Save_Recovery_Log(path + "_Restore_Recovery.log");
+		if (status == 1)
+			gui_msg(Msg(msg::kError,     "restore_fail=[RESTORE FAILED]"));
+		else if (status == 2)
+			gui_msg(Msg(msg::kHighlight, "restore_cancel=[RESTORE CANCELLED]"));
+	}
+	return status;
+}
+
+
+// Per-operation log slicing: records the current byte position of
+// /tmp/recovery.log as the start of the backup/restore operation about to
+// begin. The FIRST call of the session additionally freezes log_ctx_end —
+// everything before it (fstab/mounts/decrypt) is the boot context every per-op
+// log gets as a prefix. stat errors leave the marks untouched ->
+// Save_Recovery_Log then does the full copy.
+void TWPartitionManager::Mark_Operation_Log_Start(void) {
+	struct stat st;
+	if (stat(TMP_LOG_FILE, &st) != 0)
+		return;
+	if (log_ctx_end < 0)
+		log_ctx_end = (long long)st.st_size;
+	log_op_start = (long long)st.st_size;
+}
+
+void TWPartitionManager::Save_Recovery_Log(const string& log_path) {
+	// Slice only with plausible marks; EVERY edge case (marks unset because no
+	// operation funnel ran; stat/IO errors; offsets beyond the file size) falls
+	// back to the plain full copy.
+	bool sliced = false;
+	if (log_op_start >= 0 && log_ctx_end >= 0 && log_ctx_end <= log_op_start)
+		sliced = TWFunc::Copy_Log_Slices(TMP_LOG_FILE, log_path, log_ctx_end, log_op_start);
+	if (!sliced)
+		TWFunc::copy_file("/tmp/recovery.log", log_path, 0644);
+	tw_set_default_metadata(log_path.c_str());
+}
+
+// ADB backup/restore ONLY: the ADB path has no backup folder (the stream goes
+// to the PC) and thus no (possibly user-defined) folder name for the GUI
+// intra/sibling scheme -> date name (Get_Current_Date = backup name format)
+// directly in the backup root. Used by Run_Backup success (adb),
+// Operation_Cleanup (adb) and twrpAdbBuFifo::Restore_ADB_Backup (all exits —
+// mirrors GUI restore practice, which stores a log on success AND
+// error/cancel). Errors are swallowed silently by copy_file.
+void TWPartitionManager::Save_ADB_Recovery_Log(const std::string& op) {
+	string root;
+	DataManager::GetValue(TW_BACKUPS_FOLDER_VAR, root);
+	if (root.empty()) {
+		LOGINFO("Save_ADB_Recovery_Log: no backup root set, skipping\n");
+		return;
+	}
+	TWFunc::Recursive_Mkdir(root);   // in case no backup ever existed
+	Save_Recovery_Log(root + "/ADB_" + op + "_" + TWFunc::Get_Current_Date() + "_Recovery.log");
+}
+
+
 
 bool TWPartitionManager::Restore_Partition(PartitionSettings *part_settings) {
 	time_t Start, Stop;
@@ -1133,35 +1456,138 @@ bool TWPartitionManager::Restore_Partition(PartitionSettings *part_settings) {
 		part_settings->Part->Set_Backup_FileName(part_settings->Part->Backup_Name + "." + part_settings->Part->Current_File_System + ".win");
 	}
 
-	TWFunc::SetPerformanceMode(true);
+	// RAII: both guards restore automatically on every return (mirror of
+	// Backup_Partition).
+	GuiAffinityGuard     gui_affinity_guard;
+	PerformanceModeGuard perf_mode_guard;
 
 	time(&Start);
 
 	if (!part_settings->Part->Restore(part_settings)) {
-		TWFunc::SetPerformanceMode(false);
+		return false;
+	}
+	if (stop_restore.get_value() != 0) {
+		Update_System_Details();
 		return false;
 	}
 	if (part_settings->Part->Has_SubPartition && !part_settings->adbbackup) {
-		std::vector<TWPartition*>::iterator subpart;
 		TWPartition *parentPart = part_settings->Part;
-
-		for (subpart = Partitions.begin(); subpart != Partitions.end(); subpart++) {
-			part_settings->Part = *subpart;
-			if ((*subpart)->Is_SubPartition && (*subpart)->SubPartition_Of == parentPart->Mount_Point) {
-				part_settings->Part = (*subpart);
-				part_settings->Part->Set_Backup_FileName(part_settings->Part->Backup_Name + "." + part_settings->Part->Current_File_System + ".win");
-				if (!(*subpart)->Restore(part_settings)) {
-					TWFunc::SetPerformanceMode(false);
-					return false;
-				}
+		for (TWPartition* subpart : Get_SubPartitions_Of(parentPart, /*require_can_be_backed_up=*/false)) {
+			part_settings->Part = subpart;
+			part_settings->Part->Set_Backup_FileName(part_settings->Part->Backup_Name + "." + part_settings->Part->Current_File_System + ".win");
+			if (!subpart->Restore(part_settings)) {
+				return false;
+			}
+			if (stop_restore.get_value() != 0) {
+				Update_System_Details();
+				return false;
 			}
 		}
 	}
 	time(&Stop);
-	TWFunc::SetPerformanceMode(false);
 	gui_msg(Msg("restore_part_done=[{1} done ({2} seconds)]")(part_settings->Part->Backup_Display_Name)((int)difftime(Stop, Start)));
 
 	return true;
+}
+
+// Sets the cancel lock in BOTH sources (atomic restore_cancelable + DataManager
+// mirror tw_restore_cancelable). Single source so the two never diverge.
+void TWPartitionManager::Set_Restore_Cancelable(int v) {
+	restore_cancelable.set_value(v);
+	DataManager::SetValue("tw_restore_cancelable", v);
+}
+
+// Writes the SPECIFIC reject message for a Restore_Validity reason to the GUI
+// console. ONE source (DRY) for both reject paths: the early GUI firewall
+// Preflight_Restore_Backup AND the Run_Restore loop-1 guard (CLI/ORS backstop).
+// Takes the partition, so the messages name the partition (Mount_Point, e.g.
+// "/data") or the .info filename (Backup_Name+".info", e.g. "data.info")
+// instead of the GUI display name — CLI/ORS restore gets the same specific
+// reason as the GUI.
+void TWPartitionManager::Emit_Restore_Validity_Error(Restore_Validity rv, const TWPartition* Part) {
+	switch (rv) {
+		case RV_NO_BACKUP_SIZE:
+			gui_msg(Msg(msg::kError, "restore_invalid_dfp_size=The backup of partition {1} is corrupted. The required backup size header (TWRP.backup_size) is missing.")(Part->Mount_Point));
+			break;
+		case RV_LEGACY_NO_INFO:
+			gui_msg(Msg(msg::kError, "restore_invalid_legacy_info=The required \"{1}\" file is missing from the selected backup for the \"{2}\" partition.")(Part->Backup_Name + ".info")(Part->Mount_Point));
+			break;
+		case RV_REJECT_OPENAES:
+			gui_err("restore_openaes_rejected=This backup is encrypted with OpenAES and is no longer supported. OpenAES was removed from TWRP v3.7+ by the core developers.");
+			break;
+		case RV_WRONG_PASSWORD:
+			gui_msg(Msg(msg::kError, "fail_decrypt_tar=Failed to decrypt tar file '{1}'")(Part->Backup_Display_Name));
+			break;
+		case RV_REJECT_UNKNOWN:
+		default:
+			gui_msg(Msg(msg::kError, "restore_unknown_format=The backup for the {1} partition has an unrecognized format. Its header could not be read.")(Part->Mount_Point));
+			break;
+	}
+}
+
+// Early GUI firewall: validates ALL file-based partitions of the chosen backup
+// BEFORE the user selects partitions (tw_restore_selected = still all). Mirrors
+// the validation iteration of Run_Restore loop 1 (split_partition_list ->
+// Find_Partition_By_Path -> top + subpartition) but uses the shared primitive
+// TWPartition::Probe_Restore_Backup (DRY). One SPECIFIC message per broken
+// partition to the GUI console (which partition + reason); returns false as
+// soon as ANY partition is not restorable (whole backup rejected). READ-ONLY
+// (header peek + console) — NO wipe, NO partition writes. Images/super + ADB
+// gate the probe themselves (RV_VALID). The loop-1 guard in Run_Restore remains
+// as a backstop (CLI/ORS bypass this GUI firewall).
+bool TWPartitionManager::Preflight_Restore_Backup(const string& Restore_Name) {
+	// Probe_Restore_Backup detects OpenAES itself via the outer type
+	// (Get_Archive_Type_From_Segments scans all segments) -> RV_REJECT_OPENAES
+	// per partition. SSoT = HeaderManager.
+	PartitionSettings part_settings;
+	part_settings.Backup_Folder = Restore_Name;
+	part_settings.Part = NULL;
+	part_settings.adbbackup = false;
+	part_settings.PM_Method = PM_RESTORE;
+
+	string Restore_List;
+	DataManager::GetValue("tw_restore_selected", Restore_List);
+	if (Restore_List.empty())
+		return true;   // nothing to check (e.g. ADB) -> do not block
+
+	bool all_ok = true;
+	for (const string& restore_path : split_partition_list(Restore_List)) {
+		TWPartition* top = Find_Partition_By_Path(restore_path);
+		if (top == NULL)
+			continue;   // a missing partition is the Run_Restore loop-1 backstop's job, not a validity issue
+
+		// Top partition + (if present) its subpartitions — mirrors Run_Restore loop 1.
+		std::vector<TWPartition*> to_check;
+		to_check.push_back(top);
+		if (top->Has_SubPartition) {
+			for (std::vector<TWPartition*>::iterator sp = Partitions.begin(); sp != Partitions.end(); sp++)
+				if ((*sp)->Is_SubPartition && (*sp)->SubPartition_Of == top->Mount_Point)
+					to_check.push_back(*sp);
+		}
+
+		for (std::vector<TWPartition*>::iterator it = to_check.begin(); it != to_check.end(); it++) {
+			TWPartition* Part = *it;
+			part_settings.Part = Part;
+			int probe_ead = 0;
+			Restore_Validity rv = Part->Probe_Restore_Backup(&part_settings, nullptr, nullptr, &probe_ead);
+			// ead is purely /data-related (/data/media/0/Android). Write it ONLY
+			// here, otherwise the next non-/data partition (GetEad()=-1 -> has=0)
+			// would clobber the /data value. Preflight is the ONE place that
+			// loads /data at setup time (R2 password-less in readBackup, R3 after
+			// password in decrypt_backup). tw_has_ = fact (checkbox visibility),
+			// tw_restore_ = default "on".
+			if (Part->Mount_Point == "/data") {
+				int has = (probe_ead == 1) ? 1 : 0;
+				DataManager::SetValue("tw_has_external_app_data", has);
+				DataManager::SetValue("tw_restore_external_app_data", has);
+			}
+			if (rv == RV_VALID)
+				continue;
+			all_ok = false;
+			Emit_Restore_Validity_Error(rv, Part);
+		}
+	}
+	return all_ok;
 }
 
 int TWPartitionManager::Run_Restore(const string& Restore_Name) {
@@ -1170,8 +1596,24 @@ int TWPartitionManager::Run_Restore(const string& Restore_Name) {
 
 	time_t rStart, rStop;
 	time(&rStart);
-	string Restore_List, restore_path;
-	size_t start_pos = 0, end_pos;
+	string Restore_List;
+
+	// Per-op log: record the start offset of this restore operation (slicing in
+	// Save_Recovery_Log; covers GUI and ORS — adb restore has its own funnel in
+	// twrpAdbBuFifo::Restore_ADB_Backup).
+	Mark_Operation_Log_Start();
+
+	/* Clear a stale cancel flag from the previous restore. Run_Backup() does
+	 * this; Run_Restore never adopted it, so after a cancel all pipe children in
+	 * a multi-pipe restore would immediately exit 253 ("Pipe N: stop_restore
+	 * signaled, exiting"). Upstream is affected too (single-pipe fails there the
+	 * same way, just less visibly). */
+	stop_restore.set_value(0);
+
+	// Cancel lock defaults to closed: until a partition has been routed
+	// (filesystem vs image), no cancel is allowed. Set per partition in the
+	// restore loop below.
+	Set_Restore_Cancelable(0);
 
 	part_settings.Backup_Folder = Restore_Name;
 	part_settings.Part = NULL;
@@ -1180,12 +1622,28 @@ int TWPartitionManager::Run_Restore(const string& Restore_Name) {
 	part_settings.adbbackup = false;
 	part_settings.PM_Method = PM_RESTORE;
 
+	// Refresh system/partition details (free/size, storage display) BEFORE the restore
+	// -- upstream parity: original TWRP calls Update_System_Details() here at the start
+	// of Run_Restore (before restore_started/Mount_Current_Storage); in this fork the
+	// start call had been lost (only at restore end + in the cancel paths). Mirror of
+	// Run_Backup, which also refreshes early -> loop 1 (size calc) and the GUI work with
+	// current values. (Scope: refresh only, NO freespace check.)
+	Update_System_Details();
+
 	gui_msg("restore_started=[RESTORE STARTED]");
+	int restore_encrypted = 0;
+	DataManager::GetValue("tw_restore_encrypted", restore_encrypted);
+	if (restore_encrypted)
+		gui_msg((getauxval(AT_HWCAP) & HWCAP_AES) ? "aes_hw" : "aes_sw");
 	gui_msg(Msg("restore_folder=Restore folder: '{1}'")(Restore_Name));
 
 	if (!Mount_Current_Storage(true))
-		return false;
+		return Operation_Cleanup(OpType::Restore, 1, Restore_Name);
 
+	// OpenAES reject: no separate tw_restore_openaes flag — Get_Restore_Size ->
+	// Probe returns RV_REJECT_OPENAES, loop 1 collects it (backup_validity), the
+	// guard below rejects BEFORE the wipe (backstop for CLI/ORS that bypass the
+	// early GUI firewall). SSoT = HeaderManager.
 	DataManager::GetValue(TW_SKIP_DIGEST_CHECK_VAR, check_digest);
 	if (check_digest > 0) {
 		// Check Digest files first before restoring to ensure that all of them match before starting a restore
@@ -1197,15 +1655,23 @@ int TWPartitionManager::Run_Restore(const string& Restore_Name) {
 	gui_msg("calc_restore=Calculating restore details...");
 	DataManager::GetValue("tw_restore_selected", Restore_List);
 
+	// Fail-hard flag: if even one partition from Restore_List is not findable via
+	// Find_Partition_By_Path (the backup contains it, the device list no longer
+	// does), the entire restore is aborted before the destructive loop 2. Loop 1
+	// collects all missings (diagnostic logging); the guard fires AFTER the
+	// existing partition_count==0 check.
+	bool any_partition_missing = false;
+	bool any_backup_invalid = false;   // strict preflight: backup self-describing-incomplete/damaged/OpenAES (Get_Restore_Size -> Probe) -> abort before wipe
+	Restore_Validity first_invalid = RV_VALID;   // first reject reason + partition -> specific message in the guard (Emit_Restore_Validity_Error)
+	const TWPartition* first_invalid_part = nullptr;
+
 	if (!Restore_List.empty()) {
-		end_pos = Restore_List.find(";", start_pos);
-		while (end_pos != string::npos && start_pos < Restore_List.size()) {
-			restore_path = Restore_List.substr(start_pos, end_pos - start_pos);
+		for (const string& restore_path : split_partition_list(Restore_List)) {
 			part_settings.Part = Find_Partition_By_Path(restore_path);
 			if (part_settings.Part != NULL) {
 				if (part_settings.Part->Mount_Read_Only) {
 					gui_msg(Msg(msg::kError, "restore_read_only=Cannot restore {1} -- mounted read only.")(part_settings.Part->Backup_Display_Name));
-					return false;
+					return Operation_Cleanup(OpType::Restore, 1, Restore_Name);
 				}
 
 				string Full_Filename = part_settings.Backup_Folder + "/" + part_settings.Part->Backup_FileName;
@@ -1215,9 +1681,13 @@ int TWPartitionManager::Run_Restore(const string& Restore_Name) {
 				}
 
 				if (check_digest > 0 && !twrpDigestDriver::Check_Digest(Full_Filename))
-					return false;
+					return Operation_Cleanup(OpType::Restore, 1, Restore_Name);
 				part_settings.partition_count++;
 				part_settings.total_restore_size += part_settings.Part->Get_Restore_Size(&part_settings);
+				if (part_settings.backup_validity != RV_VALID) {   // strict preflight (guard below)
+					any_backup_invalid = true;
+					if (first_invalid == RV_VALID) { first_invalid = part_settings.backup_validity; first_invalid_part = part_settings.Part; }
+				}
 				if (part_settings.Part->Has_SubPartition) {
 					TWPartition *parentPart = part_settings.Part;
 					std::vector<TWPartition*>::iterator subpart;
@@ -1225,23 +1695,51 @@ int TWPartitionManager::Run_Restore(const string& Restore_Name) {
 					for (subpart = Partitions.begin(); subpart != Partitions.end(); subpart++) {
 						part_settings.Part = *subpart;
 						if ((*subpart)->Is_SubPartition && (*subpart)->SubPartition_Of == parentPart->Mount_Point) {
-							if (check_digest > 0 && !twrpDigestDriver::Check_Digest(Full_Filename))
-								return false;
+							// The digest check must verify the subpartition's own
+							// archive name, not the parent filename. Otherwise
+							// `Full_Filename` (parent) is checked N times redundantly
+							// and the sub-archives (e.g. cache.ext4.win) never —
+							// corruption would stay undetected until the destructive
+							// restore loop.
+							string Sub_Full_Filename = part_settings.Backup_Folder + "/" +
+								(*subpart)->Backup_Name + "." + (*subpart)->Current_File_System + ".win";
+							if (check_digest > 0 && !twrpDigestDriver::Check_Digest(Sub_Full_Filename))
+								return Operation_Cleanup(OpType::Restore, 1, Restore_Name);
 							part_settings.total_restore_size += (*subpart)->Get_Restore_Size(&part_settings);
+							if (part_settings.backup_validity != RV_VALID) {
+								any_backup_invalid = true;
+								if (first_invalid == RV_VALID) { first_invalid = part_settings.backup_validity; first_invalid_part = part_settings.Part; }
+							}
 						}
 					}
 				}
 			} else {
 				gui_msg(Msg(msg::kError, "restore_unable_locate=Unable to locate '{1}' partition for restoring.")(restore_path));
+				any_partition_missing = true;   // diagnostic: collect all missings, abort comes after loop 1
 			}
-			start_pos = end_pos + 1;
-			end_pos = Restore_List.find(";", start_pos);
 		}
 	}
 
 	if (part_settings.partition_count == 0) {
 		gui_err("no_part_restore=No partitions selected for restore.");
-		return false;
+		return Operation_Cleanup(OpType::Restore, 1, Restore_Name);
+	}
+
+	// Fail hard if at least one partition from Restore_List was not findable.
+	// Guards against a silent partial restore (e.g. /system + /vendor OK, /data
+	// missing -> bootloop without warning). Abort BEFORE the destructive loop 2.
+	if (any_partition_missing)
+		return Operation_Cleanup(OpType::Restore, 1, Restore_Name);
+
+	// Strict preflight: a DFP backup without the g-header backup_size, a legacy
+	// RAW without a usable .info, or an OpenAES backup is not restorable ->
+	// reject hard BEFORE the wipe (Get_Restore_Size -> Probe set backup_validity).
+	// Only gzip legacy continues without .info via pigz -l. /super image + ADB
+	// are exempt (own paths). Specific reason via the shared helper -> CLI/ORS
+	// gets the same message as the early GUI firewall (DRY).
+	if (any_backup_invalid) {
+		Emit_Restore_Validity_Error(first_invalid, first_invalid_part);
+		return Operation_Cleanup(OpType::Restore, 1, Restore_Name);
 	}
 
 	gui_msg(Msg("restore_part_count=Restoring {1} partitions...")(part_settings.partition_count));
@@ -1250,37 +1748,113 @@ int TWPartitionManager::Run_Restore(const string& Restore_Name) {
 	ProgressTracking progress(part_settings.total_restore_size);
 	part_settings.progress = &progress;
 
-	start_pos = 0;
+	// LOOP POLICY: hard-fail — any error/not-found of a partition aborts the
+	// entire restore (Operation_Cleanup); unlike backup, NO skip.
 	if (!Restore_List.empty()) {
-		end_pos = Restore_List.find(";", start_pos);
-		while (end_pos != string::npos && start_pos < Restore_List.size()) {
-			restore_path = Restore_List.substr(start_pos, end_pos - start_pos);
+		for (const string& restore_path : split_partition_list(Restore_List)) {
+			if (stop_restore.get_value() != 0)
+				break;
 
 			part_settings.Part = Find_Partition_By_Path(restore_path);
 			if (part_settings.Part != NULL) {
-				part_settings.partition_count++;
-				if (!Restore_Partition(&part_settings))
-					return false;
+				// Couple the cancel lock to the UPCOMING partition:
+					// filesystem (TAR/Restore_Tar) -> cancel allowed;
+					// image (Restore_Image -> Raw_Read_Write/dd) -> cancel locked.
+				// The routing mirrors TWPartition::Restore() (partition.cpp:
+				// Is_File_System -> Restore_Tar, Is_Image -> Restore_Image). We
+				// evaluate the same condition BEFORE entering Restore_Partition()
+				// so the GUI cancel button is correctly locked during setup
+				// (mount, wipe, pipeline init). Restore_File_System is not a
+				// member; TWPartition::Restore() parses it locally via
+				// Get_Restore_File_System() from the backup filename (suffix after
+				// the first dot) — call the same helper here instead of member access.
+				string RestoreFS = part_settings.Part->Get_Restore_File_System(&part_settings);
+				int cancelable = part_settings.Part->Is_File_System(RestoreFS) ? 1 : 0;
+#ifdef TWRP_RESTORE_DEMO_MODE
+				// In demo mode NO restore writes to the real block device: file
+				// restores extract to <storage>/TWRP/TestRestore/<part>/, dd-image
+				// restores only write a <part>.emmc.win.raw test file
+				// (Restore_Image_Test). So a cancel is harmless for EVERY
+				// partition -> allow it generally. This relaxation exists ONLY
+				// under active demo mode (compile time): in the final build this
+				// #ifdef block is gone -> image restores go via Restore_Image ->
+				// Raw_Read_Write/dd directly to the block device -> cancelable
+				// stays the Is_File_System value (image=0) -> Cancel_Restore hard-
+				// blocks (else an abort would softbrick a half-written block device).
+				cancelable = 1;
+#endif
+				Set_Restore_Cancelable(cancelable);
+
+				if (!Restore_Partition(&part_settings)) {
+					if (stop_restore.get_value() != 0)
+						return Operation_Cleanup(OpType::Restore, 2, Restore_Name);
+					return Operation_Cleanup(OpType::Restore, 1, Restore_Name);
+				}
 			} else {
+				// Defense in depth: loop 1 should have caught this already (the
+				// any_partition_missing guard after loop 1), but if the partition
+				// list flips between loop 1 and loop 2 (race), abort hard here.
+				// Restore_Partition was NOT called for this partition — nothing
+				// destructive happens.
 				gui_msg(Msg(msg::kError, "restore_unable_locate=Unable to locate '{1}' partition for restoring.")(restore_path));
+				return Operation_Cleanup(OpType::Restore, 1, Restore_Name);
 			}
-			start_pos = end_pos + 1;
-			end_pos = Restore_List.find(";", start_pos);
 		}
 	}
+	if (stop_restore.get_value() != 0)
+		return Operation_Cleanup(OpType::Restore, 2, Restore_Name);
+	// Successful restore run — close the cancel lock again.
+	Set_Restore_Cancelable(0);
+
+	// Take rStop IMMEDIATELY at the end of restore data — BEFORE any cleanup
+	// (metadata/unmount/Update_System_Details, moved to the end) and before the
+	// phase-B verification. Otherwise "Updating partition details..." (and
+	// formerly phase B) would flow into restore_total_time -> avg_restore_rate
+	// too low.
+	time(&rStop);
+	int restore_total_time = (int)difftime(rStop, rStart);
+	if (restore_total_time > 0 && part_settings.total_restore_size > 0)
+		gui_msg(Msg("avg_restore_rate=Average restore rate: {1} MB/sec")(part_settings.total_restore_size / (unsigned long long)restore_total_time / 1048576));
+
+#ifdef TWRP_RESTORE_DEMO_MODE
+	// Demo phase B (UNTIMED): the live-partition verification of the /super test
+	// restore deliberately runs AFTER rStop so the second 14-GB read does not
+	// distort the restore time/rate above ("MB/s first, then hashing"). Only
+	// partitions whose phase A succeeded (Demo_Test_Pending) are checked.
+	{
+		size_t vpos = 0, vend;
+		while ((vend = Restore_List.find(";", vpos)) != string::npos && vpos < Restore_List.size()) {
+			string vpath = Restore_List.substr(vpos, vend - vpos);
+			TWPartition* vpart = Find_Partition_By_Path(vpath);
+			if (vpart && vpart->Demo_Test_Pending)
+				vpart->Verify_Image_Test();
+			vpos = vend + 1;
+		}
+	}
+#endif
+
+	// "Updating partition details..." moved to the end (AFTER rStop +
+	// avg_restore_rate and AFTER phase B) so this cleanup does not distort the
+	// restore time/rate. Order only — still runs before return.
 	TWFunc::GUI_Operation_Text(TW_UPDATE_SYSTEM_DETAILS_TEXT, gui_parse_text("{@updating_system_details}"));
 	tw_set_default_metadata(Get_Android_Root_Path().c_str());
 	UnMount_By_Path(Get_Android_Root_Path(), false);
 	Update_System_Details();
 	UnMount_Main_Partitions();
-	time(&rStop);
-	gui_msg(Msg(msg::kHighlight, "restore_completed=[RESTORE COMPLETED IN {1} SECONDS]")((int)difftime(rStop,rStart)));
+
 	TWPartition* Decrypt_Data = Find_Partition_By_Path("/data");
 	if (Decrypt_Data && Decrypt_Data->Is_Encrypted)
 		gui_msg(Msg(msg::kWarning, "reboot_after_restore=It is recommended to reboot Android once after first boot."));
 	DataManager::SetValue("tw_file_progress", "");
 
-	return true;
+	gui_msg(Msg(msg::kHighlight, "restore_completed=[RESTORE COMPLETED IN {1} SECONDS]")(restore_total_time)); // mirror of backup_completed
+
+	// Store the persistent recovery.log as a sibling next to the source backup
+	// folder (mirror of Run_Backup, which is intra-folder). Suffix
+	// "_Restore_Recovery.log" to distinguish it from the backup-side recovery.log.
+	Save_Recovery_Log(Restore_Name + "_Restore_Recovery.log");
+
+	return 0;
 }
 
 void TWPartitionManager::Set_Restore_Files(string Restore_Name) {
@@ -1290,7 +1864,38 @@ void TWPartitionManager::Set_Restore_Files(string Restore_Name) {
 	bool adbbackup = false;
 
 	DataManager::SetValue("tw_restore_encrypted", 0);
-	if (twadbbu::Check_ADB_Backup_File(Restore_Name)) {
+	// Deterministic default: only the .ab branch below sets the flag to 1.
+	// Without this reset a previous .ab selection left a stale 1 behind (folder
+	// selections never cleared it) and the nandroid restore action would
+	// misroute a folder restore into stream_adb_backup.
+	DataManager::SetValue("tw_enable_adb_backup", 0);
+
+	// Only a regular file can be an .ab stream: folder backups (every .win
+	// selection, ORS folders, the /data mount-point calls from the ADB stream
+	// restore) skip the probe entirely. Probing a directory always failed with
+	// EISDIR and, since the short-read guard (2026-07-08), logged a bogus
+	// "Unable to read adb backup header" line on every folder selection.
+	struct stat rn_st;
+	bool rn_is_reg = (stat(Restore_Name.c_str(), &rn_st) == 0 && S_ISREG(rn_st.st_mode));
+
+	if (rn_is_reg) {
+		if (!twadbbu::Check_ADB_Backup_File(Restore_Name)) {
+			// A selected regular file that is no valid .ab = corrupt/truncated
+			// ADB backup -> hard reject with a specific red error and NO
+			// partition list. The fileselector normally filters these out of
+			// the restore list; this catches ORS paths and files broken after
+			// listing.
+			gui_msg(Msg(msg::kError, "adbbu_invalid_ab=Unable to read the ADB backup header of '{1}'. The backup file is corrupt.")(Restore_Name));
+			DataManager::SetValue("tw_restore_list", "");
+			DataManager::SetValue("tw_restore_selected", "");
+			DataManager::SetValue("tw_has_external_app_data", 0);
+			DataManager::SetValue("tw_restore_external_app_data", 0);
+			return;
+		}
+		// Progress message for the restore_reading page: the header scan reads
+		// the .ab (only ~512 B per MB since the frame seek, but still noticeable
+		// on slow media); the second line is deliberately just "...Done.".
+		gui_msg("adbbu_read_ab=Reading ADB backup file. Please wait...");
 		vector<string> adb_files;
 		adb_files = twadbbu::Get_ADB_Backup_Files(Restore_Name);
 		for (unsigned int i = 0; i < adb_files.size(); ++i) {
@@ -1302,6 +1907,7 @@ void TWPartitionManager::Set_Restore_Files(string Restore_Name) {
 			Part->Backup_FileName = TWFunc::Get_Filename(adb_restore_file);
 			adbbackup = true;
 		}
+		gui_msg("adbbu_read_ab_done=...Done.");
 		DataManager::SetValue("tw_enable_adb_backup", 1);
 	}
 	else {
@@ -1361,17 +1967,29 @@ void TWPartitionManager::Set_Restore_Files(string Restore_Name) {
 			int extnlength = strlen(extn);
 			if (extnlength != 3 && extnlength != 6) continue;
 			if (extnlength >= 3 && strncmp(extn, "win", 3) != 0) continue;
-			//if (extnlength == 6 && strncmp(extn, "win000", 6) != 0) continue;
+			// Only consider the first segment per partition (win000 or unsplit
+			// .win). This filter stays high: BackupHeaderManager::Load detects
+			// the type partition-wide itself (Get_Archive_Type_From_Segments
+			// scans all segments), so no per-file scan is needed here.
+			if (extnlength == 6 && strncmp(extn, "win000", 6) != 0) continue;
 
 			if (check_encryption) {
 				string filename = Restore_Name + "/";
 				filename += de->d_name;
-				if (TWFunc::Get_File_Type(filename) == 2) {
+				// Only the OUTER type (is it BAES?) is needed -> GetFileType
+				// (4-byte magic "BA", NO decrypt). NOT Load(): Load decrypts for
+				// the inner 5-vs-7 sniff and would trigger the BAES empty-password
+				// guard with an empty password (red "empty password rejected").
+				// Only DFP BAES triggers the password page (tw_restore_encrypted =
+				// GUI page state). OpenAES is NOT marked here — the rejection is
+				// done by Probe_Restore_Backup (RV_REJECT_OPENAES) in
+				// Preflight/Run_Restore.
+				if (BackupHeaderManager::GetFileType(filename) == ENCRYPTED) {
 					LOGINFO("'%s' is encrypted\n", filename.c_str());
 					DataManager::SetValue("tw_restore_encrypted", 1);
+					check_encryption = false;
 				}
 			}
-			if (extnlength == 6 && strncmp(extn, "win000", 6) != 0) continue;
 
 			TWPartition* Part = Find_Partition_By_Path(label);
 			if (Part == NULL)
@@ -1403,6 +2021,16 @@ void TWPartitionManager::Set_Restore_Files(string Restore_Name) {
 	// Set the final value
 	DataManager::SetValue("tw_restore_list", Restore_List);
 	DataManager::SetValue("tw_restore_selected", Restore_List);
+
+	// External app data (/data/media/0/Android)? Self-describing: the info lives
+	// in the PAX g-header (TWRP.ead) of the /data first segment. It is read in
+	// the /data probe of Preflight_Restore_Backup (the ONE place that loads /data
+	// at setup time — password-less R2 in readBackup, after password R3 in
+	// decrypt_backup). Here just preset to 0 so a backup without /data (or ADB)
+	// inherits no stale values from a previous selection.
+	DataManager::SetValue("tw_has_external_app_data", 0);
+	DataManager::SetValue("tw_restore_external_app_data", 0);
+
 	return;
 }
 
@@ -1817,7 +2445,7 @@ void TWPartitionManager::Post_Decrypt(const string& Block_Device) {
 			dat->Storage_Path = "/data/media/0";
 			dat->Symlink_Path = dat->Storage_Path;
 			DataManager::SetValue("tw_storage_path", "/data/media/0");
-			DataManager::SetValue("tw_settings_path", "/data/media/0");
+			DataManager::SetValue("tw_settings_path", TW_STORAGE_PATH);
 		}
 		DataManager::LoadTWRPFolderInfo();
 		Update_System_Details();
@@ -2416,15 +3044,13 @@ void TWPartitionManager::Get_Partition_List(string ListType, std::vector<Partiti
 			}
 		}
 	} else if (ListType == "storage") {
-		char free_space[255];
 		string Current_Storage = DataManager::GetCurrentStoragePath();
 		for (iter = Partitions.begin(); iter != Partitions.end(); iter++) {
 			if ((*iter)->Is_Storage) {
 				struct PartitionList part;
-				sprintf(free_space, "%llu", (*iter)->Free / 1024 / 1024);
-				part.Display_Name = (*iter)->Storage_Name + " (";
-				part.Display_Name += free_space;
-				part.Display_Name += "MB)";
+				std::string unit;
+				std::string num = TWFunc::Bytes_To_Readable_Size((*iter)->Free, unit);
+				part.Display_Name = (*iter)->Storage_Name + " (" + num + unit + ")";
 				part.Mount_Point = (*iter)->Storage_Path;
 				if ((*iter)->Storage_Path == Current_Storage)
 					part.selected = 1;
@@ -2434,7 +3060,6 @@ void TWPartitionManager::Get_Partition_List(string ListType, std::vector<Partiti
 			}
 		}
 	} else if (ListType == "backup") {
-		char backup_size[255];
 		unsigned long long Backup_Size;
 		for (iter = Partitions.begin(); iter != Partitions.end(); iter++) {
 			if ((*iter)->Can_Be_Backed_Up && !(*iter)->Is_SubPartition && (*iter)->Is_Present) {
@@ -2448,10 +3073,9 @@ void TWPartitionManager::Get_Partition_List(string ListType, std::vector<Partiti
 							Backup_Size += (*subpart)->Backup_Size;
 					}
 				}
-				sprintf(backup_size, "%llu", Backup_Size / 1024 / 1024);
-				part.Display_Name = (*iter)->Backup_Display_Name + " (";
-				part.Display_Name += backup_size;
-				part.Display_Name += "MB)";
+				std::string unit;
+				std::string num = TWFunc::Bytes_To_Readable_Size(Backup_Size, unit);
+				part.Display_Name = (*iter)->Backup_Display_Name + " (" + num + unit + ")";
 				part.Mount_Point = (*iter)->Backup_Path;
 				part.selected = 0;
 				Partition_List->push_back(part);
@@ -2610,7 +3234,7 @@ bool TWPartitionManager::Enable_MTP(void) {
 
 	int mtppipe[2];
 
-	if (pipe(mtppipe) < 0) {
+	if (pipe2(mtppipe, O_CLOEXEC) < 0) {
 		LOGERR("Error creating MTP pipe\n");
 		return false;
 	}
@@ -3012,6 +3636,7 @@ bool TWPartitionManager::Decrypt_Adopted() {
 			return false;
 		}
 
+	DataManager::SetValue("tw_settings_path", TW_STORAGE_PATH);
 	LOGINFO("Decrypt adopted storage starting\n");
 	char* xmlFile = PageManager::LoadFileToBuffer("/data/system/storage.xml", NULL);
 	xml_document<> *doc = NULL;
@@ -3421,6 +4046,7 @@ bool TWPartitionManager::Prepare_Super_Volume(TWPartition* twrpPart) {
 	if (access(("/dev/block/bootdevice/by-name/" + bare_partition_name).c_str(), F_OK) == -1) {
 		LOGINFO("Symlinking %s => /dev/block/bootdevice/by-name/%s \n", fstabEntry.blk_device.c_str(), bare_partition_name.c_str());
 		symlink(fstabEntry.blk_device.c_str(), ("/dev/block/bootdevice/by-name/" + bare_partition_name).c_str());
+		property_set("twrp.super.symlinks_created", "true");
 	}
 
     return true;
@@ -3428,15 +4054,19 @@ bool TWPartitionManager::Prepare_Super_Volume(TWPartition* twrpPart) {
 
 bool TWPartitionManager::Prepare_All_Super_Volumes() {
 	bool status = true;
-	std::vector<TWPartition*>::iterator iter;
+	std::vector<TWPartition*>::iterator iter = Partitions.begin();
 
-	for (iter = Partitions.begin(); iter != Partitions.end(); iter++) {
+	while (iter != Partitions.end()) {
 		if ((*iter)->Is_Super) {
 			if (!Prepare_Super_Volume(*iter)) {
 				status = false;
+				LOGINFO("Logical partition '%s' does not exist in super, skipping\n", (*iter)->Get_Mount_Point().c_str());
+				iter = Partitions.erase(iter);
+				continue;
 			}
 			PartitionManager.Output_Partition(*iter);
 		}
+		++iter;
 	}
 	Update_System_Details();
 	return status;

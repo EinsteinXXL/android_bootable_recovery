@@ -32,6 +32,9 @@ extern "C" {
 #define LOGERR(...) printf("E:" __VA_ARGS__)
 #define LOGINFO(...) printf("I:" __VA_ARGS__)
 #define gui_print(...) printf( __VA_ARGS__ )
+// Standalone-twrpTar counterpart of gui_print: there is no GUI console color here,
+// so drop the color argument and print the rest via printf.
+#define gui_print_color(color, ...) printf( __VA_ARGS__ )
 #endif
 
 #define STRINGIFY(x) #x

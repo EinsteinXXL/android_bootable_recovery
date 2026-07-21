@@ -1,0 +1,6 @@
+zstd_version=1.5.7
+zstd_tag=v1.5.7
+source_tarball=zstd-1.5.7.tar.gz
+source_url=https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+sha256=eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3
+retrieved_utc=2026-06-18T00:36:06Z

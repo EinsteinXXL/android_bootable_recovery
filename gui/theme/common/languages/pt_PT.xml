@@ -179,10 +179,14 @@
 		<string name="part_present_no">Presente: Não</string>
 		<string name="part_removable_yes">Removível: Sim</string>
 		<string name="part_removable_no">Removível: Não</string>
-		<string name="part_size">Tamanho: % tw_partition_size % MB</string>
-		<string name="part_used">Ocupado: % tw_partition_used % MB</string>
-		<string name="part_free">Livre: % tw_partition_free % MB</string>
-		<string name="part_backup_size">Tamanho do backup: % tw_partition_backup_size % MB</string>
+		<string name="part_size">Tamanho: %tw_partition_size% MB</string>
+		<string name="part_used">Ocupado: %tw_partition_used% MB</string>
+		<string name="part_free">Livre: %tw_partition_free% MB</string>
+		<string name="part_backup_size">Tamanho do backup: %tw_partition_backup_size% MB</string>
+		<string name="part_size_kb">Tamanho: %tw_partition_size% KB</string>
+		<string name="part_used_kb">Ocupado: %tw_partition_used% KB</string>
+		<string name="part_free_kb">Livre: %tw_partition_free% KB</string>
+		<string name="part_backup_size_kb">Tamanho do backup: %tw_partition_backup_size% KB</string>
 		<string name="resize_btn">Redimensionar sistema de ficheiros</string>
 		<string name="resize_btn_s">Redimensionar</string>
 		<string name="resize_confirm">Redimensionar %tw_partition_name%?</string>
@@ -658,7 +662,7 @@
 		<string name="compression_on">A compactação está ativa</string>
 		<string name="digest_off" version="2">A geração do MD5 está desativada</string>
 		<string name="backup_fail">O backup falhou</string>
-		<string name="backup_clean">O backup falhou. A limpar a pasta de Backup.</string>
+		<string name="backup_error_clean">O backup falhou. A limpar a pasta de Backup.</string>
 		<string name="running_recovery_commands">A executar os comandos de Recovery</string>
 		<string name="recovery_commands_complete">Comandos de Recovery concluídos</string>
 		<string name="running_ors">OpenRecoveryScript em execução</string>
@@ -719,5 +723,17 @@
 		<string name="include_kernel_log">Incluir log do Kernel</string>
 		<string name="sha2_chk">Usar SHA2 para fazer hash</string>
 		<string name="unable_set_boot_slot">Erro ao alterar o slot do bootloader para {1}</string>
+		<string name="adbbu_preparing">Preparing ADB backup mode...</string>
+		<string name="adbbu_ready">ADB backup mode ready. On the PC you can now run your backup or restore as usual with 'adb backup/restore'.</string>
+		<string name="adbbu_idle_hint">If no backup/restore follows, this mode turns off automatically after {1} minutes.</string>
+		<string name="adbbu_stopped">ADB backup mode stopped. Default ADB was restored.</string>
+		<string name="adbbu_stopped_timeout">ADB backup mode was stopped after timeout ({1} min). Default ADB was restored.</string>
+		<string name="adbbu_cancel_mode">Cancelling ADB backup mode...</string>
+		<string name="adbbu_stock_refused">Direct 'adb backup/restore' is disabled here: stock adbd uses a freeze-prone PTY. On the PC run:  adb shell adbbu start  then retry your backup/restore.</string>
+		<string name="adbbu_read_ab_hdr">Reading Backup</string>
+		<string name="adbbu_read_ab">Reading ADB backup file. Please wait...</string>
+		<string name="adbbu_read_ab_done">...Done.</string>
+		<string name="adbbu_invalid_ab">Unable to read the ADB backup header of '{1}'. The backup file is corrupt.</string>
+		<string name="verbose_log_chk">Enable verbose log (log all file/folder names)</string>
 	</resources>
 </language>

@@ -175,6 +175,7 @@
 		<variable name="row25_y" value="734"/>
 		<variable name="navbar_y" value="748"/>
 		<variable name="navbar_btn_y" value="774"/>
+		<!-- Y of the yellow RAW-cancel hint (restore_run page); scaled per DPI variant. Portrait: vertically centered in the gap between the cancel button's bottom edge (721) and the screen bottom (800). -->
 		<variable name="keyboard_y" value="464"/>
 		<variable name="keyboard_terminal_y" value="422"/>
 		<variable name="background_color" value="#1A1A1A"/>

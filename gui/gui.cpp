@@ -47,6 +47,7 @@ extern "C"
 #include "../variables.h"
 #include "../partitions.hpp"
 #include "../twrp-functions.hpp"
+#include "../twrp_affinity.hpp"   // Touch-Performance-Boost (gui_touch_boost_tick, 2026-07-16)
 #include "../openrecoveryscript.hpp"
 #include "../orscmd/orscmd.h"
 #include "blanktimer.hpp"
@@ -504,6 +505,9 @@ static void ors_command_read()
 	}
 }
 
+static timespec last_input_time;
+static int input_time_initialized = 0;
+
 // Get and dispatch input events until it's time to draw the next frame
 // This special function will return immediately the first time, but then
 // always returns 1/30th of a second (or immediately if called later) from
@@ -526,6 +530,11 @@ static void loopTimer(int input_timeout_ms)
 		timespec curTime;
 		clock_gettime(CLOCK_MONOTONIC, &curTime);
 
+		if (got_event) {
+			last_input_time = curTime;
+			input_time_initialized = 1;
+		}
+
 		timespec diff = TWFunc::timespec_diff(lastCall, curTime);
 
 		// This is really 2 or 30 times per second
@@ -543,8 +552,10 @@ static void loopTimer(int input_timeout_ms)
 		}
 
 		// We need to sleep some period time microseconds
-		//unsigned int sleepTime = 33333 -(diff.tv_nsec / 1000);
-		//usleep(sleepTime); // removed so we can scan for input
+		if (!got_event) {
+			unsigned int sleepTime = 33333 -(diff.tv_nsec / 1000);
+			usleep(sleepTime);
+		}
 		input_timeout_ms = 0;
 	} while (1);
 }
@@ -573,6 +584,24 @@ static int runPages(const char *page_name, const int stop_on_page_done)
 	for (;;)
 	{
 		loopTimer(input_timeout_ms);
+
+		// Touch performance boost: during backup/restore GuiAffinityGuard/extractTarFork
+		// pin the GUI to the efficiency core (TW_AFFINITY_GUI_EFFICIENCY) -- there a
+		// lock-swipe frame under load costs 60-70 ms instead of ~14 ms. On touch this
+		// tick lifts the GUI to the performance core (TW_AFFINITY_GUI_PERFORMANCE) for
+		// the touch duration + 5 s of coast; each further touch extends it. Outside the
+		// efficiency phase (and in the doubtful/end case) a no-op -- state machine +
+		// self-healing in tw_affinity::gui_touch_boost_tick.
+		{
+			bool input_recent = false;
+			if (input_time_initialized) {
+				timespec bnow;
+				clock_gettime(CLOCK_MONOTONIC, &bnow);
+				input_recent = TWFunc::timespec_diff_ms(last_input_time, bnow) <= 5000;
+			}
+			tw_affinity::gui_touch_boost_tick(input_recent);
+		}
+
 		FD_ZERO(&fdset);
 		timeout.tv_sec = 0;
 		timeout.tv_usec = 1;
@@ -600,6 +629,7 @@ static int runPages(const char *page_name, const int stop_on_page_done)
 
 		if (!gForceRender.get_value())
 		{
+			PageManager::ResetFrameRegion();  // clear the region accumulator
 			int ret = PageManager::Update();
 			if (ret == 0)
 				++idle_frames;
@@ -607,15 +637,104 @@ static int runPages(const char *page_name, const int stop_on_page_done)
 				break; // Theme reload failure
 			else
 				idle_frames = 0;
+			// Frame throttle, busy/idle-aware. tw_busy (TW_ACTION_BUSY) is 1 during
+			// backup/restore/operation (action.cpp), else 0.
+			//  - busy:  floor 24 fps (41 ms) -> the backup animation stays smooth even if
+			//           there is an occasional render gap; idle_frames=0 (animation ticks) -> 0 -> 30 fps.
+			//  - idle:  ~5 fps (200 ms) after idling -> save power. Touch/drag interrupts
+			//           the select wait immediately -> interaction stays at a full 30 fps.
+			bool tw_busy = DataManager::GetIntValue("tw_busy") != 0;
+			const int idle_ms = tw_busy ? 41 : 200;
 			// due to possible animation objects, we need to delay activating the input timeout
-			input_timeout_ms = idle_frames > 15 ? 1000 : 0;
+			input_timeout_ms = idle_frames > 15 ? idle_ms : 0;
+			// Touch-idle DEEP throttle: after 5 s without input deepen to 1 fps (1000 ms)
+			// -- but ONLY when the screen is truly static (idle_frames > 15) and NOT while
+			// busy. The idle_frames coupling is the key point: a ticking animation
+			// (progressbar on fastboot/adb-backup, tw_busy=0) keeps idle_frames at <= ~2
+			// -> this throttle never engages there, the animation stays smooth even after
+			// a touch (design intent: throttle only on a 100% static display). WITHOUT the
+			// coupling condition 2 would motion-blindly throttle every tw_busy=0 animation
+			// page 5 s after the last touch (that was the stutter bug). On a truly static
+			// screen (only the status-bar clock changes, idle_frames climbs) this deepens
+			// from 5 fps (condition 1) to 1 fps = extra power saving (the upstream idle value).
+			if (!tw_busy && input_time_initialized && idle_frames > 15) {
+				timespec now;
+				clock_gettime(CLOCK_MONOTONIC, &now);
+				if (TWFunc::timespec_diff_ms(last_input_time, now) > 5000)
+					input_timeout_ms = 1000;
+			}
 
 #ifndef PRINT_RENDER_TIME
-			if (ret > 1)
+			if (ret > 1) {
+				// Full render: an object requests the complete page.
 				PageManager::Render();
-
-			if (ret > 0)
 				flip();
+			} else if (ret == 1) {
+				// If an object requested only regions, redraw just those. Only on a
+				// rect-list overflow is the region path unguarded -> full-render fallback
+				// (full flip). Active overlays run along the region path:
+				// PageSet::RenderRegion renders page + overlays clipped in Z-order (blend
+				// identical to the full render); without this every overlay would force a
+				// full render here (75-330 ms/frame on a lockscreen swipe). Without a
+				// region request the object drew itself -> just flip (original behavior,
+				// full flip).
+				if (PageManager::FrameHasRegion()) {
+					if (PageManager::FrameRegionOverflow()) {
+						PageManager::Render();
+						flip();
+					} else {
+						// ONE render pass over the bounding box of ALL damage rects instead
+						// of N separate passes. Background: each RenderRegion call iterates
+						// the whole object list + a full-screen gr_fill; with N simultaneous
+						// rects (counter/filename/percent/animation) that meant N-fold work
+						// -> 66-95 ms/frame, fps collapsing to 10. First build the bbox
+						// (WITHOUT rendering), then render exactly once: one object pass, one
+						// fill, one flip. Cost <= 1 full render (24 ms -> 30 fps). The bbox
+						// encloses all rects -> never draws too little; the partial flip (K4)
+						// is kept for a small bbox.
+						int n = PageManager::FrameRegionCount();
+						int bx0 = 0, by0 = 0, bx1 = 0, by1 = 0;
+						int64_t sum_area = 0; // sum of the individual region areas
+						for (int i = 0; i < n; i++) {
+							GRRect r = PageManager::GetFrameRegionAt(i);
+							sum_area += (int64_t)r.w * r.h;
+							if (i == 0) {
+								bx0 = r.x; by0 = r.y;
+								bx1 = r.x + r.w; by1 = r.y + r.h;
+							} else {
+								if (r.x < bx0) bx0 = r.x;
+								if (r.y < by0) by0 = r.y;
+								if (r.x + r.w > bx1) bx1 = r.x + r.w;
+								if (r.y + r.h > by1) by1 = r.y + r.h;
+							}
+						}
+						if (n > 0) {
+							int _bw = bx1 - bx0, _bh = by1 - by0;
+							// If the regions are far apart (union area > 2x the sum of the
+							// individual areas, e.g. counter at the top + console at the bottom),
+							// render each region SEPARATELY instead of drawing the whole gap
+							// between them. The flip-damage band (K4) accumulates min-top/max-bot
+							// over the separate calls -> one flip afterwards. Otherwise
+							// (near/overlapping/single) a union pass (saves redundant object
+							// iteration).
+							int64_t union_area = (int64_t)_bw * _bh;
+							if (n > 1 && union_area > 2 * sum_area) {
+								for (int i = 0; i < n; i++) {
+									GRRect r = PageManager::GetFrameRegionAt(i);
+									PageManager::RenderRegion(r.x, r.y, r.w, r.h);
+									gr_set_flip_damage(r.x, r.y, r.w, r.h);
+								}
+							} else {
+								PageManager::RenderRegion(bx0, by0, bx1 - bx0, by1 - by0);
+								gr_set_flip_damage(bx0, by0, bx1 - bx0, by1 - by0);
+							}
+						}
+						flip();
+					}
+				} else {
+					flip();
+				}
+			}
 #else
 			if (ret > 1)
 			{
@@ -816,7 +935,7 @@ extern "C" int gui_loadResources(void)
 			}
 		}
 
-		theme_path += TWFunc::Check_For_TwrpFolder() + "/theme/ui.zip";
+		theme_path += "theme/ui.zip";
 		if (check || PageManager::LoadPackage("TWRP", theme_path, "main"))
 		{
 #endif // ifndef TW_OEM_BUILD
@@ -850,7 +969,7 @@ extern "C" int gui_loadCustomResources(void)
 	}
 
 	std::string theme_path = DataManager::GetSettingsStoragePath();
-	theme_path += TWFunc::Check_For_TwrpFolder() + "/theme/ui.zip";
+	theme_path += "theme/ui.zip";
 	// Check for a custom theme
 	if (TWFunc::Path_Exists(theme_path)) {
 		// There is a custom theme, try to load it

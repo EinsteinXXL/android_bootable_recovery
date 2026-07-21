@@ -34,6 +34,7 @@
 #include <string>
 #include <iterator>
 #include <algorithm>
+#include <regex>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <zlib.h>
@@ -60,6 +61,10 @@ extern "C" {
 OpenRecoveryScript::VoidFunction OpenRecoveryScript::call_after_cli_command;
 
 #define SCRIPT_COMMAND_SIZE 512
+
+// Defined below next to Backup_Command; needed earlier by run_script_file
+// (restore password pre-check).
+static bool Ors_Password_Valid(const std::string& pw);
 
 int OpenRecoveryScript::check_for_script_file(void) {
 	std::string logDir = TWFunc::get_log_dir();
@@ -108,6 +113,13 @@ int OpenRecoveryScript::run_script_file(void) {
 
 	FILE *fp = fopen(SCRIPT_FILE_TMP, "r");
 	if (fp != NULL) {
+		// Consume the script immediately (unlink BEFORE processing): if recovery
+		// dies mid-run, a leftover file would be appended to by the next twrp CLI
+		// call (Insert_ORS_Command) — the stale line would then be replayed
+		// unintentionally (potentially an unwanted restore) and the new one never
+		// read (the loop stops at ret_val != 0). The open FILE* keeps reading the
+		// unlinked inode to EOF (POSIX).
+		unlink(SCRIPT_FILE_TMP);
 		DataManager::SetValue(TW_SIMULATE_ACTIONS, 0);
 		DataManager::SetValue("ui_progress", 0); // Reset the progress bar
 		while (fgets(script_line, SCRIPT_COMMAND_SIZE, fp) != NULL && ret_val == 0) {
@@ -140,7 +152,15 @@ int OpenRecoveryScript::run_script_file(void) {
 				if ((int) *val_start == 32)
 					val_start++; //get rid of space
 				strncpy(value, val_start, line_len - cindex - remove_nl);
-				LOGINFO("value is: '%s'\n", value);
+				// Password masking: for backup/restore replace everything after the
+				// first ':' with '****' — the password must never reach recovery.log.
+				if ((strcmp(command, "backup") == 0 || strcmp(command, "restore") == 0) && strchr(value, ':') != NULL) {
+					string masked_value(value);
+					masked_value = masked_value.substr(0, masked_value.find(':') + 1) + "****";
+					LOGINFO("value is: '%s'\n", masked_value.c_str());
+				} else {
+					LOGINFO("value is: '%s'\n", value);
+				}
 			} else {
 				strncpy(command, script_line, line_len - remove_nl + 1);
 				gui_print("command is: '%s' and there is no value\n", command);
@@ -176,50 +196,48 @@ int OpenRecoveryScript::run_script_file(void) {
 			} else if (strcmp(command, "backup") == 0) {
 				// Backup
 				DataManager::SetValue("tw_action_text2", gui_parse_text("{@backing}"));
-				tok = strtok(value, " ");
-				strcpy(value1, tok);
-				tok = strtok(NULL, " ");
-				if (tok != NULL) {
-					memset(value2, 0, sizeof(value2));
-					strcpy(value2, tok);
-					line_len = strlen(tok);
-					if ((int)value2[line_len - 1] == 10 || (int)value2[line_len - 1] == 13) {
-						if ((int)value2[line_len - 1] == 10 || (int)value2[line_len - 1] == 13)
-							remove_nl = 2;
-						else
-							remove_nl = 1;
-					} else
-						remove_nl = 0;
-					strncpy(value2, tok, line_len - remove_nl);
-					DataManager::SetValue(TW_BACKUP_NAME, value2);
-					gui_msg(Msg("backup_folder_set=Backup folder set to '{1}'")(value2));
-					if (PartitionManager.Check_Backup_Name(value2, true, true) != 0) {
-						ret_val = 1;
-						continue;
-					}
-				} else {
-					char empt[50];
-					strcpy(empt, "(Current Date)");
-					DataManager::SetValue(TW_BACKUP_NAME, empt);
-				}
-				ret_val = Backup_Command(value1);
+				// Pass the whole value ("codes [name]:password") to Backup_Command —
+				// it splits codes/name/password at the FIRST ':' itself, so a
+				// password containing spaces is validated as a whole instead of
+				// being cut at the space, and the backup name before the ':' survives.
+				ret_val = Backup_Command(value);
 			} else if (strcmp(command, "restore") == 0) {
 				// Restore
-				DataManager::SetValue("tw_action_text2", gui_parse_text("{@restore}"));
+				DataManager::SetValue("tw_action_text2", gui_parse_text("{@ors_restore}"));
 				PartitionManager.Mount_All_Storage();
-				DataManager::SetValue(TW_SKIP_DIGEST_CHECK_VAR, 0);
+				DataManager::SetValue(TW_SKIP_DIGEST_CHECK_VAR, 1);
 				char folder_path[512], partitions[512];
 
-				string val = value, restore_folder, restore_partitions;
-				size_t pos = val.find_last_of(" ");
-				if (pos == string::npos) {
-					restore_folder = value;
-					partitions[0] = '\0';
-				} else {
-					restore_folder = val.substr(0, pos);
-					restore_partitions = val.substr(pos + 1, val.size() - pos - 1);
-					strcpy(partitions, restore_partitions.c_str());
+				string val = value, restore_folder, restore_partitions, Password;
+				bool has_password = false;
+				// Split the password at the FIRST ':' (format: <folder> [codes]:<password>).
+				// Everything after it is the password (spaces are later rejected by
+				// Ors_Password_Valid); "<folder> [codes]" remains for the split below.
+				size_t pw_colon = val.find(':');
+				if (pw_colon != string::npos) {
+					Password = val.substr(pw_colon + 1);
+					has_password = true;
+					val = val.substr(0, pw_colon);
 				}
+				DataManager::SetValue("tw_restore_password", Password);
+				// Split folder/codes via regex (mirrors the backup syntax): folder
+				// first (may contain spaces), optional codes as the last token. The
+				// alphabet is the SAME as for backup (S/D/C/R/B/A/E/M + O/X) so backup
+				// code strings can be reused 1:1. O (compression) and X (encryption)
+				// are silent no-ops here — both are auto-detected on restore
+				// (Set_Restore_Files/tw_restore_encrypted, password via :pw) and have
+				// no code branch or partition name below. A last token that is not a
+				// valid code string belongs entirely to the folder, so folder names
+				// with spaces are handled correctly.
+				std::smatch rm;
+				static const std::regex restore_mask("^(.+?)(?: +([SsDdCcRrBbAaEeOoMmXx]+))?$");
+				if (std::regex_match(val, rm, restore_mask)) {
+					restore_folder = rm[1].str();
+					restore_partitions = rm[2].str();
+				} else {
+					restore_folder = val;
+				}
+				strcpy(partitions, restore_partitions.c_str());
 				strcpy(folder_path, restore_folder.c_str());
 				LOGINFO("Restore folder is: '%s' and partitions: '%s'\n", folder_path, partitions);
 				gui_msg(Msg("restoring=Restoring {1}...")(folder_path));
@@ -262,50 +280,121 @@ int OpenRecoveryScript::run_script_file(void) {
 				DataManager::GetValue("tw_restore_list", Partition_List);
 				if (strlen(partitions) != 0) {
 					string Restore_List;
+					bool any_partition_code = false;
 
 					memset(value2, 0, sizeof(value2));
 					strcpy(value2, partitions);
-					gui_msg(Msg("set_restore_opt=Setting restore options: '{1}':")(value2));
+					// Collect the partition names matching the codes (input order) for the message.
+					string opt_names;
+					for (int j = 0; value2[j]; j++) {
+						const char* mp = NULL;
+						switch (value2[j]) {
+							case 'S': case 's': mp = "/system"; break;
+							case 'D': case 'd': mp = "/data"; break;
+							case 'C': case 'c': mp = "/cache"; break;
+							case 'R': case 'r': mp = "/recovery"; break;
+							case 'B': case 'b': mp = "/boot"; break;
+							case 'A': case 'a': mp = "/and-sec"; break;
+							case 'E': case 'e': mp = "/sd-ext"; break;
+							default: break;
+						}
+						if (mp) {
+							if (!opt_names.empty()) opt_names += ", ";
+							opt_names += mp;
+						}
+					}
+					string opt_suffix = opt_names.empty() ? "" : " (" + opt_names + ")";
+					gui_msg(Msg("set_restore_opt=Setting restore options: '{1}'{2}:")(value2)(opt_suffix));
+
+					// Only restore a requested partition if it is in the backup; skip
+					// missing ones with a notice (mirrors the backup pre-filter).
+					auto add_restore_if_present = [&](const char* mp, const char* opt_msg) {
+						any_partition_code = true;
+						string entry = string(mp) + ";";
+						if (Partition_List.find(entry) != string::npos) {
+							Restore_List += entry;
+							gui_msg(opt_msg);
+						} else {
+							gui_msg(Msg(msg::kWarning, "ors_restore_part_missing=Partition '{1}' is not in this backup -- skipping.")(mp));
+						}
+					};
+
 					line_len = strlen(value2);
 					for (i=0; i<line_len; i++) {
-						if ((value2[i] == 'S' || value2[i] == 's') && Partition_List.find("/system;") != string::npos) {
-							Restore_List += "/system;";
-							gui_msg("system=System");
-						} else if ((value2[i] == 'D' || value2[i] == 'd') && Partition_List.find("/data;") != string::npos) {
-							Restore_List += "/data;";
-							gui_msg("data=Data");
-						} else if ((value2[i] == 'C' || value2[i] == 'c') && Partition_List.find("/cache;") != string::npos) {
-							Restore_List += "/cache;";
-							gui_msg("cache=Cache");
-						} else if ((value2[i] == 'R' || value2[i] == 'r') && Partition_List.find("/recovery;") != string::npos) {
-							Restore_List += "/recovery;";
-							gui_msg("recovery=Recovery");
-						} else if ((value2[i] == 'B' || value2[i] == 'b') && Partition_List.find("/boot;") != string::npos) {
-							Restore_List += "/boot;";
-							gui_msg("boot=Boot");
-						} else if ((value2[i] == 'A' || value2[i] == 'a')  && Partition_List.find("/and-sec;") != string::npos) {
-							Restore_List += "/and-sec;";
-							gui_msg("android_secure=Android Secure");
-						} else if ((value2[i] == 'E' || value2[i] == 'e')  && Partition_List.find("/sd-ext;") != string::npos) {
-							Restore_List += "/sd-ext;";
-							gui_msg("sdext=SD-EXT");
-						} else if (value2[i] == 'M' || value2[i] == 'm') {
-							DataManager::SetValue(TW_SKIP_DIGEST_CHECK_VAR, 1);
+						char c = value2[i];
+						if (c == 'S' || c == 's') {
+							add_restore_if_present("/system", "system=System");
+						} else if (c == 'D' || c == 'd') {
+							add_restore_if_present("/data", "data=Data");
+						} else if (c == 'C' || c == 'c') {
+							add_restore_if_present("/cache", "cache=Cache");
+						} else if (c == 'R' || c == 'r') {
+							add_restore_if_present("/recovery", "recovery=Recovery");
+						} else if (c == 'B' || c == 'b') {
+							add_restore_if_present("/boot", "boot=Boot");
+						} else if (c == 'A' || c == 'a') {
+							add_restore_if_present("/and-sec", "android_secure=Android Secure");
+						} else if (c == 'E' || c == 'e') {
+							add_restore_if_present("/sd-ext", "sdext=SD-EXT");
+						} else if (c == 'M' || c == 'm') {
+							DataManager::SetValue(TW_SKIP_DIGEST_CHECK_VAR, 0);
 							gui_msg("digest_check_skip=Digest check skip is on");
 						}
 					}
 
-					DataManager::SetValue("tw_restore_selected", Restore_List);
+					// Partitions were requested but NONE of them is in the backup -> clean abort.
+					if (any_partition_code && Restore_List.empty()) {
+						gui_err("ors_restore_no_match=None of the requested partitions are in this backup.");
+						ret_val = 1;
+						continue;
+					}
+					// Non-empty -> only those; switches only (M) without a partition -> everything in the backup.
+					if (Restore_List.empty())
+						DataManager::SetValue("tw_restore_selected", Partition_List);
+					else
+						DataManager::SetValue("tw_restore_selected", Restore_List);
 				} else {
+					// No codes -> everything in the backup. Names come from Partition_List.
+					string all_names;
+					size_t np_start = 0, np_end;
+					while ((np_end = Partition_List.find(';', np_start)) != string::npos) {
+						string np = Partition_List.substr(np_start, np_end - np_start);
+						if (!np.empty()) {
+							if (!all_names.empty()) all_names += ", ";
+							all_names += np;
+						}
+						np_start = np_end + 1;
+					}
+					gui_msg(Msg("set_restore_opt_all=Setting restore options: all ({1}):")(all_names));
 					DataManager::SetValue("tw_restore_selected", Partition_List);
 				}
 				if (is_encrypted) {
-					gui_err("ors_encrypt_restore_err=Unable to use OpenRecoveryScript to restore an encrypted backup.");
-					ret_val = 1;
-				} else if (!PartitionManager.Run_Restore(folder_path))
-					ret_val = 1;
-				else
-					gui_msg("done=Done.");
+					// Encrypted backup: validate the password BEFORE the wipe (like the
+					// GUI's decrypt_backup) — a wrong or missing password must not cost data.
+					if (!has_password || Password.empty()) {
+						gui_err("ors_restore_pw_required=This backup is encrypted and needs a password. Use: restore <folder> <options>:<password>");
+						ret_val = 1;
+					} else if (!Ors_Password_Valid(Password)) {
+						gui_err("ors_pw_invalid=Password contains invalid characters -- no spaces or control characters allowed.");
+						ret_val = 1;
+					} else if (!TWFunc::Try_Decrypting_Backup(folder_path, Password)) {
+						gui_err("ors_restore_pw_wrong=Wrong password -- unable to decrypt backup.");
+						ret_val = 1;
+					} else if (PartitionManager.Run_Restore(folder_path) != 0) {
+						ret_val = 1;
+					} else {
+						gui_msg("done=Done.");
+					}
+				} else {
+					// A superfluous password on an unencrypted backup only warns, it does
+					// not abort (the GUI does not ask for a password there either).
+					if (has_password)
+						gui_msg(Msg(msg::kWarning, "ors_pw_not_needed=Backup is not encrypted; the given password is ignored."));
+					if (PartitionManager.Run_Restore(folder_path) != 0)
+						ret_val = 1;
+					else
+						gui_msg("done=Done.");
+				}
 			} else if (strcmp(command, "remountrw") == 0) {
 				ret_val = remountrw();
 			} else if (strcmp(command, "mount") == 0) {
@@ -443,7 +532,6 @@ int OpenRecoveryScript::run_script_file(void) {
 			}
 		}
 		fclose(fp);
-		unlink(SCRIPT_FILE_TMP);
 		gui_msg("done_ors=Done processing script file");
 	} else {
 		gui_msg(Msg(msg::kError, "error_opening_strerr=Error opening: '{1}' ({2})")(SCRIPT_FILE_TMP)(
@@ -562,31 +650,90 @@ string OpenRecoveryScript::Locate_Zip_File(string Zip, string Storage_Root) {
 	return "";
 }
 
+// Fail-fast validation of an ORS backup/restore password before execution
+// (mirrors the GUI pre-check): non-empty, printable ASCII without space
+// (0x21-0x7E). A space would otherwise silently truncate the password;
+// tabs/control characters are unwanted.
+static bool Ors_Password_Valid(const string& pw) {
+	if (pw.empty())
+		return false;
+	for (unsigned char c : pw)
+		if (c < 0x21 || c > 0x7E)
+			return false;
+	return true;
+}
+
 int OpenRecoveryScript::Backup_Command(string Options) {
-	char value1[SCRIPT_COMMAND_SIZE];
 	int line_len, i;
 	string Backup_List;
-
-	strcpy(value1, Options.c_str());
+	string Password;
+	bool has_password = false;
+	bool encrypt = false;
 
 	DataManager::SetValue(TW_USE_COMPRESSION_VAR, 0);
 	DataManager::SetValue(TW_SKIP_DIGEST_GENERATE_VAR, 0);
 
+	// Format: [name] <codes>[:password] (mirrors restore <folder> <codes>:<pw>).
+	// 1) Split the password at the FIRST ':' — everything after it is the password
+	//    (including any spaces, which Ors_Password_Valid then rejects).
+	size_t colon = Options.find(':');
+	if (colon != string::npos) {
+		Password = Options.substr(colon + 1);
+		has_password = true;
+		Options = Options.substr(0, colon);
+	}
+
+	// 2) Parse the rest via regex: optional name (may contain spaces) + codes as
+	//    the last token (valid code characters only). No match -> reject (e.g.
+	//    "data" fails at the 't') instead of misparsing character by character.
+	string Backup_Name;
+	std::smatch bm;
+	static const std::regex backup_mask("^(?:(.+) )?([SsDdCcRrBbAaEeOoMmXx123]+)$");
+	if (!std::regex_match(Options, bm, backup_mask)) {
+		gui_err("ors_invalid_options=Invalid backup options. Use: backup [name] <SDCRBAEOMX>[:password]");
+		return 1;
+	}
+	Backup_Name = bm[1].str();
+	Options = bm[2].str();
+
+	// Set the backup name (default = current date).
+	if (!Backup_Name.empty()) {
+		DataManager::SetValue(TW_BACKUP_NAME, Backup_Name);
+		gui_msg(Msg("backup_folder_set=Backup folder set to '{1}'")(Backup_Name));
+		if (PartitionManager.Check_Backup_Name(Backup_Name, true, true) != 0)
+			return 1;
+	} else {
+		DataManager::SetValue(TW_BACKUP_NAME, "(Current Date)");
+	}
+
 	gui_msg("select_backup_opt=Setting backup options:");
+	// Append a partition to the backup list only if it exists on this device
+	// (Find_Partition_By_Path — the same primitive as the backstop in Run_Backup).
+	// Prevents a character-wise-parsed word — e.g. the 'a' in "data" -> /and-sec —
+	// from putting a nonexistent (legacy) partition into the list and triggering
+	// the hard abort in Run_Backup later. Missing partitions get a visible warning
+	// (no error/abort) and are skipped; the GUI already filters the same way via
+	// Get_Partition_List (Is_Present), so ORS behaves symmetrically.
+	auto add_part_if_present = [&](const char* mount_point, const char* opt_msg) {
+		if (PartitionManager.Find_Partition_By_Path(mount_point) != NULL) {
+			Backup_List += mount_point;
+			Backup_List += ";";
+			gui_msg(opt_msg);
+		} else {
+			gui_msg(Msg(msg::kWarning, "ors_part_not_found=Partition '{1}' not found on this device -- skipping.")(mount_point));
+		}
+	};
+
 	line_len = Options.size();
 	for (i=0; i<line_len; i++) {
 		if (Options.substr(i, 1) == "S" || Options.substr(i, 1) == "s") {
-			Backup_List += "/system;";
-			gui_msg("system=System");
+			add_part_if_present("/system", "system=System");
 		} else if (Options.substr(i, 1) == "D" || Options.substr(i, 1) == "d") {
-			Backup_List += "/data;";
-			gui_msg("data=Data");
+			add_part_if_present("/data", "data=Data");
 		} else if (Options.substr(i, 1) == "C" || Options.substr(i, 1) == "c") {
-			Backup_List += "/cache;";
-			gui_msg("cache=Cache");
+			add_part_if_present("/cache", "cache=Cache");
 		} else if (Options.substr(i, 1) == "R" || Options.substr(i, 1) == "r") {
-			Backup_List += "/recovery;";
-			gui_msg("recovery=Recovery");
+			add_part_if_present("/recovery", "recovery=Recovery");
 		} else if (Options.substr(i, 1) == "1") {
 			gui_print("%s\n", "Special1 -- No Longer Supported...");
 		} else if (Options.substr(i, 1) == "2") {
@@ -594,25 +741,51 @@ int OpenRecoveryScript::Backup_Command(string Options) {
 		} else if (Options.substr(i, 1) == "3") {
 			gui_print("%s\n", "Special3 -- No Longer Supported...");
 		} else if (Options.substr(i, 1) == "B" || Options.substr(i, 1) == "b") {
-			Backup_List += "/boot;";
-			gui_msg("boot=Boot");
+			add_part_if_present("/boot", "boot=Boot");
 		} else if (Options.substr(i, 1) == "A" || Options.substr(i, 1) == "a") {
-			Backup_List += "/and-sec;";
-			gui_msg("android_secure=Android Secure");
+			add_part_if_present("/and-sec", "android_secure=Android Secure");
 		} else if (Options.substr(i, 1) == "E" || Options.substr(i, 1) == "e") {
-			Backup_List += "/sd-ext;";
-			gui_msg("sdext=SD-EXT");
+			add_part_if_present("/sd-ext", "sdext=SD-EXT");
 		} else if (Options.substr(i, 1) == "O" || Options.substr(i, 1) == "o") {
 			DataManager::SetValue(TW_USE_COMPRESSION_VAR, 1);
 			gui_msg("compression_on=Compression is on");
 		} else if (Options.substr(i, 1) == "M" || Options.substr(i, 1) == "m") {
 			DataManager::SetValue(TW_SKIP_DIGEST_GENERATE_VAR, 1);
 			gui_msg("digest_off=Digest Generation is off");
+		} else if (Options.substr(i, 1) == "X" || Options.substr(i, 1) == "x") {
+			encrypt = true;
 		}
 	}
+
+	// Encryption/password validation (fail-fast, BEFORE Run_Backup, like the GUI):
+	if (encrypt) {
+		if (!has_password || Password.empty()) {
+			gui_err("ors_pw_required=Encryption requested (X) but no password given. Use: backup <options>[ name]:<password>");
+			return 1;
+		}
+		if (!Ors_Password_Valid(Password)) {
+			gui_err("ors_pw_invalid=Password contains invalid characters -- no spaces or control characters allowed.");
+			return 1;
+		}
+		DataManager::SetValue("tw_encrypt_backup", 1);
+		DataManager::SetValue("tw_backup_password", Password);
+		gui_msg("encryption_on=Encryption is on");
+	} else if (has_password) {
+		gui_err("ors_pw_no_flag=A password was given but encryption is off. Add 'X' to the options to encrypt.");
+		return 1;
+	}
+
 	DataManager::SetValue("tw_backup_list", Backup_List);
-	if (!PartitionManager.Run_Backup(false)) {
-		gui_err("backup_fail=Backup Failed");
+	int backup_rc = PartitionManager.Run_Backup(false);
+
+	// Hardening: remove password/flag from the DataManager after use.
+	if (encrypt) {
+		DataManager::SetValue("tw_backup_password", "");
+		DataManager::SetValue("tw_encrypt_backup", 0);
+	}
+
+	if (backup_rc != 0) {
+		gui_err("backup_fail=[BACKUP FAILED]");
 		return 1;
 	}
 	gui_msg("backup_complete=Backup Complete");

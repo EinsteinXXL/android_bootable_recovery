@@ -47,6 +47,17 @@ struct COLOR {
 		: red(r), green(g), blue(b), alpha(a) {}
 };
 
+// A simple rectangle for regional repaints (damage region). Defined inline here
+// (not from minuitwrp/minui.h) because pages.hpp is also included by modules
+// without the minuitwrp include path (e.g. twrpinstall). Coordinates in logical
+// pixels (before rotation), as for gr_clip/gr_blit.
+struct GRRect {
+	int x;
+	int y;
+	int w;
+	int h;
+};
+
 struct language_struct {
 	std::string filename;
 	std::string displayvalue;
@@ -84,6 +95,8 @@ public:
 
 public:
 	virtual int Render(void);
+	// Renders only the clipped rectangle area (background + objects).
+	virtual int RenderRegion(int rx, int ry, int rw, int rh);
 	virtual int Update(void);
 	virtual int NotifyTouch(TOUCH_STATE state, int x, int y);
 	virtual int NotifyKey(int key, bool down);
@@ -130,6 +143,8 @@ public:
 
 	// These are routing routines
 	int Render(void);
+	int RenderRegion(int rx, int ry, int rw, int rh);  // Phase 3 v2
+	bool HasOverlays() const { return !mOverlays.empty(); }  // Phase 3 v2
 	int Update(void);
 	int NotifyTouch(TOUCH_STATE state, int x, int y);
 	int NotifyKey(int key, bool down);
@@ -178,6 +193,21 @@ public:
 	// These are routing routines
 	static int Render(void);
 	static int Update(void);
+
+	// Regional repaint (damage). All calls come from the GUI thread, so no mutex is
+	// needed. ResetFrameRegion() before every Update(); objects report via
+	// RequestFrameRegion(); the GUI loop then reads the damage-rect LIST (disjoint
+	// rectangles instead of a bounding box, otherwise the region becomes ~fullscreen
+	// for spatially scattered widgets). On overflow -> full-render fallback.
+	static void ResetFrameRegion();
+	static void RequestFrameRegion(int rx, int ry, int rw, int rh);
+	static bool FrameHasRegion();
+	static int FrameRegionCount();
+	static GRRect GetFrameRegionAt(int i);
+	static bool FrameRegionOverflow();
+	static bool CurrentSetHasOverlays();
+	static int RenderRegion(int rx, int ry, int rw, int rh);
+
 	static int NotifyTouch(TOUCH_STATE state, int x, int y);
 	static int NotifyKey(int key, bool down);
 	static int NotifyCharInput(int ch);

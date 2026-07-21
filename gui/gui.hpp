@@ -30,6 +30,9 @@ void gui_highlight(const char* text);
 void gui_msg(Message msg);
 void gui_err(Message msg);
 
+void gui_activate_msg_pipe(int fd);
+void gui_deactivate_msg_pipe(void);
+
 std::string gui_parse_text(std::string inText);
 std::string gui_lookup(const std::string& resource_name, const std::string& default_value);
 

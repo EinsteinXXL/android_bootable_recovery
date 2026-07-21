@@ -29,6 +29,8 @@ public:
 
 	void SetPartitionSize(const unsigned long long part_size);
 	void SetSizeCount(const unsigned long long part_size, unsigned long long f_count);
+	void CorrectTotalSize(long long delta);            // Correct the overall denominator by the exact per-partition delta (bar ends at 100%)
+	void Finish_Partition_Exact();                     // Reconcile announced partition size with actually extracted bytes. ADB restore loop only.
 
 	void UpdateSize(const unsigned long long size);
 	void UpdateSizeCount(const unsigned long long size, const unsigned long long count);
@@ -36,8 +38,9 @@ public:
 	void DisplayFileCount(const bool display);
 	void UpdateDisplayDetails(const bool force);
 
+
 private:
-	unsigned long long total_backup_size;              // Overall size (for the progress bar)
+	unsigned long long total_size;                     // Overall size — denominator for the progress bar (backup and restore)
 
 	unsigned long long partition_size;                 // Size of the current partition
 	unsigned long long file_count;                     // Count of files for the current partition (tar backup only, not restore)

@@ -150,7 +150,10 @@ oct_to_int(char *oct, size_t octlen)
 
 	memcpy(tmp, oct, octlen);
 	tmp[octlen] = '\0';
-	return sscanf(oct, "%llo", &val) == 1 ? (int64_t)val : 0;
+	/* sscanf MUST run on the null-terminated duplicate tmp, not on oct: a fully
+	 * used 12-digit octal field without a NUL (GNU-tar-legal in foreign archives)
+	 * would otherwise let sscanf read on into the next field -> wrong size/mtime. */
+	return sscanf(tmp, "%llo", &val) == 1 ? (int64_t)val : 0;
 }
 
 

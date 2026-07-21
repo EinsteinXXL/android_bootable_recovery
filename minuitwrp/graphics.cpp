@@ -114,6 +114,19 @@ int gr_textEx_scaleW(int x, int y, const char *s, void* pFont, int max_width, in
     return twrpTruetype::gr_ttf_textExWH(gl, x, y + y_scale, s, vfont, measured_width + x, -1, gr_draw);
 }
 
+// gr_clip REPLACES the scissor rect (not an intersection). Widgets that clip
+// internally (GUIScrollList/GUIInput) thereby broke out of the page's region
+// scissor in the region-render path and could leave undimmed pixels outside the
+// region under an overlay. Solution: track the active logical clip rect here;
+// gr_clip_intersect() intersects with it (1-slot save), gr_clip_restore() restores
+// the state before the intersect. Used only from the GUI thread (like the flip
+// damage tracking). NOT nestable -- exactly ONE intersect->restore pair per widget
+// render.
+static bool g_clip_active = false;      // gr_clip set (and no gr_noclip since)
+static int  g_clip_x = 0, g_clip_y = 0, g_clip_w = 0, g_clip_h = 0;   // logical coordinates
+static bool g_clip_saved_active = false; // 1-slot save for gr_clip_restore()
+static int  g_clip_sx = 0, g_clip_sy = 0, g_clip_sw = 0, g_clip_sh = 0;
+
 void gr_clip(int x, int y, int w, int h)
 {
     GGLContext *gl = gr_context;
@@ -133,6 +146,8 @@ void gr_clip(int x, int y, int w, int h)
             break;
     }
     gl->enable(gl, GGL_SCISSOR_TEST);
+    g_clip_active = true;
+    g_clip_x = x; g_clip_y = y; g_clip_w = w; g_clip_h = h;
 }
 
 void gr_noclip()
@@ -142,6 +157,39 @@ void gr_noclip()
                 gr_draw->width - 2 * overscan_offset_x,
                 gr_draw->height - 2 * overscan_offset_y);
     gl->disable(gl, GGL_SCISSOR_TEST);
+    g_clip_active = false;
+}
+
+void gr_clip_intersect(int x, int y, int w, int h)
+{
+    // Save the state BEFORE the intersect (for gr_clip_restore).
+    g_clip_saved_active = g_clip_active;
+    g_clip_sx = g_clip_x; g_clip_sy = g_clip_y; g_clip_sw = g_clip_w; g_clip_sh = g_clip_h;
+
+    if (!g_clip_active) {
+        // No active clip (full-render context) -> behaves exactly like gr_clip
+        // (previous widget behavior, byte-identical).
+        gr_clip(x, y, w, h);
+        return;
+    }
+    int x0 = (x > g_clip_x) ? x : g_clip_x;
+    int y0 = (y > g_clip_y) ? y : g_clip_y;
+    int x1 = ((x + w) < (g_clip_x + g_clip_w)) ? (x + w) : (g_clip_x + g_clip_w);
+    int y1 = ((y + h) < (g_clip_y + g_clip_h)) ? (y + h) : (g_clip_y + g_clip_h);
+    if (x1 <= x0 || y1 <= y0) {
+        // Empty intersection: a degenerate 0x0 scissor -> all draws are discarded.
+        gr_clip(x0, y0, 0, 0);
+        return;
+    }
+    gr_clip(x0, y0, x1 - x0, y1 - y0);
+}
+
+void gr_clip_restore()
+{
+    if (g_clip_saved_active)
+        gr_clip(g_clip_sx, g_clip_sy, g_clip_sw, g_clip_sh);
+    else
+        gr_noclip();
 }
 
 void gr_line(int x0, int y0, int x1, int y1, int width)
@@ -338,6 +386,70 @@ unsigned int gr_get_height(gr_surface surface) {
         return 0;
     }
     return ((GGLSurface*) surface)->height;
+}
+
+// Partial flipping. Damage in DISPLAY rows (post-rotation). g_flip_*_cur = the
+// currently accumulated frame damage; g_flip_*_prev = the previous frame. Because
+// of double buffering, Union(cur, prev) must be copied per flip (the target
+// scanout buffer is 2 frames old). Touched only from the GUI thread.
+static bool g_flip_damage_set = false;
+static int  g_flip_cur_top = 0,  g_flip_cur_bot = 0;
+static int  g_flip_prev_top = 0, g_flip_prev_bot = 0;
+static bool g_flip_prev_full = true;
+
+void gr_set_flip_damage(int x, int y, int w, int h) {
+    if (!gr_draw || w <= 0 || h <= 0)
+        return;
+    const int H = gr_draw->height;
+    int top, bot;
+    // Same logical->display mapping as gr_clip (scissor): only the y span.
+    switch (gr_rotation) {
+        case 90:  top = x;         bot = x + w; break; // disp y = logischer x, h = w
+        case 180: top = H - y - h; bot = H - y; break;
+        case 270: top = H - x - w; bot = H - x; break;
+        default:  top = y;         bot = y + h; break; // 0
+    }
+    if (top < 0) top = 0;
+    if (bot > H) bot = H;
+    if (bot <= top) return;
+    if (!g_flip_damage_set) {
+        g_flip_cur_top = top;
+        g_flip_cur_bot = bot;
+        g_flip_damage_set = true;
+    } else {
+        if (top < g_flip_cur_top) g_flip_cur_top = top;
+        if (bot > g_flip_cur_bot) g_flip_cur_bot = bot;
+    }
+}
+
+int gr_flip_consume_damage(int* top, int* bottom) {
+    const int H = gr_draw ? gr_draw->height : 0;
+    const bool cur_full = !g_flip_damage_set;
+    const int cur_top = cur_full ? 0 : g_flip_cur_top;
+    const int cur_bot = cur_full ? H : g_flip_cur_bot;
+
+    const bool need_full = cur_full || g_flip_prev_full;
+    int copy_top = 0, copy_bot = H;
+    if (!need_full) {
+        copy_top = (cur_top < g_flip_prev_top) ? cur_top : g_flip_prev_top;
+        copy_bot = (cur_bot > g_flip_prev_bot) ? cur_bot : g_flip_prev_bot;
+    }
+
+    // Advance the 1-frame history (right here, once per flip).
+    g_flip_prev_full = cur_full;
+    g_flip_prev_top  = cur_top;
+    g_flip_prev_bot  = cur_bot;
+    g_flip_damage_set = false;
+
+    if (need_full)
+        return 0;
+    if (copy_top < 0) copy_top = 0;
+    if (copy_bot > H) copy_bot = H;
+    if (copy_bot <= copy_top)
+        return 0;
+    *top = copy_top;
+    *bottom = copy_bot;
+    return 1;
 }
 
 void gr_flip() {

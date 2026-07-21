@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <android-base/logging.h>
 #include <android-base/properties.h>
+#include <libgen.h>
 #include <chrono>
 #include <dirent.h>
 #include <errno.h>
@@ -30,6 +31,7 @@
 #include <sys/time.h>
 
 #define LOG_TAG "MtpServer"
+#include <log/log.h>
 
 #include "MtpDebug.h"
 #include "mtp_MtpDatabase.hpp"
@@ -42,6 +44,8 @@
 #include "MtpServer.h"
 #include "MtpStorage.h"
 #include "MtpStringBuffer.h"
+
+static const int SN_EVENT_LOG_ID = 0x534e4554;
 
 static const MtpOperationCode kSupportedOperationCodes[] = {
 	MTP_OPERATION_GET_DEVICE_INFO,
@@ -969,9 +973,20 @@ MtpResponseCode MtpServer::doSendObjectInfo() {
 	if (!parseDateTime(modified, modifiedTime))
 		modifiedTime = 0;
 
+	if ((strcmp(name, ".") == 0) || (strcmp(name, "..") == 0) ||
+		(strcmp(name, "/") == 0) || (strcmp(basename(name), name) != 0)) {
+		char errMsg[80];
+
+		snprintf(errMsg, sizeof(errMsg), "Invalid name: %s", (const char *) name);
+		ALOGE("%s (b/130656917)", errMsg);
+		android_errorWriteWithInfoLog(SN_EVENT_LOG_ID, "130656917", -1, errMsg,
+										strlen(errMsg));
+
+		return MTP_RESPONSE_INVALID_PARAMETER;
+	}
 	if (path[path.size() - 1] != '/')
 		path.append("/");
-	path.append(name);
+	path.append(basename(name));
 
 	// check space first
 	if (mSendObjectFileSize > storage->getFreeSpace())

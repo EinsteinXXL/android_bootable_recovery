@@ -30,7 +30,6 @@
 #include <vector>
 #include <fstream>
 #include <sstream>
-#include <assert.h>
 
 #include "twadbstream.h"
 #include "libtwadbbu.hpp"
@@ -45,16 +44,29 @@ bool twadbbu::Check_ADB_Backup_File(std::string fname) {
 	int fd = open(fname.c_str(), O_RDONLY);
 	if (fd < 0) {
 		printf("Unable to open %s for reading: %s.\n", fname.c_str(), strerror(errno));
+		return false;
+	}
+
+	// Only a regular file can be an .ab stream. The probe doubles as the
+	// .ab-vs-folder discriminator on every restore selection, so stay silent for
+	// directories -- read() would just fail with EISDIR and the short-read
+	// message below would log a bogus header error for every folder backup.
+	struct stat st;
+	if (fstat(fd, &st) == 0 && !S_ISREG(st.st_mode)) {
 		close(fd);
 		return false;
 	}
+
 	bytes = read(fd, &buf, sizeof(buf));
 	close(fd);
 
-	if (memcpy(&adbbuhdr, buf, sizeof(adbbuhdr)) == NULL) {
-		printf("Unable to memcpy: %s (%s).\n", fname.c_str(), strerror(errno));
+	// Reject a short/failed read BEFORE copying the header out of buf -- otherwise
+	// uninitialized stack would flow into the CRC comparison.
+	if (bytes < (int)sizeof(adbbuhdr)) {
+		printf("Unable to read adb backup header from %s.\n", fname.c_str());
 		return false;
 	}
+	memcpy(&adbbuhdr, buf, sizeof(adbbuhdr));
 	adbbuhdrcrc = adbbuhdr.crc;
 	memset(&adbbuhdr.crc, 0, sizeof(adbbuhdr.crc));
 	crc = crc32(0L, Z_NULL, 0);
@@ -80,7 +92,6 @@ std::vector<std::string> twadbbu::Get_ADB_Backup_Files(std::string fname) {
 		int readbytes;
 		if ((readbytes = read(fd, &buf, sizeof(buf))) > 0) {
 			memcpy(&structcmd, buf, sizeof(structcmd));
-			assert(structcmd.type == TWENDADB || structcmd.type == TWIMG || structcmd.type == TWFN);
 			cmdstr = structcmd.type;
 			std::string cmdtype = cmdstr.substr(0, sizeof(structcmd.type) - 1);
 			if (cmdtype == TWENDADB) {
@@ -123,14 +134,54 @@ std::vector<std::string> twadbbu::Get_ADB_Backup_Files(std::string fname) {
 					close(fd);
 					return std::vector<std::string>();
 				}
+
+				// Skip this partition's data frames via lseek instead of READING them:
+				// scanning every 512-B block of a large .ab (14 GB = ~27M reads) would
+				// freeze the restore-selection GUI for 10-20 s. The stream layout is
+				// deterministic: the twfilehdr is followed by 1-MB frames (512-B TWDATA
+				// header + payload), terminated by the md5trailer on the 1-MB boundary
+				// (mirror of _walk_frames in the Python reader adb_backup_reader.py). Only
+				// the 512-B header is read per frame -> 512 B per 1 MB. 0 frames (empty
+				// partition: twfilehdr immediately followed by the md5trailer) is valid.
+				while (true) {
+					if ((readbytes = read(fd, &buf, sizeof(buf))) != (int)sizeof(buf)) {
+						printf("Get_ADB_Backup_Files: unexpected end of %s (no md5trailer)\n", fname.c_str());
+						close(fd);
+						return adb_partitions;   // partial, like the outer EOF semantics
+					}
+					memcpy(&structcmd, buf, sizeof(structcmd));
+					std::string blocktype = structcmd.get_type();
+					if (blocktype == TWDATA) {
+						if (lseek(fd, (off_t)(DATA_MAX_CHUNK_SIZE - MAX_ADB_READ), SEEK_CUR) < 0) {
+							printf("Get_ADB_Backup_Files: lseek failed on %s: %s\n", fname.c_str(), strerror(errno));
+							close(fd);
+							return adb_partitions;
+						}
+					} else if (blocktype == MD5TRAILER) {
+						break;   // partition complete -- on to the next header
+					} else {
+						// Desync/corrupt stream: abort defensively instead of reading
+						// further GBs.
+						printf("Get_ADB_Backup_Files: unexpected block '%s' in data region of %s\n", blocktype.c_str(), fname.c_str());
+						close(fd);
+						return adb_partitions;
+					}
+				}
 			}
+		}
+		else {
+			// EOF/read error without a TWENDADB marker: the file ends prematurely --
+			// abort instead of looping forever. Return the partitions found so far;
+			// the actual restore re-checks every header via CRC.
+			printf("Get_ADB_Backup_Files: unexpected end of %s (no TWENDADB)\n", fname.c_str());
+			break;
 		}
 	}
 	close(fd);
 	return adb_partitions;
 }
 
-bool twadbbu::Write_ADB_Stream_Header(uint64_t partition_count) {
+bool twadbbu::Write_ADB_Stream_Header(uint64_t partition_count, uint64_t total_size) {
 	struct AdbBackupStreamHeader twhdr;
 	int adb_control_bu_fd;
 
@@ -145,6 +196,7 @@ bool twadbbu::Write_ADB_Stream_Header(uint64_t partition_count) {
 	strncpy(twhdr.type, TWSTREAMHDR, sizeof(twhdr.type));
 	twhdr.partition_count = partition_count;
 	twhdr.version = ADB_BACKUP_VERSION;
+	twhdr.set_total_size(total_size);   // restore grand total, u64-LE@44 via lo/hi (see twadbstream.h); 0 = unknown
 	memset(twhdr.space, 0, sizeof(twhdr.space));
 	twhdr.crc = crc32(0L, Z_NULL, 0);
 	twhdr.crc = crc32(twhdr.crc, (const unsigned char*) &twhdr, sizeof(twhdr));
@@ -153,6 +205,7 @@ bool twadbbu::Write_ADB_Stream_Header(uint64_t partition_count) {
 		close(adb_control_bu_fd);
 		return false;
 	}
+	close(adb_control_bu_fd);
 	return true;
 }
 
@@ -217,9 +270,11 @@ bool twadbbu::Write_TWIMG(std::string Backup_FileName, uint64_t file_size) {
 	printf("Sending TWIMG to adb\n");
 	if (write(adb_control_bu_fd, &twimghdr, sizeof(twimghdr)) < 1) {
 		printf("Cannot write to adb control channel: %s\n", strerror(errno));
+		close(adb_control_bu_fd);
 		return false;
 	}
 
+	close(adb_control_bu_fd);
 	return true;
 }
 
@@ -267,6 +322,7 @@ bool twadbbu::Write_TWERROR() {
 	twerror.crc = crc32(twerror.crc, (const unsigned char*) &twerror, sizeof(twerror));
 	if (write(adb_control_bu_fd, &twerror, sizeof(twerror)) < 0) {
 		printf("Cannot write to adb control channel: %s\n", strerror(errno));
+		close(adb_control_bu_fd);
 		return false;
 	}
 	close(adb_control_bu_fd);
@@ -286,6 +342,7 @@ bool twadbbu::Write_TWENDADB() {
 	printf("Sending TWENDADB to ADB Backup\n");
 	if (write(adb_control_bu_fd, &endadb, sizeof(endadb)) < 1) {
 		printf("Cannot write to ADB_CONTROL_BU_FD: %s\n", strerror(errno));
+		close(adb_control_bu_fd);
 		return false;
 	}
 

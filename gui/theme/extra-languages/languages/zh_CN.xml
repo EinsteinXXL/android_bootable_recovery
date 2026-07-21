@@ -184,6 +184,10 @@
 		<string name="part_used">已用: %tw_partition_used%MB</string>
 		<string name="part_free">空闲: %tw_partition_free%MB</string>
 		<string name="part_backup_size">备份大小: %tw_partition_backup_size%MB</string>
+		<string name="part_size_kb">大小: %tw_partition_size%KB</string>
+		<string name="part_used_kb">已用: %tw_partition_used%KB</string>
+		<string name="part_free_kb">空闲: %tw_partition_free%KB</string>
+		<string name="part_backup_size_kb">备份大小: %tw_partition_backup_size%KB</string>
 		<string name="resize_btn">调整文件系统</string>
 		<string name="resize_btn_s">调整</string>
 		<string name="resize_confirm">是否调整 %tw_partition_name%？</string>
@@ -681,7 +685,7 @@
 		<string name="compression_on">压缩选项已开启</string>
 		<string name="digest_off" version="2">Digest 生成已关闭</string>
 		<string name="backup_fail">备份失败</string>
-		<string name="backup_clean">备份失败。正在清理备份文件夹。</string>
+		<string name="backup_error_clean">备份失败。正在清理备份文件夹。</string>
 		<string name="running_recovery_commands">运行 Recovery 命令</string>
 		<string name="recovery_commands_complete">Recovery 命令执行完成</string>
 		<string name="running_ors">运行 OpenRecoveryScript 脚本</string>
@@ -787,5 +791,6 @@
 		<string name="restore_with_pattern1">ROM 中的 图案密码 已启用</string>
 		<string name="restore_with_pattern2">恢复前应该在 ROM 中禁用 图案密码</string>
 		<string name="reboot_after_restore">建议在 Android 首次启动后再重启一次。</string>
+		<string name="verbose_log_chk">Enable verbose log (log all file/folder names)</string>
 	</resources>
 </language>

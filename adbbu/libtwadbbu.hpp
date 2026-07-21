@@ -38,7 +38,7 @@ class twadbbu {
 public:
 	static bool Check_ADB_Backup_File(std::string fname);                                          //Check if file is ADB Backup file
 	static std::vector<std::string> Get_ADB_Backup_Files(std::string fname);                       //List ADB Files in String Vector
-	static bool Write_ADB_Stream_Header(uint64_t partition_count);                                 //Write ADB Stream Header to stream
+	static bool Write_ADB_Stream_Header(uint64_t partition_count, uint64_t total_size);            //Write ADB Stream Header to stream (total_size = sum of the backup estimates, 0 = unknown)
 	static bool Write_ADB_Stream_Trailer();                                                        //Write ADB Stream Trailer to stream
 	static bool Write_TWFN(std::string Backup_FileName, uint64_t file_size, bool use_compression); //Write a tar image to stream
 	static bool Write_TWIMG(std::string Backup_FileName, uint64_t file_size);                      //Write a partition image to stream

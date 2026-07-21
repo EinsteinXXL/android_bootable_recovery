@@ -20,6 +20,7 @@
 		<string name="cache">Cache</string>
 		<string name="data">Data</string>
 		<string name="data_backup">Data (excl. storage)</string>
+		<string name="data_backup_ext">Data (incl. external app data, excl. media)</string>
 		<string name="sdcard">SD card</string>
 		<string name="internal">Internal Storage</string>
 		<string name="microsd">Micro SD card</string>
@@ -133,6 +134,7 @@
 		<string name="swipe_flash">Swipe to confirm Flash</string>
 		<string name="confirm_action">Confirm Action</string>
 		<string name="back_cancel">Press back button to cancel.</string>
+		<string name="back_continue_restore">Press back to continue restore.</string>
 		<string name="cancel_btn">Cancel</string>
 		<string name="wipe_hdr">Wipe</string>
 		<string name="factory_reset_hdr">Factory Reset</string>
@@ -184,6 +186,10 @@
 		<string name="part_used">Used: %tw_partition_used%MB</string>
 		<string name="part_free">Free: %tw_partition_free%MB</string>
 		<string name="part_backup_size">Backup Size: %tw_partition_backup_size%MB</string>
+		<string name="part_size_kb">Size: %tw_partition_size%KB</string>
+		<string name="part_used_kb">Used: %tw_partition_used%KB</string>
+		<string name="part_free_kb">Free: %tw_partition_free%KB</string>
+		<string name="part_backup_size_kb">Backup Size: %tw_partition_backup_size%KB</string>
 		<string name="resize_btn">Resize File System</string>
 		<string name="resize_btn_s">Resize</string>
 		<string name="resize_confirm">Resize %tw_partition_name%?</string>
@@ -223,9 +229,29 @@
 		<string name="storage">Storage:</string>
 		<string name="enc_disabled">disabled - set a password to enable</string>
 		<string name="enc_enabled">enabled</string>
-		<string name="enable_backup_comp_chk">Enable compression</string>
+		<string name="enable_backup_comp_chk">Enable compression (1=fast, 19=smallest)</string>
+		<string name="zstd_level_slider">Compression level: %tw_zstd_level%</string>
 		<string name="skip_digest_backup_chk" version="2">Skip Digest generation during backup</string>
+		<string name="backup_external_app_data_chk">Backup external app data (internal storage)</string>
+		<string name="compress_super_chk">Compress super partition</string>
+		<string name="restore_external_app_data_chk">Restore external app data (internal storage)</string>
+		<string name="counting_external"> * Counting external app data size...</string>
+		<string name="counting_external_done"> * ...done</string>
+		<string name="backup_external_app_data_size">Including {1} MB external app data from internal storage</string>
+		<string name="external_app_data_skip">External app data requested but folder '{1}' not found -- skipping.</string>
+		<string name="removing_external_app_data">Removing previous external app data...</string>
+		<string name="aes_hw">Using BoringSSL AES-256-GCM hardware acceleration</string>
+		<string name="aes_sw">Using BoringSSL ChaCha20-Poly1305 (software AEAD)</string>
+		<string name="aes_hw_comp">Using BoringSSL AES-256-GCM hardware acceleration and compression</string>
+		<string name="aes_sw_comp">Using BoringSSL ChaCha20-Poly1305 (software AEAD) and compression</string>
+		<string name="aes_hw_enc">Using BoringSSL AES-256-GCM hardware acceleration</string>
+		<string name="aes_sw_enc">Using BoringSSL ChaCha20-Poly1305 (software AEAD)</string>
+		<string name="aes_hw_decomp">Using BoringSSL AES-256-GCM hardware acceleration and decompression</string>
+		<string name="aes_sw_decomp">Using BoringSSL ChaCha20-Poly1305 (software AEAD) and decompression</string>
+		<string name="aes_hw_dec">Using BoringSSL AES-256-GCM hardware acceleration</string>
+		<string name="aes_sw_dec">Using BoringSSL ChaCha20-Poly1305 (software AEAD)</string>
 		<string name="disable_backup_space_chk" version="2">Disable free space check before backup</string>
+		<string name="verbose_log_chk">Enable verbose log (log all file/folder names)</string>
 		<string name="skip_digest_zip_chk">Skip Digest check before installing zip</string>
 		<string name="current_boot_slot">Current Slot: %tw_active_slot%</string>
 		<string name="boot_slot_a">Slot A</string>
@@ -554,6 +580,7 @@
 		<string name="current_date">(Current Date)</string>
 		<string name="auto_generate">(Auto Generate)</string>
 		<string name="unable_to_locate_partition">Unable to locate '{1}' partition for backup calculations.</string>
+		<string name="ors_part_not_found">Partition '{1}' not found on this device -- skipping.</string>
 		<string name="no_partition_selected">No partitions selected for backup.</string>
 		<string name="total_partitions_backup"> * Total number of partitions to back up: {1}</string>
 		<string name="total_backup_size"> * Total size of all data: {1}MB</string>
@@ -565,22 +592,24 @@
 		<string name="fail_backup_folder">Failed to make backup folder.</string>
 		<string name="avg_backup_fs">Average backup rate for file systems: {1} MB/sec</string>
 		<string name="avg_backup_img">Average backup rate for imaged drives: {1} MB/sec</string>
+		<string name="avg_restore_rate">Average restore rate: {1} MB/sec</string>
 		<string name="total_backed_size">[{1} MB TOTAL BACKED UP]</string>
 		<string name="backup_completed">[BACKUP COMPLETED IN {1} SECONDS]</string>
 		<string name="restore_started">[RESTORE STARTED]</string>
+		<string name="restore_completed">[RESTORE COMPLETED IN {1} SECONDS]</string>
 		<string name="restore_folder">Restore folder: '{1}'</string>
 		<!-- {1} is the partition display name and {2} is the number of seconds -->
-		<string name="restore_part_done">[{1} done ({2} seconds)]</string>
+		<string name="restore_part_done">[Restore {1} done ({2} seconds)]</string>
 		<string name="verifying_digest" version="2">Verifying Digest</string>
 		<string name="skip_digest" version="2">Skipping Digest check based on user setting.</string>
 		<string name="calc_restore">Calculating restore details...</string>
 		<string name="restore_read_only">Cannot restore {1} -- mounted read only.</string>
 		<string name="restore_unable_locate">Unable to locate '{1}' partition for restoring.</string>
 		<string name="no_part_restore">No partitions selected for restore.</string>
+		<string name="restore_backup_invalid">Backup incomplete or damaged -- restore not possible.</string>
 		<string name="restore_part_count">Restoring {1} partitions...</string>
 		<string name="total_restore_size">Total restore size is {1}MB</string>
 		<string name="updating_system_details">Updating System Details</string>
-		<string name="restore_completed">[RESTORE COMPLETED IN {1} SECONDS]</string>
 		<!-- {1} is the path we could not open, {2} is strerror output -->
 		<string name="error_opening_strerr">Error opening: '{1}' ({2})</string>
 		<string name="unable_locate_part_backup_name">Unable to locate partition by backup name: '{1}'</string>
@@ -649,19 +678,31 @@
 		<string name="wiping_data">Wiping data without wiping /data/media ...</string>
 		<string name="backing_up">Backing up {1}...</string>
 		<string name="backup_storage_warning">Backups of {1} do not include any files in internal storage such as pictures or downloads.</string>
+		<string name="backup_storage_warning_ext">Backups of {1} include external app data but still exclude media such as pictures and downloads.</string>
 		<string name="backing">Backing Up</string>
 		<string name="backup_size">Backup file size for '{1}' is 0 bytes.</string>
 		<string name="datamedia_fs_restore">WARNING: This /data backup was made with {1} file system! The backup may not boot unless you change back to {1}.</string>
 		<string name="restoring">Restoring {1}...</string>
+		<string name="ors_restore">Restore</string>
 		<string name="restoring_hdr">Restoring</string>
 		<string name="recreate_folder_err">Unable to recreate {1} folder.</string>
 		<string name="img_size_err">Size of image is larger than target device</string>
 		<string name="flashing">Flashing {1}...</string>
 		<string name="backup_folder_set">Backup folder set to '{1}'</string>
 		<string name="locate_backup_err">Unable to locate backup '{1}'</string>
-		<string name="set_restore_opt">Setting restore options: '{1}':</string>
+		<string name="set_restore_opt">Setting restore options: '{1}'{2}:</string>
+		<string name="set_restore_opt_all">Setting restore options: all ({1}):</string>
 		<string name="digest_check_skip" version="2">Digest check skip is on</string>
 		<string name="ors_encrypt_restore_err">Unable to use OpenRecoveryScript to restore an encrypted backup.</string>
+		<string name="ors_pw_required">Encryption requested (X) but no password given. Use: backup &lt;options&gt;[ name]:&lt;password&gt;</string>
+		<string name="ors_pw_invalid">Password contains invalid characters -- no spaces or control characters allowed.</string>
+		<string name="ors_pw_no_flag">A password was given but encryption is off. Add 'X' to the options to encrypt.</string>
+		<string name="ors_restore_pw_required">This backup is encrypted and needs a password. Use: restore &lt;folder&gt; &lt;options&gt;:&lt;password&gt;</string>
+		<string name="ors_restore_pw_wrong">Wrong password -- unable to decrypt backup.</string>
+		<string name="ors_pw_not_needed">Backup is not encrypted; the given password is ignored.</string>
+		<string name="ors_invalid_options">Invalid backup options. Use: backup [name] &lt;SDCRBAEOMX&gt;[:password]</string>
+		<string name="ors_restore_part_missing">Partition '{1}' is not in this backup -- skipping.</string>
+		<string name="ors_restore_no_match">None of the requested partitions are in this backup.</string>
 		<string name="mounting">Mounting</string>
 		<string name="unmounting">Unmounting</string>
 		<string name="mounted">Mounted '{1}'</string>
@@ -681,9 +722,12 @@
 		<string name="installing_zip">Installing zip file '{1}'</string>
 		<string name="select_backup_opt">Setting backup options:</string>
 		<string name="compression_on">Compression is on</string>
+		<string name="encryption_on">Encryption is on</string>
 		<string name="digest_off" version="2">Digest Generation is off</string>
-		<string name="backup_fail">Backup Failed</string>
-		<string name="backup_clean">Backup Failed. Cleaning Backup Folder.</string>
+		<string name="backup_fail">[BACKUP FAILED]</string>
+		<string name="backup_fail_status">Backup Failed</string>
+		<string name="backup_error_clean">Backup failed. Cleaning backup folder.</string>
+		<string name="backup_cancel_clean">Backup cancelled! Cleaning backup folder.</string>
 		<string name="running_recovery_commands">Running Recovery Commands</string>
 		<string name="recovery_commands_complete">Recovery Commands Complete</string>
 		<string name="running_ors">Running OpenRecoveryScript</string>
@@ -708,6 +752,8 @@
 		<string name="split_backup">Breaking backup file into multiple archives...</string>
 		<string name="backup_error">Error creating backup.</string>
 		<string name="restore_error">Error during restore process.</string>
+		<string name="restore_fail">[RESTORE FAILED]</string>
+		<string name="restore_fail_status">Restore Failed</string>
 		<string name="split_thread">Splitting thread ID {1} into archive {2}</string>
 		<!-- These 2 items are saved in the data manager instead of resource manager, so %llu, etc is correct instead of {1} -->
 		<string name="file_progress">%llu of %llu files, %i%%</string>
@@ -715,7 +761,41 @@
 		<string name="decrypt_cmd" version="2">Attempting to decrypt data partition or user data via command line.</string>
 		<string name="base_pkg_err">Failed to load base packages.</string>
 		<string name="simulating">Simulating actions...</string>
-		<string name="backup_cancel">Backup Cancelled</string>
+		<string name="backup_cancel">[BACKUP CANCELLED]</string>
+		<string name="backup_cancel_status">Backup Cancelled</string>
+		<!-- Phase 5a/5b (Restore_Konzept.md Sec. 9.2): Multi-Pipe-Restore-Status -->
+		<string name="restore_cancel">[RESTORE CANCELLED]</string>
+		<string name="restore_cancel_status">Restore Cancelled</string>
+		<string name="cancel_restore_hdr">Cancel Restore?</string>
+		<string name="cancel_restore_warning">Warning: Cancelling will leave the restore incomplete and may cause corrupt data!</string>
+		<string name="cancel_restore_warning_l1">Warning: Cancelling will leave</string>
+		<string name="cancel_restore_warning_l2">the restore incomplete and</string>
+		<string name="cancel_restore_warning_l3">may cause corrupt data!</string>
+		<string name="cancel_restore_info">Only cancel if you are aware of the consequences.</string>
+		<string name="swipe_cancel_restore">Swipe to Cancel Restore</string>
+		<!-- Restore-Cancel-Sperre bei RAW-Partitionen (Restore_Image / dd) -->
+		<string name="restore_cancel_blocked">Cancel blocked: RAW partition in progress -- aborting would damage the device.</string>
+		<string name="restore_cancel_blocked_hdr">Cancel not allowed</string>
+		<string name="restore_cancel_blocked_warning">Cancel is locked while a RAW partition is being restored.</string>
+		<string name="restore_cancel_blocked_warning_l1">Cancel is locked while</string>
+		<string name="restore_cancel_blocked_warning_l2">a RAW partition is</string>
+		<string name="restore_cancel_blocked_warning_l3">being restored.</string>
+		<string name="restore_cancel_blocked_info1">Aborting a raw (dd) flash mid-write would leave the partition half-written and softbrick the device.</string>
+		<string name="restore_cancel_blocked_info2">Cancel becomes available again as soon as a filesystem partition (e.g. /data) is being restored.</string>
+		<string name="restore_cancel_blocked_info1_l1">Aborting a raw (dd) flash mid-write would leave</string>
+		<string name="restore_cancel_blocked_info1_l2">the partition half-written and softbrick the device.</string>
+		<string name="restore_cancel_blocked_info2_l1">Cancel becomes available again as soon as</string>
+		<string name="restore_cancel_blocked_info2_l2">a filesystem partition (e.g. /data) is being restored.</string>
+		<string name="restore_pipe_done">Pipe {1} finished ({2} archives)</string>
+		<!-- Legacy-Restore (Original-TWRP-Backups, Single-Pipe) -->
+		<string name="restore_legacy_detected">Legacy backup detected! Restoring in single pipe mode.</string>
+		<string name="restore_openaes_rejected">This backup is encrypted with OpenAES and is no longer supported. OpenAES was removed from TWRP v3.7+ by the core developers.</string>
+		<string name="restore_data_info_missing">Backup incomplete: The data.info file is missing or incomplete (e.g. the entry directory_first_processing=1 is missing).</string>
+		<string name="restore_unknown_format">The backup for the {1} partition has an unrecognized format. Its header could not be read.</string>
+		<string name="restore_unknown_segment">Backup segment has an unknown format -- header not recognized.</string>
+		<string name="restore_preflight_hdr">Backup cannot be restored</string>
+		<string name="restore_invalid_dfp_size">The backup of partition {1} is corrupted. The required backup size header (TWRP.backup_size) is missing.</string>
+		<string name="restore_invalid_legacy_info">The required "{1}" file is missing from the selected backup for the "{2}" partition.</string>
 		<string name="config_twrp">Configuring TWRP...</string>
 		<string name="config_twrp_err">Unable to configure TWRP with this kernel.</string>
 		<string name="copy_log">Copied recovery log to {1}.</string>
@@ -793,5 +873,16 @@
 		<string name="restore_with_pattern1">Pattern is enabled</string>
 		<string name="restore_with_pattern2">Pattern should be disabled before restore</string>
 		<string name="reboot_after_restore">It is recommended to reboot Android once after first boot.</string>
+		<string name="adbbu_preparing">Preparing ADB backup mode...</string>
+		<string name="adbbu_ready">ADB backup mode ready. On the PC you can now run your backup or restore as usual with 'adb backup/restore'.</string>
+		<string name="adbbu_idle_hint">If no backup/restore follows, this mode turns off automatically after {1} minutes.</string>
+		<string name="adbbu_stopped">ADB backup mode stopped. Default ADB was restored.</string>
+		<string name="adbbu_stopped_timeout">ADB backup mode was stopped after timeout ({1} min). Default ADB was restored.</string>
+		<string name="adbbu_cancel_mode">Cancelling ADB backup mode...</string>
+		<string name="adbbu_stock_refused">Direct 'adb backup/restore' is disabled here: stock adbd uses a freeze-prone PTY. On the PC run:  adb shell adbbu start  then retry your backup/restore.</string>
+		<string name="adbbu_read_ab_hdr">Reading Backup</string>
+		<string name="adbbu_read_ab">Reading ADB backup file. Please wait...</string>
+		<string name="adbbu_read_ab_done">...Done.</string>
+		<string name="adbbu_invalid_ab">Unable to read the ADB backup header of '{1}'. The backup file is corrupt.</string>
 	</resources>
 </language>

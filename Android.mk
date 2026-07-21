@@ -58,9 +58,12 @@ LOCAL_SRC_FILES := \
     twrp.cpp \
     fixContexts.cpp \
     twrpTar.cpp \
+    pipe_operation.cpp \
+    twrp_affinity.cpp \
     exclude.cpp \
     find_file.cpp \
     infomanager.cpp \
+    backupheadermanager.cpp \
     data.cpp \
     partition.cpp \
     partitionmanager.cpp \
@@ -101,6 +104,12 @@ RECOVERY_API_VERSION := 3
 RECOVERY_FSTAB_VERSION := 2
 LOCAL_CFLAGS += -DRECOVERY_API_VERSION=$(RECOVERY_API_VERSION)
 LOCAL_CFLAGS += -Wno-unused-parameter -Wno-unused-function
+# Demo mode -- restore writes into the consolidated folder /data/TestRestore/<partition>/
+# instead of overwriting real partitions (file restore via Restore_Tar, dd images via
+# Restore_Image_Test). Root is /data/TestRestore (top-level /data), NOT /data/media/... --
+# only there are the per-dir fscrypt policies settable on a file restore. Wipe/removeDir/
+# capability actions are skipped; NO path ever writes to the real block device.
+LOCAL_CFLAGS += -DTWRP_RESTORE_DEMO_MODE=1
 LOCAL_CLANG := true
 
 LOCAL_C_INCLUDES += \
@@ -128,6 +137,12 @@ LOCAL_C_INCLUDES += \
     $(LOCAL_PATH)/twinstall/include
 
 LOCAL_STATIC_LIBRARIES += libguitwrp
+# zstd decode (in-process) for the self-describing-backup ead peek (P3). Static lib
+# -> links into the recovery binary (no .so -> no ramdisk-restage trap as with
+# libtar). Lazy inclusion: 0 contribution to the binary until P3 code references
+# ZSTD_decompressStream. Include via $(LOCAL_PATH)/zstd/lib (zstd.h).
+LOCAL_STATIC_LIBRARIES += libzstddec_twrp
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/zstd/lib
 LOCAL_SHARED_LIBRARIES += libz libc libcutils libstdc++ libtar libblkid libminuitwrp libmtdutils libtwadbbu 
 LOCAL_SHARED_LIBRARIES += libbootloader_message libcrecovery libtwrpdigest libc++ libaosprecovery libcrypto libbase 
 LOCAL_SHARED_LIBRARIES += libziparchive libselinux libdl_android.bootstrap
@@ -178,6 +193,10 @@ endif
 
 ifeq ($(TW_PREPARE_DATA_MEDIA_EARLY),true)
     LOCAL_CFLAGS += -DTW_PREPARE_DATA_MEDIA_EARLY
+endif
+
+ifeq ($(TW_ENABLE_FS_COMPRESSION),true)
+    LOCAL_CFLAGS += -DTW_ENABLE_FS_COMPRESSION
 endif
 
 LOCAL_MODULE_PATH := $(TARGET_RECOVERY_ROOT_OUT)/system/bin
@@ -359,9 +378,10 @@ endif
 ifneq ($(TW_CUSTOM_CPU_TEMP_PATH),)
 	LOCAL_CFLAGS += -DTW_CUSTOM_CPU_TEMP_PATH=$(TW_CUSTOM_CPU_TEMP_PATH)
 endif
-ifneq ($(TW_EXCLUDE_ENCRYPTED_BACKUPS),)
-    LOCAL_SHARED_LIBRARIES += libopenaes
-else
+# TW_EXCLUDE_ENCRYPTED_BACKUPS := true  -> exclude backup encryption (BoringSSL
+# tw_bssl_aes) entirely. Empty/false/any other value -> crypto ON (default). OpenAES
+# has been removed; BoringSSL (libcrypto) is linked above anyway.
+ifeq ($(TW_EXCLUDE_ENCRYPTED_BACKUPS), true)
     LOCAL_CFLAGS += -DTW_EXCLUDE_ENCRYPTED_BACKUPS
 endif
 ifeq ($(TARGET_RECOVERY_QCOM_RTC_FIX),)
@@ -383,6 +403,58 @@ ifneq ($(TARGET_RECOVERY_INITRC),)
     TW_EXCLUDE_DEFAULT_USB_INIT := true
 endif
 LOCAL_CFLAGS += -DTW_USE_NEW_MINADBD
+
+# --- TWRP CPU affinity (multi-pipe backup) -----------------------------------
+# Bool flag TW_USE_CPU_AFFINITY: compile-time eval via a makefile filter. Whitelist
+# true/1/yes/on (case-insensitive) -> -DFLAG=1; whitelist false/0/no/off -> no define
+# (= disabled); an unknown value -> build warning + no define (= off, same default
+# semantics but visible instead of silent).
+ifneq ($(TW_USE_CPU_AFFINITY),)
+    _tw_use_cpu_affinity_lc := $(shell echo "$(TW_USE_CPU_AFFINITY)" | tr '[:upper:]' '[:lower:]')
+    ifneq ($(filter true 1 yes on,$(_tw_use_cpu_affinity_lc)),)
+        LOCAL_CFLAGS += -DTW_USE_CPU_AFFINITY=1
+    else
+        ifeq ($(filter false 0 no off,$(_tw_use_cpu_affinity_lc)),)
+            $(warning TW_USE_CPU_AFFINITY="$(TW_USE_CPU_AFFINITY)" not recognized (expected true/1/yes/on or false/0/no/off) -- treated as false)
+        endif
+    endif
+endif
+ifneq ($(TW_SET_MAX_PIPES),)
+    LOCAL_CFLAGS += -DTW_SET_MAX_PIPES=$(TW_SET_MAX_PIPES)
+endif
+# Unified MAX thread budget for zstd (-T) AND pigz (-p). Set (>=1) -> a budget
+# counter in compute_compressor_threads (= budget/active) caps -T (1 pipe -> -T<MAX>,
+# MAX pipes -> -T1), not a fixed value. := 0 -> all physical cores (nproc, = zstd
+# -T0 semantics: 1 pipe -> -Tnproc, N pipes -> nproc/N).
+# Unset -> budget = MAX_PIPES (nproc/2 class, leaves headroom for AES + workers).
+ifneq ($(TW_MAX_COMPRESSOR_THREADS),)
+    LOCAL_CFLAGS += -DTW_MAX_COMPRESSOR_THREADS=$(TW_MAX_COMPRESSOR_THREADS)
+endif
+# Affinity lists (comma or range syntax, -1 = no-pin per slot):
+ifneq ($(TW_AFFINITY_TAR_WORKER_CORES),)
+    LOCAL_CFLAGS += -DTW_AFFINITY_TAR_WORKER_CORES=\"$(TW_AFFINITY_TAR_WORKER_CORES)\"
+endif
+ifneq ($(TW_AFFINITY_ZSTD_CORES),)
+    LOCAL_CFLAGS += -DTW_AFFINITY_ZSTD_CORES=\"$(TW_AFFINITY_ZSTD_CORES)\"
+endif
+ifneq ($(TW_AFFINITY_ENC_CORES),)
+    LOCAL_CFLAGS += -DTW_AFFINITY_ENC_CORES=\"$(TW_AFFINITY_ENC_CORES)\"
+endif
+ifneq ($(TW_AFFINITY_COMP_ENC_CORES),)
+    LOCAL_CFLAGS += -DTW_AFFINITY_COMP_ENC_CORES=\"$(TW_AFFINITY_COMP_ENC_CORES)\"
+endif
+# Single-core pinnings:
+ifneq ($(TW_AFFINITY_GUI_PERFORMANCE),)
+    LOCAL_CFLAGS += -DTW_AFFINITY_GUI_PERFORMANCE=$(TW_AFFINITY_GUI_PERFORMANCE)
+endif
+ifneq ($(TW_AFFINITY_GUI_EFFICIENCY),)
+    LOCAL_CFLAGS += -DTW_AFFINITY_GUI_EFFICIENCY=$(TW_AFFINITY_GUI_EFFICIENCY)
+endif
+ifneq ($(TW_AFFINITY_MTP_CORE),)
+    LOCAL_CFLAGS += -DTW_AFFINITY_MTP_CORE=$(TW_AFFINITY_MTP_CORE)
+endif
+# -----------------------------------------------------------------------------
+
 ifneq ($(TW_DEFAULT_LANGUAGE),)
     LOCAL_CFLAGS += -DTW_DEFAULT_LANGUAGE=$(TW_DEFAULT_LANGUAGE)
 else
@@ -418,6 +490,9 @@ endif
 ifeq ($(TW_INCLUDE_FASTBOOTD), true)
     LOCAL_CFLAGS += -DTW_INCLUDE_FASTBOOTD
 endif
+ifeq ($(TW_ENABLE_BLKDISCARD), true)
+    LOCAL_CFLAGS += -DTW_ENABLE_BLKDISCARD
+endif
 
 LOCAL_C_INCLUDES += system/vold \
 
@@ -432,6 +507,7 @@ TWRP_REQUIRED_MODULES += \
     flash_image \
     mke2fs.conf \
     pigz \
+    zstd \
     teamwin \
     twrp \
     fsck.fat \
@@ -451,6 +527,8 @@ TWRP_REQUIRED_MODULES += \
     vendor_hwservice_contexts \
     minadbd \
     twrpbu \
+    twadbd \
+    adbbu \
     adbd_system_api_recovery \
     me.twrp.twrpapp.apk \
     privapp-permissions-twrpapp.xml \
@@ -520,8 +598,8 @@ endif
 ifeq ($(BOARD_HAS_NO_REAL_SDCARD),)
     TWRP_REQUIRED_MODULES += sgdisk
 endif
-ifneq ($(TW_EXCLUDE_ENCRYPTED_BACKUPS),)
-    TWRP_REQUIRED_MODULES += openaes openaes_license
+ifneq ($(TW_EXCLUDE_ENCRYPTED_BACKUPS), true)
+    TWRP_REQUIRED_MODULES += tw_bssl_aes
 endif
 ifeq ($(TW_INCLUDE_DUMLOCK), true)
     TWRP_REQUIRED_MODULES += \
@@ -675,10 +753,11 @@ include $(commands_TWRP_local_path)/injecttwrp/Android.mk \
     $(commands_TWRP_local_path)/mtdutils/Android.mk \
     $(commands_TWRP_local_path)/flashutils/Android.mk \
     $(commands_TWRP_local_path)/pigz/Android.mk \
+    $(commands_TWRP_local_path)/zstd/Android.mk \
     $(commands_TWRP_local_path)/libtar/Android.mk \
     $(commands_TWRP_local_path)/libcrecovery/Android.mk \
     $(commands_TWRP_local_path)/libblkid/Android.mk \
-    $(commands_TWRP_local_path)/openaes/Android.mk \
+    $(commands_TWRP_local_path)/tw_bssl_aes/Android.mk \
     $(commands_TWRP_local_path)/twrpTarMain/Android.mk \
     $(commands_TWRP_local_path)/minzip/Android.mk \
     $(commands_TWRP_local_path)/dosfstools/Android.mk \
@@ -686,7 +765,9 @@ include $(commands_TWRP_local_path)/injecttwrp/Android.mk \
     $(commands_TWRP_local_path)/simg2img/Android.mk \
     $(commands_TWRP_local_path)/adbbu/Android.mk \
     $(commands_TWRP_local_path)/twrpDigest/Android.mk \
-    $(commands_TWRP_local_path)/attr/Android.mk
+    $(commands_TWRP_local_path)/attr/Android.mk \
+    $(commands_TWRP_local_path)/hash_files/Android.mk \
+    $(commands_TWRP_local_path)/fscrypt_policy/Android.mk
 
 ifneq ($(TW_OZIP_DECRYPT_KEY),)
     TWRP_REQUIRED_MODULES += ozip_decrypt

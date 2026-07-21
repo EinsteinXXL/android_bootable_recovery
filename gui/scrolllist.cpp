@@ -166,6 +166,10 @@ void GUIScrollList::SetVisibleListLocation(size_t list_index)
 	// This will make sure that the item indicated by list_index is visible on the screen
 	size_t lines = GetDisplayItemCount();
 
+	// Remember the position beforehand -> below, mark dirty only if it changes.
+	int prevFirstDisplayedItem = firstDisplayedItem;
+	int prevYoffset = y_offset;
+
 	if (list_index <= (unsigned)firstDisplayedItem) {
 		// list_index is above the currently displayed items, put the selected item at the very top
 		firstDisplayedItem = list_index;
@@ -184,8 +188,16 @@ void GUIScrollList::SetVisibleListLocation(size_t list_index)
 		if (firstDisplayedItem < 0)
 			firstDisplayedItem = 0;
 	}
-	scrollingSpeed = 0; // stop kinetic scrolling on setting visible location
-	mUpdate = 1;
+	// Only redraw when the visible position actually changed. Fixes the console
+	// self-render loop: scrollToEnd calls this every frame with the already-visible
+	// last line -> previously mUpdate=1 without any change -> the whole console
+	// re-rendered every frame. Applies universally to all lists/menus. Also: reset
+	// scrollingSpeed (stop kinetics) only on a real change, so a SetVisibleListLocation
+	// with an identical position does not choke an ongoing kinetic scroll.
+	if (firstDisplayedItem != prevFirstDisplayedItem || y_offset != prevYoffset) {
+		scrollingSpeed = 0; // stop kinetic scrolling on (real) location change
+		mUpdate = 1;
+	}
 }
 
 int GUIScrollList::Render(void)
@@ -198,7 +210,11 @@ int GUIScrollList::Render(void)
 	gr_fill(mRenderX, mRenderY + mHeaderH, mRenderW, mRenderH - mHeaderH);
 
 	// don't paint outside of the box
-	gr_clip(mRenderX, mRenderY, mRenderW, mRenderH);
+	// intersect instead of gr_clip -- in the region-render path this respects the
+	// page's region scissor (no escape: the list paints only the intersection
+	// region∩bounds; under an overlay the dimming outside the region stays intact).
+	// In the full render (no active clip) identical to the previous gr_clip.
+	gr_clip_intersect(mRenderX, mRenderY, mRenderW, mRenderH);
 
 	// Next, render the background resource (if it exists)
 	if (mBackground && mBackground->GetResource())
@@ -276,7 +292,10 @@ int GUIScrollList::Render(void)
 	}
 
 	// reset clipping
-	gr_noclip();
+	// restore instead of gr_noclip -- restores a possibly active region scissor so
+	// the FastScroll renderer below stays clipped in the region path too. In the full
+	// render == gr_noclip.
+	gr_clip_restore();
 
 	// render fast scroll
 	if (hasScroll) {

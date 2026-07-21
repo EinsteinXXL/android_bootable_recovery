@@ -19,15 +19,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 
 #include <sys/mount.h>
 #include <sys/param.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/vfs.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <fcntl.h>
+#include <time.h>
 #include <iostream>
 #include <libgen.h>
 #include <zlib.h>
@@ -44,11 +48,15 @@
 #include "data.hpp"
 #include "twrp-functions.hpp"
 #include "twrpTar.hpp"
+#include "twrp_affinity.hpp"
 #include "exclude.hpp"
 #include "infomanager.hpp"
+#include "backupheadermanager.hpp"
 #include "set_metadata.h"
 #include "gui/gui.hpp"
 #include "adbbu/libtwadbbu.hpp"
+#include "twrpDigest/twrpDigest.hpp"
+#include "twrpDigest/twrpSHA.hpp"
 #ifdef TW_INCLUDE_CRYPTO
 	#include "crypto/fde/cryptfs.h"
 	#include "Decrypt.h"
@@ -68,6 +76,10 @@ extern "C" {
 }
 #include <selinux/selinux.h>
 #include <selinux/label.h>
+#include <sys/auxv.h>
+#ifndef HWCAP_AES
+#define HWCAP_AES (1 << 3)
+#endif
 #ifdef HAVE_CAPABILITIES
 #include <sys/capability.h>
 #include <sys/xattr.h>
@@ -165,6 +177,7 @@ enum TW_FSTAB_FLAGS {
 	TWFLAG_WRAPPEDKEY,
 	TWFLAG_ADOPTED_MOUNT_DELAY,
 	TWFLAG_DM_USE_ORIGINAL_PATH,
+	TWFLAG_FS_COMPRESS,
 	TWFLAG_LOGICAL,
 };
 
@@ -214,6 +227,7 @@ const struct flag_list tw_flags[] = {
 	{ "wrappedkey",             TWFLAG_WRAPPEDKEY },
 	{ "adopted_mount_delay=",   TWFLAG_ADOPTED_MOUNT_DELAY },
 	{ "dm_use_original_path",   TWFLAG_DM_USE_ORIGINAL_PATH },
+	{ "fscompress",             TWFLAG_FS_COMPRESS },
 	{ "logical",                TWFLAG_LOGICAL },
 	{ 0,                        0 },
 };
@@ -244,6 +258,7 @@ TWPartition::TWPartition() {
 	Used = 0;
 	Free = 0;
 	Backup_Size = 0;
+	Restore_Size = 0;   // close a latent uninit: loop 1 (Get_Restore_Size) sets it before Restore_Tar; the 0-init makes the cache guard in Restore_Tar watertight
 	Can_Be_Encrypted = false;
 	Is_Encrypted = false;
 	Is_Decrypted = false;
@@ -282,6 +297,7 @@ TWPartition::TWPartition() {
 	Adopted_Mount_Delay = 0;
 	Original_Path = "";
 	Use_Original_Path = false;
+	Needs_Fs_Compress = false;
 }
 
 TWPartition::~TWPartition(void) {
@@ -536,6 +552,18 @@ bool TWPartition::Process_Fstab_Line(const char *fstab_line, bool Display_Error,
 			Display_Name = "Vendor";
 			Backup_Display_Name = Display_Name;
 			Storage_Name = Display_Name;
+		} else if (Mount_Point == "/metadata") {
+			Display_Name = "Metadata";
+			Backup_Display_Name = Display_Name;
+			Storage_Name = Display_Name;
+		} else if (Mount_Point == "/odm_dlkm") {
+			Display_Name = "ODM DLKM";
+			Backup_Display_Name = Display_Name;
+			Storage_Name = Display_Name;
+		} else if (Mount_Point == "/vendor_dlkm") {
+			Display_Name = "Vendor DLKM";
+			Backup_Display_Name = Display_Name;
+			Storage_Name = Display_Name;
 		}
 #ifdef TW_EXTERNAL_STORAGE_PATH
 		if (Mount_Point == EXPAND(TW_EXTERNAL_STORAGE_PATH)) {
@@ -569,6 +597,11 @@ bool TWPartition::Process_Fstab_Line(const char *fstab_line, bool Display_Error,
 		Setup_Image();
 		if (Mount_Point == "/boot") {
 			Display_Name = "Boot";
+			Backup_Display_Name = Display_Name;
+			Can_Be_Backed_Up = true;
+			Can_Flash_Img = true;
+		} else if (Mount_Point == "/init_boot") {
+			Display_Name = "Init Boot";
 			Backup_Display_Name = Display_Name;
 			Can_Be_Backed_Up = true;
 			Can_Flash_Img = true;
@@ -770,6 +803,7 @@ bool TWPartition::Decrypt_FBE_DE() {
 	ExcludeAll(Mount_Point + "/system/gatekeeper.pattern.key");
 	ExcludeAll(Mount_Point + "/system/locksettings.db");
 	ExcludeAll(Mount_Point + "/system/locksettings.db-wal");
+	ExcludeAll(Mount_Point + "/system/locksettings.db-shm");
 	ExcludeAll(Mount_Point + "/misc/gatekeeper");
 	ExcludeAll(Mount_Point + "/misc/keystore");
 	ExcludeAll(Mount_Point + "/drm/kek.dat");
@@ -804,6 +838,7 @@ bool TWPartition::Decrypt_FBE_DE() {
 				ExcludeAll(Mount_Point + "/system/users/" + (*iter).userId + "/gatekeeper.pattern.key");
 				ExcludeAll(Mount_Point + "/system/users/" + (*iter).userId + "/locksettings.db");
 				ExcludeAll(Mount_Point + "/system/users/" + (*iter).userId + "/locksettings.db-wal");
+				ExcludeAll(Mount_Point + "/system/users/" + (*iter).userId + "/locksettings.db-shm");
 			}
 		}
 		DataManager::SetValue(TW_CRYPTO_PWTYPE, pwd_type);
@@ -1052,6 +1087,14 @@ void TWPartition::Apply_TW_Flag(const unsigned flag, const char* str, const bool
 		case TWFLAG_LOGICAL:
 			Is_Super = true;
 			break;
+		case TWFLAG_FS_COMPRESS:
+			#ifdef TW_ENABLE_FS_COMPRESSION
+				Needs_Fs_Compress = true;
+				LOGINFO("Enabling 'fs compression'\n");
+			#else
+				LOGINFO("Ignoring the 'fscompress' fstab flag\n");
+			#endif
+			break;
 		default:
 			// Should not get here
 			LOGINFO("Flag identified for processing, but later unmatched: %i\n", flag);
@@ -1247,6 +1290,9 @@ void TWPartition::Setup_Data_Media() {
 			Storage_Path = Mount_Point + "/media/0";
 			Symlink_Path = Storage_Path;
 			DataManager::SetValue(TW_INTERNAL_PATH, Mount_Point + "/media/0");
+			#ifndef TW_INCLUDE_CRYPTO
+				DataManager::SetValue("tw_settings_path", TW_STORAGE_PATH);
+			#endif
 			UnMount(true);
 		}
 		DataManager::SetValue("tw_has_internal", 1);
@@ -1257,6 +1303,8 @@ void TWPartition::Setup_Data_Media() {
 		backup_exclusions.add_absolute_dir("/data/cache");
         backup_exclusions.add_absolute_dir("/data/misc/apexdata/com.android.art"); // exclude this dir to prevent "error 255" on AOSP Android 12
 		backup_exclusions.add_absolute_dir("/data/extm"); //exclude this dir to prevent "error 255" on MIUI
+		backup_exclusions.add_absolute_dir("/data/gsi"); // Contains huge files (DSU System image + Userdata image), and won't work after restoration (requires configuration files in metadata)
+		backup_exclusions.add_absolute_dir("/data/adb/ksu/modules.img"); //After ksu 0.8.x the modules.img file became 1tb, which is inhibiting the execution of backups
 		wipe_exclusions.add_absolute_dir(Mount_Point + "/misc/vold"); // adopted storage keys
 		ExcludeAll(Mount_Point + "/system/storage.xml");
 
@@ -1291,6 +1339,18 @@ void TWPartition::Setup_Data_Media() {
 		}
 	}
 	ExcludeAll(Mount_Point + "/media");
+	// The inclusion of /data/media/0/Android is not set here. The decision is
+	// made per backup run by TWPartitionManager::Sync_Backup_Inclusions() — so
+	// toggling the checkbox takes effect immediately, without a TWRP reboot.
+}
+
+void TWPartition::Refresh_External_App_Data_Inclusion(bool include) {
+	backup_exclusions.Clear_External_App_Data_Inclusion();
+	if (!include)
+		return;
+	string p = Mount_Point + "/media/0/Android";
+	if (TWFunc::Path_Exists(p))
+		backup_exclusions.Add_External_App_Data_Inclusion(p);
 }
 
 void TWPartition::Find_Real_Block_Device(string& Block, bool Display_Error) {
@@ -1521,8 +1581,21 @@ bool TWPartition::Is_Mounted(void) {
 	if (stat(test_path.c_str(), &st2) != 0)  return false;
 
 	// Compare the device IDs -- if they match then we're (probably) using tmpfs instead of an actual device
-	int ret = (st1.st_dev != st2.st_dev) ? true : false;
-	return ret;
+	if (st1.st_dev != st2.st_dev)
+		return true;
+
+	// Fallback (adapted from cherry-pick 17061196): a partition reachable via a symlink
+	// mount point (e.g. /data via /sdcard) may be mounted even when the device-id check
+	// above is inconclusive. Scanned only here, not in the common path, to avoid reading
+	// /proc/mounts on every Is_Mounted() call.
+	if (!Symlink_Mount_Point.empty()) {
+		scan_mounted_volumes();
+		const MountedVolume* sml = find_mounted_volume_by_mount_point(Symlink_Mount_Point.c_str());
+		if (sml != nullptr)
+			return true;
+	}
+
+	return false;
 }
 
 bool TWPartition::Is_File_System_Writable(void) {
@@ -1738,6 +1811,13 @@ bool TWPartition::ReMount_RW(bool Display_Error) {
 	return ret;
 }
 
+bool TWPartition::BlkDiscard() {
+	string cmd;
+	LOGINFO("Perform BLKDISCARD on block device %s\n", Actual_Block_Device.c_str());
+	cmd = "/system/bin/toybox blkdiscard " + Actual_Block_Device;
+	return (TWFunc::Exec_Cmd(cmd) == 0);
+}
+
 bool TWPartition::Wipe(string New_File_System) {
 	bool wiped = false, update_crypt = false, recreate_media = true;
 	int check;
@@ -1930,7 +2010,7 @@ bool TWPartition::Repair() {
 			return false;
 		gui_msg(Msg("repairing_using=Repairing {1} using {2}...")(Display_Name)("fsck.f2fs"));
 		Find_Actual_Block_Device();
-		command = "/system/bin/fsck.f2fs " + Actual_Block_Device;
+		command = "/system/bin/fsck.f2fs -a " + Actual_Block_Device;
 		LOGINFO("Repair command: %s\n", command.c_str());
 		if (TWFunc::Exec_Cmd(command) == 0) {
 			gui_msg("done=Done.");
@@ -2029,7 +2109,7 @@ bool TWPartition::Resize() {
 	return false;
 }
 
-bool TWPartition::Backup(PartitionSettings *part_settings, pid_t *tar_fork_pid) {
+bool TWPartition::Backup(PartitionSettings *part_settings, std::atomic<pid_t> *tar_fork_pid) {
 	if (Backup_Method == BM_FILES)
 		return Backup_Tar(part_settings, tar_fork_pid);
 	else if (Backup_Method == BM_DD)
@@ -2486,6 +2566,9 @@ bool TWPartition::Wipe_F2FS() {
 	if(needs_casefold)
 		f2fs_command += " -O casefold -C utf8";
 
+	if (Needs_Fs_Compress)
+		f2fs_command += " -O compression,extra_attr";
+
 	f2fs_command += " " + Actual_Block_Device + " " + dev_sz_str;
 
 	if (TWFunc::Path_Exists("/system/bin/sload_f2fs")) {
@@ -2642,12 +2725,34 @@ void TWPartition::Wipe_Crypto_Key() {
 	}
 }
 
-bool TWPartition::Backup_Tar(PartitionSettings *part_settings, pid_t *tar_fork_pid) {
+bool TWPartition::Backup_Tar(PartitionSettings *part_settings, std::atomic<pid_t> *tar_fork_pid) {
 	string Full_FileName;
 	twrpTar tar;
 
 	if (!Mount(true))
 		return false;
+
+	// The empty-password guard MUST come before GUI_Operation_Text + the
+	// "backing_up" gui_msg. Otherwise the user first sees "Backing up X..." and
+	// then the abort error — confusing, and it writes a phantom backup line to
+	// the log. Defense in depth: PBKDF2(empty, salt) yields a key derivable from
+	// the salt alone — semantically unsafe, so the GUI layer should prevent it too.
+#ifndef TW_EXCLUDE_ENCRYPTED_BACKUPS
+	string Password;
+	if (Can_Encrypt_Backup) {
+		DataManager::GetValue("tw_encrypt_backup", tar.use_encryption);
+		if (tar.use_encryption) {
+			DataManager::GetValue("tw_backup_password", Password);
+			if (Password.empty()) {
+				LOGERR("Backup_Tar: encryption requested but password is empty -- aborting backup.\n");
+				gui_print_color("error", "Encryption is enabled but the backup password is empty -- backup aborted.\n");
+				return false;
+			}
+		} else {
+			tar.use_encryption = 0;
+		}
+	}
+#endif
 
 	TWFunc::GUI_Operation_Text(TW_BACKUP_TEXT, Backup_Display_Name, gui_parse_text("{@backing}"));
 	gui_msg(Msg("backing_up=Backing up {1}...")(Backup_Display_Name));
@@ -2655,24 +2760,24 @@ bool TWPartition::Backup_Tar(PartitionSettings *part_settings, pid_t *tar_fork_p
 	DataManager::GetValue(TW_USE_COMPRESSION_VAR, tar.use_compression);
 
 #ifndef TW_EXCLUDE_ENCRYPTED_BACKUPS
-	if (Can_Encrypt_Backup) {
-		DataManager::GetValue("tw_encrypt_backup", tar.use_encryption);
-		if (tar.use_encryption) {
-			if (Use_Userdata_Encryption)
-				tar.userdata_encryption = tar.use_encryption;
-			string Password;
-			DataManager::GetValue("tw_backup_password", Password);
-			tar.setpassword(Password);
-		} else {
-			tar.use_encryption = 0;
-		}
+	if (Can_Encrypt_Backup && tar.use_encryption) {
+		if (Use_Userdata_Encryption)
+			tar.userdata_encryption = tar.use_encryption;
+		tar.setpassword(Password);
 	}
 #endif
 
 	Backup_FileName = Backup_Name + "." + Current_File_System + ".win";
 	Full_FileName = part_settings->Backup_Folder + "/" + Backup_FileName;
-	if (Has_Data_Media)
-		gui_msg(Msg(msg::kWarning, "backup_storage_warning=Backups of {1} do not include any files in internal storage such as pictures or downloads.")(Display_Name));
+	if (Has_Data_Media) {
+		// When external app data (/data/media/0/Android) is included, the blanket
+		// "no internal storage" warning is wrong — external app data physically
+		// lives in internal storage; use the more precise _ext variant then.
+		if (Mount_Point == "/data" && part_settings->external_app_data_included)
+			gui_msg(Msg(msg::kWarning, "backup_storage_warning_ext=Backups of {1} include external app data but still exclude media such as pictures and downloads.")(Display_Name));
+		else
+			gui_msg(Msg(msg::kWarning, "backup_storage_warning=Backups of {1} do not include any files in internal storage such as pictures or downloads.")(Display_Name));
+	}
 	if (Mount_Point == "/data" && DataManager::GetIntValue(TW_IS_FBE)) {
 		std::vector<users_struct>::iterator iter;
 		std::vector<users_struct>* userList = PartitionManager.Get_Users_List();
@@ -2696,6 +2801,11 @@ bool TWPartition::Backup_Tar(PartitionSettings *part_settings, pid_t *tar_fork_p
 	tar.setsize(Backup_Size);
 	tar.partition_name = Backup_Name;
 	tar.backup_folder = part_settings->Backup_Folder;
+	if (Mount_Point == "/data" && DataManager::GetIntValue("tw_backup_external_app_data") == 1) {
+		unsigned long long ext_mb = part_settings->external_app_data_size;
+		if (ext_mb > 0)
+			gui_msg(Msg("backup_external_app_data_size=Including {1} MB external app data from internal storage")(ext_mb));
+		}
 	if (tar.createTarFork(tar_fork_pid) != 0)
 		return false;
 	return true;
@@ -2711,19 +2821,36 @@ bool TWPartition::Backup_Image(PartitionSettings *part_settings) {
 
 	if (part_settings->adbbackup) {
 		Full_FileName = TW_ADB_BACKUP;
-		adb_file_name  = part_settings->Backup_Folder + "/" + Backup_FileName;
+		// Only the filename in the TWIMG header: the former Backup_Folder prefix
+		// was a fictional local path that never exists for an adb stream (mirror
+		// of the Write_TWFN fix in twrpTar.cpp; restore sides use only the
+		// basename anyway).
+		adb_file_name  = Backup_FileName;
 	}
 	else
 		Full_FileName = part_settings->Backup_Folder + "/" + Backup_FileName;
 
-	part_settings->total_restore_size = Backup_Size;
+	// Per-partition size for the progress bar (Raw_Read_Write reads
+	// partition_size in SetPartitionSize). NOT total_restore_size — that is the
+	// restore grand total and must not be overwritten here.
+	part_settings->partition_size = Backup_Size;
 
 	if (part_settings->adbbackup) {
 		if (!twadbbu::Write_TWIMG(adb_file_name, Backup_Size))
 			return false;
 	}
 
-	if (!Raw_Read_Write(part_settings))
+	// Optionally back up the /super image zstd-compressed (single pipe).
+	// Condition: only /super, no ADB backup (own TWIMG stream format), checkbox
+	// on. The filename stays super.emmc.win (dd image); zstd is only a pipe
+	// stage, the uncompressed size is self-describing in the frame header
+	// (--stream-size). All other image partitions stay raw. Raw and zstd
+	// mechanics are unified in Raw_Read_Write (compress parameter).
+	bool compress_super = !part_settings->adbbackup
+	    && Mount_Point == "/super"
+	    && DataManager::GetIntValue("tw_use_compression") == 1
+	    && DataManager::GetIntValue("tw_compress_super") == 1;
+	if (!Raw_Read_Write(part_settings, compress_super))
 		return false;
 
 	if (part_settings->adbbackup) {
@@ -2733,7 +2860,106 @@ bool TWPartition::Backup_Image(PartitionSettings *part_settings) {
 	return true;
 }
 
-bool TWPartition::Raw_Read_Write(PartitionSettings *part_settings) {
+// ---------------------------------------------------------------------------
+// ZstdPipe: shared fork->zstd-pipe->reap mechanics for the two piped image
+// paths (Raw_Read_Write with compress=true = compress; Restore_Image_Test =
+// decompress). ONE zstd child + ONE pipe to the parent — the little sibling of
+// PipeChildRegistry/run_pipe_reap in twrpTar.cpp.
+//   compress   (decompress=false): parent WRITES parent_fd; child reads the pipe
+//              (stdin), writes file_fd (stdout).
+//   decompress (decompress=true) : parent READS parent_fd; child reads file_fd
+//              (stdin), writes the pipe (stdout).
+// extra_close[] = additional parent fds (NOT O_CLOEXEC) the child must close
+// before exec. SIGPIPE is globally SIG_IGN (twrp.cpp) -> a write to a dead pipe
+// returns EPIPE instead of a signal.
+// ---------------------------------------------------------------------------
+struct ZstdPipe {
+	int   parent_fd = -1;   // parent writes (compress) or reads (decompress)
+	pid_t pid = -1;
+};
+
+// pipe2 + fork + child (dup2/close/execv). Returns 0 (zp filled) / -1.
+static int zstd_pipe_spawn(ZstdPipe& zp, bool decompress, int file_fd,
+                           const char* const argv[],
+                           const int* extra_close, int n_extra, const char* tag) {
+	int fds[2] = { -1, -1 };
+	if (pipe2(fds, O_CLOEXEC) < 0) {
+		LOGERR("%s: pipe2 failed (%s)\n", tag, strerror(errno));
+		return -1;
+	}
+	pid_t pid = fork();
+	if (pid < 0) {
+		LOGERR("%s: fork failed (%s)\n", tag, strerror(errno));
+		close(fds[0]); close(fds[1]);
+		return -1;
+	}
+	if (pid == 0) {
+		// Child. dup2 clears O_CLOEXEC on 0/1 -> they survive exec.
+		if (decompress) {
+			if (dup2(file_fd, STDIN_FILENO)  < 0) _exit(127);
+			if (dup2(fds[1],  STDOUT_FILENO) < 0) _exit(127);
+		} else {
+			if (dup2(fds[0],  STDIN_FILENO)  < 0) _exit(127);
+			if (dup2(file_fd, STDOUT_FILENO) < 0) _exit(127);
+		}
+		close(fds[0]); close(fds[1]); close(file_fd);
+		for (int i = 0; i < n_extra; ++i) close(extra_close[i]);
+		execv("/system/bin/zstd", (char* const*)argv);
+		// execv only returns on error -> report async-signal-safe (write to the
+		// inherited log fd 2) + _exit. NO LOGERR (malloc/lock) in the child: the
+		// malloc lock inherited at fork() may be held by a sibling thread
+		// (GUI/MTP) — see the fork-safety fix in pipe_operation.cpp.
+		static const char emsg[] = "execv zstd (super) child ERROR!\n";
+		if (write(STDERR_FILENO, emsg, sizeof(emsg) - 1) < 0) { /* nothing to do */ }
+		_exit(127);
+	}
+	// Parent: close the pipe end used by the child, keep the other.
+	if (decompress) { close(fds[1]); zp.parent_fd = fds[0]; }   // parent reads
+	else            { close(fds[0]); zp.parent_fd = fds[1]; }   // parent writes
+	zp.pid = pid;
+	return 0;
+}
+
+// Clean finish: close parent_fd (compress: EOF to zstd) -> waitpid -> exit
+// status. Returns 0 = clean, -1 = waitpid/exit error. On waitpid<0 pid stays
+// set so zstd_pipe_kill() reaps it later (zombie protection).
+static int zstd_pipe_finish(ZstdPipe& zp, const char* tag) {
+	if (zp.parent_fd >= 0) { close(zp.parent_fd); zp.parent_fd = -1; }
+	int status = 0;
+	if (waitpid(zp.pid, &status, 0) < 0) {
+		LOGERR("%s: waitpid failed (%s)\n", tag, strerror(errno));
+		return -1;
+	}
+	zp.pid = -1;
+	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+		LOGERR("%s: zstd exited abnormally (status=0x%x)\n", tag, status);
+		return -1;
+	}
+	return 0;
+}
+
+// Abort cleanup (exit: path): close parent_fd, hard-kill a live child + reap.
+// No-op if nothing was spawned (parent_fd==-1 && pid<=0).
+static void zstd_pipe_kill(ZstdPipe& zp) {
+	if (zp.parent_fd >= 0) { close(zp.parent_fd); zp.parent_fd = -1; }
+	if (zp.pid > 0) {
+		int status = 0;
+		kill(zp.pid, SIGKILL);
+		waitpid(zp.pid, &status, 0);
+		zp.pid = -1;
+	}
+}
+
+// Bidirectional dd path for image partitions: backup (block device ->
+// .win file/ADB FIFO), restore/flash (file/FIFO -> block device). With
+// compress=true (GUI backup ONLY, /super) the stream is piped through the
+// prebuilt 'zstd' binary into the .win file (single pipe). Self-describing:
+// --stream-size writes the uncompressed size into the zstd frame header
+// (Frame_Content_Size), which the restore reads later — NO .info dependency.
+// Deadlock-free (parent only reads the block device + writes the pipe; child
+// reads the pipe + writes the file -> no cyclic wait). SIGPIPE is globally
+// SIG_IGN (twrp.cpp) -> a write to a dead pipe returns EPIPE.
+bool TWPartition::Raw_Read_Write(PartitionSettings *part_settings, bool compress) {
 	unsigned long long RW_Block_Size, Remain = Backup_Size;
 	int src_fd = -1, dest_fd = -1;
 	ssize_t bs;
@@ -2741,6 +2967,22 @@ bool TWPartition::Raw_Read_Write(PartitionSettings *part_settings) {
 	void* buffer = NULL;
 	unsigned long long backedup_size = 0;
 	string srcfn, destfn;
+	ZstdPipe zp;
+	const char* op = (part_settings->PM_Method == PM_RESTORE) ? "Restore" : "Backup"; // GUI/log context for LOGERR
+	// ADB RESTORE is the only case with a FIFO SOURCE (srcfn = TW_ADB_RESTORE)
+	// and an already-rolled stream counter (twrpAdbBuFifo TWIMG branch) — both
+	// need special handling below. ADB BACKUP reads from the block device (the
+	// FIFO is the DESTINATION there) and rolls exclusively here -> treated like GUI.
+	const bool adb_restore_fifo = (part_settings->adbbackup && part_settings->PM_Method == PM_RESTORE);
+
+	// compress is defined ONLY for the GUI backup: ADB streams images raw
+	// (TWIMG format), and restore/flash never decompress here (demo:
+	// Restore_Image_Test; final: raw dd). Misuse would be a programming error ->
+	// reject hard instead of silently writing a raw image.
+	if (compress && (part_settings->PM_Method != PM_BACKUP || part_settings->adbbackup)) {
+		LOGERR("%s: Raw_Read_Write: compress is GUI-backup-only\n", op);
+		return false;
+	}
 
 	if (part_settings->PM_Method == PM_BACKUP) {
 		srcfn = Actual_Block_Device;
@@ -2751,6 +2993,9 @@ bool TWPartition::Raw_Read_Write(PartitionSettings *part_settings) {
 		}
 	}
 	else {
+#ifdef TW_ENABLE_BLKDISCARD
+		BlkDiscard();
+#endif
 		destfn = Actual_Block_Device;
 		if (part_settings->adbbackup) {
 			srcfn = TW_ADB_RESTORE;
@@ -2765,6 +3010,10 @@ bool TWPartition::Raw_Read_Write(PartitionSettings *part_settings) {
 		gui_msg(Msg(msg::kError, "error_opening_strerr=Error opening: '{1}' ({2})")(srcfn.c_str())(strerror(errno)));
 		return false;
 	}
+	// Sequential read hint: enlarges the kernel read-ahead window for src_fd.
+	// Works both ways: backup reads from the block device, restore reads from
+	// the .win image file. Pure hint, no I/O.
+	posix_fadvise64(src_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
 
 	dest_fd = open(destfn.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_LARGEFILE, S_IRUSR | S_IWUSR);
 	if (dest_fd < 0) {
@@ -2772,46 +3021,135 @@ bool TWPartition::Raw_Read_Write(PartitionSettings *part_settings) {
 		goto exit;
 	}
 
-	LOGINFO("Reading '%s', writing '%s'\n", srcfn.c_str(), destfn.c_str());
+	if (compress) {
+		// zstd child: stdin <- pipe (parent writes), stdout -> .win file.
+		// --stream-size writes the uncompressed size into the zstd frame header
+		// (Frame_Content_Size) -> self-describing, NO .info at restore.
+		// Level = GUI slider tw_zstd_level (default 1), -T = multithread (compressor budget, below).
+		char sizearg[64];
+		snprintf(sizearg, sizeof(sizearg), "--stream-size=%llu", (unsigned long long)Backup_Size);
+		// Thread count from the compressor budget (TW_MAX_COMPRESSOR_THREADS)
+		// instead of a hardcoded "-T4": /super is single-pipe -> full budget
+		// (active=1); fallback MAX_PIPES when unset.
+		char targ[16];
+		snprintf(targ, sizeof(targ), "-T%d", tw_affinity::compute_compressor_threads(1, 0));
+		// Compression level from the GUI slider (tw_zstd_level, 1-19) instead of
+		// a hardcoded "-1" — identical to the file-based path (fork_zstd).
+		// Default 1 == old "-1".
+		int lev = DataManager::GetIntValue("tw_zstd_level");
+		if (lev < 1 || lev > 19) lev = 1;
+		char levelarg[8];
+		snprintf(levelarg, sizeof(levelarg), "-%d", lev);
+		const char* argv[] = { "zstd", sizearg, levelarg, targ, "-c", (char*)NULL };
+		int extra[] = { src_fd };   // child inherits src_fd (not CLOEXEC) -> close it
+		if (zstd_pipe_spawn(zp, /*decompress=*/false, dest_fd, argv, extra, 1,
+		                    "Raw_Read_Write") < 0)
+			goto exit;
+		LOGINFO("Reading '%s', compressing (zstd) to '%s'\n", srcfn.c_str(), destfn.c_str());
+	} else {
+		LOGINFO("Reading '%s', writing '%s'\n", srcfn.c_str(), destfn.c_str());
+	}
 
 	if (part_settings->adbbackup) {
 		RW_Block_Size = MAX_ADB_READ;
 		bs = MAX_ADB_READ;
 	}
 	else {
-		RW_Block_Size = 1048576LLU; // 1MB
+		// 4 MB read/write chunks: cuts the read()/write() syscall count by 4x vs
+		// the old 1 MB buffer. RAM budget is uncritical (1 buffer per
+		// Raw_Read_Write call, no multi-pipe multiplication).
+		RW_Block_Size = 4ULL * 1024ULL * 1024ULL;
 		bs = (ssize_t)(RW_Block_Size);
 	}
 
 	buffer = malloc((size_t)bs);
 	if (!buffer) {
-		LOGINFO("Raw_Read_Write failed to malloc\n");
+		LOGERR("%s: Raw_Read_Write failed to malloc\n", op);
 		goto exit;
 	}
 
-	if (part_settings->progress)
-		part_settings->progress->SetPartitionSize(part_settings->total_restore_size);
+	// ADB restore: NO roll here — the cumulative stream tracker was already
+	// rolled by the FIFO thread (Restore_ADB_Backup, TWIMG branch), and
+	// SetPartitionSize is NOT idempotent (previous_partitions_size += current
+	// partition_size): a second call would count the partition twice in the
+	// grand total (mirror of the !adbbackup guards in Restore_Tar and
+	// Restore_Image_Test). GUI backup, ADB backup and GUI restore roll exactly
+	// here (the sole roll of these paths).
+	if (part_settings->progress && !adb_restore_fifo)
+		part_settings->progress->SetPartitionSize(part_settings->partition_size);
 
 	while (Remain > 0) {
 		if (Remain < RW_Block_Size)
 			bs = (ssize_t)(Remain);
-		if (read(src_fd, buffer, bs) != bs) {
-			LOGINFO("Error reading source fd (%s)\n", strerror(errno));
+		if (adb_restore_fifo) {
+			// FIFO source: read() may legitimately return LESS than bs (bu pumps
+			// 128-KB blocks ADB_DATA_BUFFER_SIZE > PIPE_BUF -> not atomic) — this
+			// is NOT an error but requires a re-read (principle of tar_io_read,
+			// libtar/block.c; identical in the demo branch Restore_Image_Test).
+			// A "!= bs" single check would wrongly abort here. Only EOF (=pipe
+			// break) or a real error aborts; EINTR is retried.
+			size_t got = 0;
+			while (got < (size_t)bs) {
+				ssize_t r = read(src_fd, (char*)buffer + got, (size_t)bs - got);
+				if (r < 0 && errno == EINTR)
+					continue;
+				if (r <= 0) {
+					LOGERR("%s: Error reading ADB stream (%s)\n", op,
+					       (r == 0) ? "unexpected EOF" : strerror(errno));
+					goto exit;
+				}
+				got += (size_t)r;
+			}
+		} else if (read(src_fd, buffer, bs) != bs) {
+			LOGERR("%s: Error reading source fd (%s)\n", op, strerror(errno));
 			goto exit;
 		}
-		if (write(dest_fd, buffer, bs) != bs) {
-			LOGINFO("Error writing destination fd (%s)\n", strerror(errno));
+		if (compress) {
+			// Write it all out: a pipe write can be partial. EPIPE = zstd dead.
+			ssize_t off = 0;
+			while (off < bs) {
+				ssize_t w = write(zp.parent_fd, (char*)buffer + off, (size_t)(bs - off));
+				if (w < 0) {
+					if (errno == EINTR)
+						continue;
+					LOGERR("%s: Error writing to zstd pipe (%s)\n", op, strerror(errno));
+					goto exit;
+				}
+				off += w;
+			}
+		} else if (write(dest_fd, buffer, bs) != bs) {
+			LOGERR("%s: Error writing destination fd (%s)\n", op, strerror(errno));
 			goto exit;
 		}
 		backedup_size += (unsigned long long)(bs);
 		Remain -= (unsigned long long)(bs);
 		if (part_settings->progress)
 			part_settings->progress->UpdateSize(backedup_size);
+		// DELIBERATELY only Check_Backup_Cancel(), NO stop_restore check:
+		// Raw_Read_Write() serves both backup (block device -> file) and restore
+		// (file -> block device, via Restore_Image). On restore the dd writes to
+		// a live block device (e.g. boot, modem, dtbo). A cancel mid-write would
+		// leave a half-flashed image -> softbrick.
+		// The user-facing cancel lock for restore is enforced on two levels (see
+		// partitionmanager.cpp Run_Restore + Cancel_Restore):
+		//   1. GUI: the cancel button on the restore_run page is locked via
+		//      tw_restore_cancelable=0 for RAW partitions (shows an info page
+		//      instead of the cancel_restore_confirm swipe).
+		//   2. C++: Cancel_Restore() refuses stop_restore.set_value(1) while
+		//      restore_cancelable=0 — blocks ADB/script bypass.
+		// Do NOT add a stop_restore.get_value() check here, or the lock becomes
+		// useless as soon as someone copies the backup path as a template.
 		if (PartitionManager.Check_Backup_Cancel() != 0)
 			goto exit;
 	}
 	if (part_settings->progress)
 		part_settings->progress->UpdateDisplayDetails(true);
+
+	// compress: close the write end (zstd sees EOF) -> waitpid (flush + exit)
+	// -> THEN fsync. Order encapsulated in the helper; on error -> exit: cleanup.
+	if (compress && zstd_pipe_finish(zp, "Raw_Read_Write") < 0)
+		goto exit;
+
 	fsync(dest_fd);
 
 	if (!part_settings->adbbackup && part_settings->PM_Method == PM_BACKUP) {
@@ -2821,10 +3159,20 @@ bool TWPartition::Raw_Read_Write(PartitionSettings *part_settings) {
 
 	ret = true;
 exit:
+	// On abort with a still-live zstd child: close the write end (EOF/EPIPE),
+	// then hard-kill + reap -> no zombie. No-op in the raw case and after a
+	// clean zstd_pipe_finish (parent_fd==-1 && pid<=0). (encapsulated in the helper)
+	zstd_pipe_kill(zp);
 	if (src_fd >= 0)
 		close(src_fd);
-	if (dest_fd >= 0)
+	if (dest_fd >= 0) {
+		// DONTNEED only in backup mode: dest is then a real file (.win image),
+		// where trashing the cache would be counterproductive. On restore dest
+		// is a block device -> the hint is pointless and can be skipped.
+		if (ret && part_settings->PM_Method == PM_BACKUP && !part_settings->adbbackup)
+			posix_fadvise64(dest_fd, 0, 0, POSIX_FADV_DONTNEED);
 		close(dest_fd);
+	}
 	if (buffer)
 		free(buffer);
 	return ret;
@@ -2858,15 +3206,220 @@ bool TWPartition::Backup_Dump_Image(PartitionSettings *part_settings) {
 	return true;
 }
 
+// Parses the zstd frame header (RFC 8878) from the first bytes and returns the
+// uncompressed size (Frame_Content_Size). 18 bytes cover any possible header
+// (max at did=3: 4 magic + 1 FHD + 1 window + 4 DID + 8 FCS). Returns true only
+// for a valid zstd frame WITH a present FCS; else false (the caller treats that
+// as "raw" / size unknown). NO .info reference.
+static bool parse_zstd_frame_content_size(const unsigned char* buf, size_t n, uint64_t& out_size) {
+	out_size = 0;
+	if (n < 5)
+		return false;
+	// Magic 0x28 0xB5 0x2F 0xFD
+	if (!(buf[0] == 0x28 && buf[1] == 0xB5 && buf[2] == 0x2F && buf[3] == 0xFD))
+		return false;
+	unsigned char fhd = buf[4];
+	// The reserved bit (bit 3) MUST be 0 (RFC 8878). Check ONLY 0x08 — bit 4 is
+	// "Unused" and a decoder MUST ignore it; checking 0x18 would wrongly reject
+	// valid frames from conformant encoders.
+	if (fhd & 0x08)
+		return false;
+	unsigned int fcs_flag   = (fhd >> 6) & 0x3;
+	unsigned int single_seg = (fhd >> 5) & 0x1;
+	unsigned int did_flag   = fhd & 0x3;
+	unsigned int did_size   = (did_flag == 0) ? 0u : (1u << (did_flag - 1)); // {0,1,2,4}
+	unsigned int fcs_size;
+	switch (fcs_flag) {
+		case 0:  fcs_size = single_seg ? 1u : 0u; break;
+		case 1:  fcs_size = 2u; break;
+		case 2:  fcs_size = 4u; break;
+		default: fcs_size = 8u; break; // flag 3
+	}
+	if (fcs_size == 0)
+		return false; // no size in the header (impossible for --stream-size backups)
+	size_t offset = 5u + (single_seg ? 0u : 1u) /*Window_Descriptor*/ + did_size;
+	if (offset + fcs_size > n)
+		return false;
+	uint64_t v = 0;
+	for (unsigned int i = 0; i < fcs_size; i++)
+		v |= ((uint64_t)buf[offset + i]) << (8u * i); // little-endian
+	if (fcs_size == 2)
+		v += 256; // RFC special case for the 2-byte FCS field
+	out_size = v;
+	return true;
+}
+
+// Opens an image backup, reads the first bytes and returns — if it is a zstd
+// frame with an embedded Frame_Content_Size (our --stream-size backups) — the
+// uncompressed size. Else false (raw/not zstd/no FCS). Serves the correct
+// restore progress (denominator = decompressed bytes), NO .info.
+static bool peek_zstd_uncompressed_size(const string& path, uint64_t& out_size) {
+	out_size = 0;
+	int fd = open(path.c_str(), O_RDONLY | O_LARGEFILE);
+	if (fd < 0)
+		return false;
+	unsigned char hdr[18];
+	ssize_t n = read(fd, hdr, sizeof(hdr));
+	close(fd);
+	if (n < 4)
+		return false;
+	if (!(hdr[0] == 0x28 && hdr[1] == 0xB5 && hdr[2] == 0x2F && hdr[3] == 0xFD))
+		return false; // not zstd -> raw
+	return parse_zstd_frame_content_size(hdr, (size_t)n, out_size);
+}
+
+// Classifies the validity of a FILE-BASED backup from ONE BackupHeaderManager
+// load (+ legacy .info) and returns the self-described size facts. Pure logic —
+// NO gui_err / NO DataManager write: the technical reason goes to the log via
+// LOGINFO, the GUI console message is made by the caller
+// (Preflight_Restore_Backup) from the return enum. Factored out of
+// Get_Restore_Size (DRY): Get_Restore_Size delegates the reject here, the early
+// GUI firewall uses the same primitive. The valid/invalid decision mirrors
+// Get_Restore_Size 1:1 (OpenAES-with-.info -> valid size here, reject only at
+// extraction); the reject subtypes differentiate ONLY the message.
+// Images/super (dd) + ADB the method gates itself (-> RV_VALID), so it is safe
+// to call for ANY partition.
+//   out_size    (optional): self-described size if known — DFP g-header
+//                           backup_size or legacy plain-tar .info backup_size; 0 for
+//                           gzip (caller computes via get_size).
+//   out_ext_app (optional): DFP ext-app-data share (bytes) for the denominator subtraction; else 0.
+Restore_Validity TWPartition::Probe_Restore_Backup(PartitionSettings *part_settings,
+		unsigned long long *out_size, unsigned long long *out_ext_app, int *out_ead) {
+	if (out_size)    *out_size = 0;
+	if (out_ext_app) *out_ext_app = 0;
+	if (out_ead)     *out_ead = 0;
+
+	// Images/super (dd) + ADB are not part of the file-based preflight -> do not
+	// block. (Makes Probe safe to call for ANY partition — the GUI firewall
+	// iterates over all.)
+	if (part_settings->adbbackup || Is_Image(Get_Restore_File_System(part_settings)))
+		return RV_VALID;
+
+	string Password;
+	DataManager::GetValue("tw_restore_password", Password);
+	// First segment: DFP split <Backup_FileName>000 first, else unsplit ".win".
+	string seg000 = part_settings->Backup_Folder + "/" + Backup_FileName + "000";
+	string probe = TWFunc::Path_Exists(seg000)
+	             ? seg000
+	             : part_settings->Backup_Folder + "/" + Backup_FileName;
+
+	BackupHeaderManager hdr;
+	hdr.Load(probe, Password);
+	Archive_Type magic = hdr.GetType();   // outer type (even on reject)
+	if (out_ead) *out_ead = hdr.GetEad(); // ead marker for the /data checkbox (caller uses it ONLY for /data)
+
+	// OpenAES (legacy, removed from TWRP 3.7+): hdr.Load scanned ALL segments of
+	// the partition via Get_Archive_Type_From_Segments (heterogeneous: win000
+	// often plain gzip, "OA" only from win100..), so the outer type is reliably
+	// LEGACY_ENCRYPTED here. Reject directly; the specific message is made by
+	// the caller (Preflight or the Run_Restore guard via Emit_Restore_Validity_Error).
+	if (magic == LEGACY_ENCRYPTED)
+		return RV_REJECT_OPENAES;
+
+	if (!hdr.IsLegacy()) {
+		// DFP is self-describing: the size MUST come from the g-header, else incomplete.
+		unsigned long long g = hdr.GetBackupSize();
+		if (g > 0) {
+			if (out_size)    *out_size = g;
+			if (out_ext_app) *out_ext_app = hdr.GetExtAppDataSize();
+			return RV_VALID;
+		}
+		LOGINFO("Probe_Restore_Backup: DFP backup '%s' without usable g-header backup_size -> reject\n", Backup_Name.c_str());
+		return RV_NO_BACKUP_SIZE;
+	}
+
+	// Legacy: size from the native `.info` (backup_size > 0; 0/missing = unusable).
+	InfoManager restore_info(part_settings->Backup_Folder + "/" + Backup_Name + ".info");
+	unsigned long long info_size = 0;
+	if (restore_info.LoadValues() == 0
+	    && restore_info.GetValue("backup_size", info_size) == 0
+	    && info_size > 0) {
+		if (out_size) *out_size = info_size;
+		return RV_VALID;
+	}
+
+	// No usable `.info`: ONLY gzip may fall back to pigz -l (unambiguous magic,
+	// reliable gzip footer) -> RV_VALID with out_size=0 (caller: tar.get_size()).
+	// Same valid/invalid decision as Get_Restore_Size `magic != LEGACY_COMPRESSED`; the
+	// reject subtypes are only differentiated for the GUI console.
+	if (magic == LEGACY_COMPRESSED)
+		return RV_VALID;
+	if (hdr.GetStatus() == DET_WRONG_PASSWORD) {
+		LOGINFO("Probe_Restore_Backup: '%s' decrypt probe failed -> reject\n", Backup_Name.c_str());
+		return RV_WRONG_PASSWORD;
+	}
+	if (hdr.GetStatus() == DET_REJECT_UNKNOWN) {
+		LOGINFO("Probe_Restore_Backup: '%s' unknown/corrupt format -> reject\n", Backup_Name.c_str());
+		return RV_REJECT_UNKNOWN;
+	}
+	LOGINFO("Probe_Restore_Backup: legacy plain-tar '%s' without usable .info backup_size -> reject\n", Backup_Name.c_str());
+	return RV_LEGACY_NO_INFO;
+}
+
 unsigned long long TWPartition::Get_Restore_Size(PartitionSettings *part_settings) {
+	part_settings->backup_validity = RV_VALID;   // strict preflight: reset per call (caller accumulates)
+
+	// ADB stream: there is NO file to measure — the size already arrived in the
+	// stream's twfilehdr (twimghdr.size -> total_restore_size, set by the
+	// twrpAdbBuFifo loop BEFORE this call). Just cache it here for Restore_Tar
+	// (SetPartitionSize uses Restore_Size). Otherwise tar.get_size() below would
+	// run on the nonexistent stream "file" (Restore_Size=0/garbage ->
+	// SetPartitionSize(0) -> broken ADB restore bar).
+	if (part_settings->adbbackup) {
+		Restore_Size = part_settings->total_restore_size;
+		return Restore_Size;
+	}
+
+	// Self-describing: a zstd-compressed image backup (e.g. super.emmc.win)
+	// carries its uncompressed size in the zstd frame header (--stream-size).
+	// Return that as the restore size so the progress bar uses the DECOMPRESSED
+	// bytes as denominator — not the compressed file size or a .info value.
+	// (Raw images fall through via false to the legacy logic.)
 	if (!part_settings->adbbackup) {
-		InfoManager restore_info(part_settings->Backup_Folder + "/" + Backup_Name + ".info");
-		if (restore_info.LoadValues() == 0) {
-			if (restore_info.GetValue("backup_size", Restore_Size) == 0) {
-				LOGINFO("Read info file, restore size is %llu\n", Restore_Size);
+		string Img_FileName = part_settings->Backup_Folder + "/" + Backup_FileName;
+		if (Is_Image(Get_Restore_File_System(part_settings))) {
+			uint64_t uncompressed = 0;
+			if (peek_zstd_uncompressed_size(Img_FileName, uncompressed)) {
+				Restore_Size = uncompressed;
+				LOGINFO("Get_Restore_Size: zstd image '%s', uncompressed size = %llu\n",
+				        Backup_FileName.c_str(), (unsigned long long)Restore_Size);
 				return Restore_Size;
 			}
 		}
+	}
+
+	// Strict restore preflight (size + validation) — the classification
+	// (DFP/legacy/gzip, valid/invalid) is factored into Probe_Restore_Backup
+	// (DRY: the early GUI firewall Preflight_Restore_Backup uses the same
+	// primitive). Here only: reject (backup_validity, before the wipe) or adopt
+	// the self-described size. Images/super (above) + ADB are exempt.
+	if (!part_settings->adbbackup && !Is_Image(Get_Restore_File_System(part_settings))) {
+		unsigned long long probe_size = 0, probe_ext = 0;
+		Restore_Validity rv = Probe_Restore_Backup(part_settings, &probe_size, &probe_ext);
+		if (rv != RV_VALID) {
+			LOGINFO("Get_Restore_Size: backup '%s' not restorable (rv=%d) -> reject before wipe\n",
+			        Backup_Name.c_str(), (int)rv);
+			part_settings->backup_validity = rv;
+			return 0;
+		}
+		if (probe_size > 0) {
+			// The DFP g-header or legacy plain-tar .info provided the size directly.
+			Restore_Size = probe_size;
+			// When the ext-app checkbox is deselected, the /data/media/0/Android
+			// entries are NOT extracted (extract skip) -> subtract the same
+			// amount from the denominator, otherwise the bar ends < 100%.
+			if (Has_Data_Media && Mount_Point == "/data"
+			    && DataManager::GetIntValue("tw_has_external_app_data") == 1
+			    && DataManager::GetIntValue("tw_restore_external_app_data") != 1) {
+				unsigned long long ead = probe_ext;
+				if (ead > Restore_Size) ead = Restore_Size;   // underflow guard
+				Restore_Size -= ead;
+				LOGINFO("Get_Restore_Size: ext-app-data excluded -> minus %llu B\n", (unsigned long long)ead);
+			}
+			LOGINFO("Get_Restore_Size: self-describing restore size = %llu\n", (unsigned long long)Restore_Size);
+			return Restore_Size;
+		}
+		// probe_size == 0 -> legacy gzip: falls through to tar.get_size() below (-> uncompressedSize -> pigz -l).
 	}
 
 	string Full_FileName = part_settings->Backup_Folder + "/" + Backup_FileName;
@@ -2880,7 +3433,6 @@ unsigned long long TWPartition::Get_Restore_Size(PartitionSettings *part_setting
 	twrpTar tar;
 	tar.setdir(Backup_Path);
 	tar.setfn(Full_FileName);
-	tar.backup_name = Full_FileName;
 #ifndef TW_EXCLUDE_ENCRYPTED_BACKUPS
 	string Password;
 	DataManager::GetValue("tw_restore_password", Password);
@@ -2894,10 +3446,85 @@ unsigned long long TWPartition::Get_Restore_Size(PartitionSettings *part_setting
 	return Restore_Size;
 }
 
+#ifdef TWRP_RESTORE_DEMO_MODE
+// === Restore demo mode: consolidated TestRestore root (SSoT) ===
+// All demo restores land under ONE root "/data/TestRestore", each partition its
+// own subfolder <Backup_Name> (data/metadata/boot/super/modem/...). File restore
+// (Restore_Tar) uses the root directly as setdir — the partition subfolder is
+// created there from the archive path itself (include_root_dir=true -> entries
+// start with data/..., metadata/..., etc.). dd-image restore
+// (Restore_Image_Test) appends <Backup_Name> explicitly. This helper is the ONLY
+// source of the root path. WHY exactly /data/TestRestore (and NOT
+// /data/media/...): see the fscrypt comment in the body. Returns the root path,
+// or "" on a mkdir error.
+string TWPartition::Ensure_TestRestore_Root() {
+	// IMPORTANT (fscrypt): the root MUST be at the /data top level
+	// ("/data/TestRestore"), NOT under /data/media/0/... . Reason: /data/media
+	// carries a CE fscrypt policy that is INHERITED by every newly created
+	// subfolder. On a file restore libtar (extract.c:
+	// fscrypt_policy_set_struct(realname,...)) calls
+	// FS_IOC_SET_ENCRYPTION_POLICY for the per-dir policy stored in the backup
+	// -> EEXIST (the folder already has the inherited CE policy), the error is
+	// only logged+ignored -> the restore silently keeps the uniform inherited
+	// descriptor instead of the original policy. /data/TestRestore (top level of
+	// /data) lies OUTSIDE the encrypted subtrees -> a per-dir policy can be set
+	// (empirically verified on-device). A tmpfs root (e.g. /TestRestore) is out
+	// entirely: FS_IOC_SET_ENCRYPTION_POLICY -> ENOTTY.
+	string root = "/data/TestRestore";
+	if (mkdir(root.c_str(), 0755) != 0 && errno != EEXIST) {
+		LOGERR("Ensure_TestRestore_Root: cannot create '%s': %s\n", root.c_str(), strerror(errno));
+		return string();
+	}
+	return root;
+}
+#endif
+
 bool TWPartition::Restore_Tar(PartitionSettings *part_settings) {
 	string Full_FileName;
 	bool ret = false;
 	string Restore_File_System = Get_Restore_File_System(part_settings);
+	// Name it more clearly when external app data (/data/media/0/Android) is restored too.
+	string shown_name = Backup_Display_Name;
+	if (Has_Data_Media && Mount_Point == "/data" && DataManager::GetIntValue("tw_restore_external_app_data") == 1)
+		shown_name = gui_lookup("data_backup_ext", "Data (incl. external app data, excl. media)");
+
+#ifdef TWRP_RESTORE_DEMO_MODE
+	// === Restore demo mode ===
+	// The restore target is redirected to the consolidated root /data/TestRestore
+	// (partition subfolder via the archive path, below); wipe, removeDir and
+	// capability operations are skipped so the daily-driver device can be tested
+	// safely. The define stays active until the final build (daily-driver
+	// protection); remove only after explicit user approval.
+	LOGINFO("Restore_Tar: DEMO MODE active for partition '%s'\n", Backup_Display_Name.c_str());
+	gui_msg(Msg("restoring=Restoring {1}...")(shown_name));
+	if (!Mount(true)) {
+		LOGERR("Restore_Tar DEMO: failed to mount %s\n", Mount_Point.c_str());
+		return false;
+	}
+	if (!ReMount_RW(true)) {
+		LOGERR("Restore_Tar DEMO: failed to remount %s RW\n", Mount_Point.c_str());
+		return false;
+	}
+	// Consolidated root (SSoT): /data/TestRestore. setdir is the root here — the
+	// partition subfolder (e.g. data/) is created during extraction from the
+	// archive path itself (include_root_dir=true).
+	string demo_dir = Ensure_TestRestore_Root();
+	if (demo_dir.empty())
+		return false;
+	LOGINFO("Restore_Tar DEMO: target root = %s\n", demo_dir.c_str());
+#else
+	// Pre-wipe validation: multi-archive sequence check BEFORE the destructive
+	// wipe runs. With gaps in the archive sequence the restore pipe worker would
+	// crash mid-stream after the old data is already wiped — total data loss. An
+	// early abort here keeps the old data intact.
+	{
+		string check_filename = part_settings->Backup_Folder + "/" + Backup_FileName;
+		if (!twrpTar::validate_multi_archive_sequence(check_filename)) {
+			LOGERR("Restore_Tar: archive sequence validation failed for '%s' -- aborting BEFORE wipe to preserve old data.\n", check_filename.c_str());
+			gui_print_color("error", "Backup is corrupt or incomplete (gap in archive sequence) -- restore aborted before wipe. Old data preserved.\n");
+			return false;
+		}
+	}
 
 	if (Has_Android_Secure) {
 		if (!Wipe_AndSec())
@@ -2913,32 +3540,73 @@ bool TWPartition::Restore_Tar(PartitionSettings *part_settings) {
 				return false;
 		}
 	}
-	TWFunc::GUI_Operation_Text(TW_RESTORE_TEXT, Backup_Display_Name, gui_parse_text("{@restoring_hdr}"));
-	gui_msg(Msg("restoring=Restoring {1}...")(Backup_Display_Name));
+	TWFunc::GUI_Operation_Text(TW_RESTORE_TEXT, shown_name, gui_parse_text("{@restoring_hdr}"));
+	gui_msg(Msg("restoring=Restoring {1}...")(shown_name));
 
 	// Remount as read/write as needed so we can restore the backup
 	if (!ReMount_RW(true))
 		return false;
 
+	// If backup includes external app data and user opted in, wipe old folder first
+	if (Has_Data_Media && Mount_Point == "/data"
+	    && DataManager::GetIntValue("tw_restore_external_app_data") == 1) {
+		gui_msg(Msg("removing_external_app_data=Removing previous external app data..."));
+		TWFunc::removeDir(Mount_Point + "/media/0/Android", true);
+	}
+#endif
+
 	Full_FileName = part_settings->Backup_Folder + "/" + Backup_FileName;
 	twrpTar tar;
 	tar.part_settings = part_settings;
+#ifdef TWRP_RESTORE_DEMO_MODE
+	tar.setdir(demo_dir);   // consolidated root; partition subfolder comes from the archive path
+#else
 	tar.setdir(Backup_Path);
+#endif
 	tar.setfn(Full_FileName);
-	tar.backup_name = Backup_Name;
+
+	// Self-describing: the archive type is NOT read from `.info backup_type` but
+	// determined directly from the archive in extractTarFork()/
+	// detect_archive_type() (4-byte magic + PAX-g marker for RAW + BAES inner
+	// sniff 5<->7). Legacy vs DFP follows from is_legacy_type(). The `.info` is gone
+	// entirely — the restore size also comes from the PAX g-header now
+	// (Get_Restore_Size, TWRP.backup_size). setpassword() below sets
+	// this->password BEFORE detection.
+
 #ifndef TW_EXCLUDE_ENCRYPTED_BACKUPS
 	string Password;
 	DataManager::GetValue("tw_restore_password", Password);
 	if (!Password.empty())
 		tar.setpassword(Password);
 #endif
-	part_settings->progress->SetPartitionSize(Get_Restore_Size(part_settings));
+	// Loop 1 (Run_Restore size calc) already set Restore_Size for this
+	// (sub)partition (it ALWAYS runs before Restore_Tar). Use the cache -> a
+	// second hdr.Load is avoided (one PBKDF2 saved for BAES). Fallback only if,
+	// against expectation, it was not measured (Restore_Size == 0).
+	if (Restore_Size == 0)
+		Get_Restore_Size(part_settings);   // sets Restore_Size internally
+	// ADB restore: the partition roll is done by the twrpAdbBuFifo loop itself
+	// (uniform for TWFN AND TWIMG — the raw path has no counterpart here) and
+	// then corrected via Finish_Partition_Exact. A second roll here would
+	// increase previous_partitions_size twice.
+	if (!part_settings->adbbackup)
+		part_settings->progress->SetPartitionSize(Restore_Size);
+	// ext-app checkbox off -> exclude /media/0/Android from extraction (no wipe
+	// needed; applies in demo + normal, all pipe workers).
+	if (Has_Data_Media && Mount_Point == "/data"
+	    && DataManager::GetIntValue("tw_has_external_app_data") == 1
+	    && DataManager::GetIntValue("tw_restore_external_app_data") != 1) {
+		tar.restore_exclude_path = Mount_Point + "/media/0/Android";   // include_root_dir=true -> archive path WITH /data (no Strip_Root_Dir)
+		LOGINFO("Restore_Tar: ext-app-data checkbox off -> excluding %s from extraction\n", tar.restore_exclude_path.c_str());
+	}
 	if (tar.extractTarFork() != 0)
 		ret = false;
 	else
 		ret = true;
 #ifdef HAVE_CAPABILITIES
+#ifndef TWRP_RESTORE_DEMO_MODE
 	// Restore capabilities to the run-as binary
+	// (Demo mode: deliberately skipped -- /system/bin/run-as is a real filesystem target)
 	if (Mount_Point == PartitionManager.Get_Android_Root_Path() && Mount(true) && TWFunc::Path_Exists("/system/bin/run-as")) {
 		struct vfs_cap_data cap_data;
 		uint64_t capabilities = (1 << CAP_SETUID) | (1 << CAP_SETGID);
@@ -2956,6 +3624,7 @@ bool TWPartition::Restore_Tar(PartitionSettings *part_settings) {
 		}
 	}
 #endif
+#endif
 	if (Mount_Read_Only || Mount_Flags & MS_RDONLY)
 		// Remount as read only when restoration is complete
 		ReMount(true);
@@ -2963,9 +3632,408 @@ bool TWPartition::Restore_Tar(PartitionSettings *part_settings) {
 	return ret;
 }
 
+#ifdef TWRP_RESTORE_DEMO_MODE
+// Demo/test-only restore for ANY image partition (super/boot/modem/dtbo/...)
+// (PHASE A): NEVER writes to the block device. Two sources:
+//  - GUI/file: reads the backup (<name>.emmc.win), detects the zstd magic; if
+//    compressed it is decompressed via a 'zstd -d' pipe, else copied raw (to EOF).
+//  - ADB stream (part_settings->adbbackup): reads exactly partition_size
+//    (= twimghdr.size, set by twrpAdbBuFifo) bytes from the data FIFO
+//    TW_ADB_RESTORE — ALWAYS raw (Backup_Image streams images over adb only via
+//    Raw_Read_Write; twimghdr.compressed is uninitialized stack garbage for
+//    TWIMG, Write_TWIMG never sets it -> deliberately ignored). NO header
+//    peek/lseek/fadvise on the FIFO: not seekable, and the 18 peek bytes would
+//    be missing from the stream (desyncing later partitions). Count-limited
+//    consumption in MAX_ADB_READ blocks = mirror of Raw_Read_Write -> the
+//    stream stays synchronous for TWENDADB/MD5.
+// The image lands at /data/TestRestore/<Backup_Name>/<name>.emmc.win.raw and is
+// hashed inline with SHA256 while writing. The result (hash + byte count) is
+// stored in Demo_Test_*; the comparison against the live partition is done by
+// phase B (Verify_Image_Test) AFTER the restore end, untimed (GUI: Run_Restore
+// after rStop; ADB: Restore_ADB_Backup after TWENDADB). The size comes from the
+// zstd frame header or the TWIMG stream header, NOT from a .info.
+bool TWPartition::Restore_Image_Test(PartitionSettings *part_settings) {
+	const unsigned long long RW_Block_Size = 4ULL * 1024ULL * 1024ULL;
+	bool ret = false;
+	int in_fd = -1, out_fd = -1;
+	ZstdPipe zp;
+	void* buffer = NULL;
+	twrpDigest* digest_out = NULL;
+	bool is_zstd = false, have_size = false;
+	bool adb_stream = (part_settings->adbbackup != 0);          // source = data FIFO instead of a local backup file
+	uint64_t content_size = 0;
+	unsigned char hdr[18];
+	ssize_t hn = 0;
+	unsigned long long done_size = 0;
+	string srcfn = adb_stream ? string(TW_ADB_RESTORE)
+	                          : part_settings->Backup_Folder + "/" + Backup_FileName;
+	string demo_root = Ensure_TestRestore_Root();               // /data/TestRestore (SSoT root, fscrypt-capable)
+	string demo_dir = demo_root + "/" + Backup_Name;            // per-partition subfolder (data/boot/super/modem/...)
+	string destfn = demo_dir + "/" + Backup_FileName + ".raw";
+	string hash_out;
+
+	LOGINFO("Restore_Image_Test: DEMO/TEST restore for '%s' from %s (never writes block device)\n",
+	        Backup_Display_Name.c_str(), adb_stream ? "ADB stream" : "backup file");
+	gui_msg(Msg("restoring=Restoring {1}...")(Backup_Display_Name));
+
+	if (demo_root.empty())
+		goto exit;   // root could not be created (Ensure_TestRestore_Root already logged it)
+
+	in_fd = open(srcfn.c_str(), O_RDONLY | O_LARGEFILE);
+	if (in_fd < 0) {
+		gui_msg(Msg(msg::kError, "error_opening_strerr=Error opening: '{1}' ({2})")(srcfn.c_str())(strerror(errno)));
+		return false;
+	}
+	if (!adb_stream) {
+		// File source only: read-ahead hint + zstd magic peek (+ lseek back).
+		// Both would be wrong on the ADB FIFO: it is not seekable, and the 18
+		// peek bytes belong to the stream's partition_size payload.
+		posix_fadvise64(in_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+
+		hn = read(in_fd, hdr, sizeof(hdr));
+		if (hn < 4) {
+			LOGERR("Restore_Image_Test: short header read (%zd)\n", hn);
+			goto exit;
+		}
+		if (lseek(in_fd, 0, SEEK_SET) != (off_t)0) {
+			LOGERR("Restore_Image_Test: lseek failed (%s)\n", strerror(errno));
+			goto exit;
+		}
+		is_zstd = (hdr[0] == 0x28 && hdr[1] == 0xB5 && hdr[2] == 0x2F && hdr[3] == 0xFD);
+		if (is_zstd) {
+			have_size = parse_zstd_frame_content_size(hdr, (size_t)hn, content_size);
+			if (have_size)
+				LOGINFO("Restore_Image_Test: zstd backup, Frame_Content_Size = %llu\n", (unsigned long long)content_size);
+			else
+				LOGINFO("Restore_Image_Test: zstd backup, Frame_Content_Size unknown (decompress to EOF)\n");
+		} else {
+			LOGINFO("Restore_Image_Test: raw (uncompressed) backup detected\n");
+		}
+	} else {
+		LOGINFO("Restore_Image_Test: ADB stream, raw copy of %llu bytes\n",
+		        (unsigned long long)part_settings->partition_size);
+	}
+
+	// Progress/comparison size: for zstd the uncompressed size from the header
+	// (NO .info), otherwise the partition size. Do NOT touch it for ADB:
+	// partition_size already carries twimghdr.size there (twrpAdbBuFifo.cpp, the
+	// stream truth) — setting it unconditionally would overwrite the correct
+	// value (mirror of the comment in Restore_Image).
+	if (!adb_stream) {
+		if (is_zstd && have_size)
+			part_settings->partition_size = content_size;
+		else
+			part_settings->partition_size = Backup_Size;
+	}
+
+	// Create the per-partition TestRestore subfolder (the root /data/TestRestore
+	// was already created by Ensure_TestRestore_Root(); only the partition level
+	// here; EEXIST ok).
+	if (mkdir(demo_dir.c_str(), 0755) != 0 && errno != EEXIST) {
+		LOGERR("Restore_Image_Test: cannot create '%s': %s\n", demo_dir.c_str(), strerror(errno));
+		goto exit;
+	}
+
+	// Free-space check: the DECOMPRESSED image (partition_size) must fit on
+	// internal storage. Reject conservatively up front instead of ENOSPC
+	// mid-write.
+	{
+		struct statfs sfs;
+		if (statfs(demo_dir.c_str(), &sfs) == 0) {
+			unsigned long long freeb = (unsigned long long)sfs.f_bavail * (unsigned long long)sfs.f_bsize;
+			if (freeb < part_settings->partition_size) {
+				LOGERR("Restore_Image_Test: not enough free space (%llu < %llu) at %s\n",
+				       freeb, (unsigned long long)part_settings->partition_size, demo_dir.c_str());
+				gui_print_color("error", "Test restore aborted: not enough free space for the decompressed super image.\n");
+				goto exit;
+			}
+		} else {
+			LOGINFO("Restore_Image_Test: statfs failed (%s), skipping free-space check\n", strerror(errno));
+		}
+	}
+
+	out_fd = open(destfn.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_LARGEFILE, S_IRUSR | S_IWUSR);
+	if (out_fd < 0) {
+		gui_msg(Msg(msg::kError, "error_opening_strerr=Error opening: '{1}' ({2})")(destfn.c_str())(strerror(errno)));
+		goto exit;
+	}
+
+	buffer = malloc((size_t)RW_Block_Size);
+	if (!buffer) {
+		LOGERR("Restore_Image_Test failed to malloc\n");
+		goto exit;
+	}
+
+	digest_out = new twrpSHA256();
+	digest_out->init();
+
+	// ADB: NO SetPartitionSize here — the cumulative stream tracker was already
+	// rolled by Restore_ADB_Backup (TWIMG branch). SetPartitionSize is NOT
+	// idempotent (previous_partitions_size += current partition_size): a second
+	// call would count the partition twice in the grand total (mirror of the
+	// !adbbackup guard around Restore_Tar's roll).
+	if (part_settings->progress && !adb_stream)
+		part_settings->progress->SetPartitionSize(part_settings->partition_size);
+
+	LOGINFO("Restore_Image_Test: extracting to '%s'\n", destfn.c_str());
+
+	if (adb_stream) {
+		// ADB: exactly partition_size (= twimghdr.size) bytes from the data FIFO
+		// in MAX_ADB_READ blocks (mirror of Raw_Read_Write's adb branch: same
+		// block size, same count-limited consumption -> the stream stays
+		// byte-synchronous for later partitions/MD5TRAILER/TWENDADB). No EOF
+		// loop: a premature EOF/short read = pipe break = error (like
+		// Raw_Read_Write; bu writes 512-byte blocks -> the FIFO yields full
+		// MAX_ADB_READ reads).
+		unsigned long long Remain = part_settings->partition_size;
+		ssize_t bs = MAX_ADB_READ;
+		while (Remain > 0) {
+			if (Remain < (unsigned long long)bs)
+				bs = (ssize_t)Remain;
+			// FIFO short reads are real (bu pumps 128-KB blocks > PIPE_BUF ->
+			// not atomic): read() may return less than bs even though the stream
+			// continues. So re-read block-exactly (principle of tar_io_read,
+			// libtar/block.c) instead of a fragile "!= bs" single check; only
+			// EOF (=pipe break) or a real error aborts. EINTR is retried
+			// (process-wide signal landscape, e.g. SIGCHLD).
+			{
+				size_t got = 0;
+				while (got < (size_t)bs) {
+					ssize_t r = read(in_fd, (char*)buffer + got, (size_t)bs - got);
+					if (r < 0 && errno == EINTR)
+						continue;
+					if (r <= 0) {
+						LOGERR("Restore: Error reading ADB stream (%s)\n",
+						       (r == 0) ? "unexpected EOF" : strerror(errno));
+						goto exit;
+					}
+					got += (size_t)r;
+				}
+			}
+			if (write(out_fd, buffer, (size_t)bs) != bs) {
+				LOGERR("Restore: Error writing test file (%s)\n", strerror(errno));
+				goto exit;
+			}
+			digest_out->update((const unsigned char*)buffer, (size_t)bs);
+			done_size += (unsigned long long)bs;
+			Remain -= (unsigned long long)bs;
+			if (part_settings->progress)
+				part_settings->progress->UpdateSize(done_size);
+			// Demo/test restore: check the correct restore cancel flag (see RAW branch).
+			// In demo mode the ADB image restore is cancelable (Restore_ADB_Backup
+			// sets cancelable=1, since only a .raw file is written) -> this check
+			// fires actively and aborts; the exit handler discards the partial .raw.
+			// In the final build cancelable stays 0 (dd to the block device), no-op.
+			if (PartitionManager.stop_restore.get_value() != 0)
+				goto exit;
+		}
+	} else if (!is_zstd) {
+		// RAW: backup file directly -> test file, hash inline (to EOF).
+		ssize_t rb;
+		while ((rb = read(in_fd, buffer, (size_t)RW_Block_Size)) > 0) {
+			if (write(out_fd, buffer, (size_t)rb) != rb) {
+				LOGERR("Restore: Error writing test file (%s)\n", strerror(errno));
+				goto exit;
+			}
+			digest_out->update((const unsigned char*)buffer, (size_t)rb);
+			done_size += (unsigned long long)rb;
+			if (part_settings->progress)
+				part_settings->progress->UpdateSize(done_size);
+			// Demo/test restore: check the correct restore cancel flag (NOT
+			// Check_Backup_Cancel()/stop_backup — that was always 0 during a
+			// restore, a dead no-op). Behavior-neutral for /super (stop_restore is
+			// 0 there anyway via the Cancel_Restore hard lock).
+			if (PartitionManager.stop_restore.get_value() != 0)
+				goto exit;
+		}
+		if (rb < 0) {
+			LOGERR("Restore: Error reading backup file (%s)\n", strerror(errno));
+			goto exit;
+		}
+	} else {
+		// ZSTD: child = 'zstd -d', stdin <- backup file (in_fd), stdout -> pipe;
+		// parent reads the pipe -> writes the test file + hashes inline
+		// (deadlock-free). No -T: zstd ignores thread args when decompressing
+		// (always single-threaded).
+		const char* argv[] = { "zstd", "-d", "-c", (char*)NULL };
+		if (zstd_pipe_spawn(zp, /*decompress=*/true, in_fd, argv, NULL, 0,
+		                    "Restore_Image_Test") < 0)
+			goto exit;
+		// The parent no longer needs in_fd (the child duped it as stdin).
+		close(in_fd);
+		in_fd = -1;
+		ssize_t rb;
+		while ((rb = read(zp.parent_fd, buffer, (size_t)RW_Block_Size)) > 0) {
+			if (write(out_fd, buffer, (size_t)rb) != rb) {
+				LOGERR("Restore: Error writing test file (%s)\n", strerror(errno));
+				goto exit;
+			}
+			digest_out->update((const unsigned char*)buffer, (size_t)rb);
+			done_size += (unsigned long long)rb;
+			if (part_settings->progress)
+				part_settings->progress->UpdateSize(done_size);
+			// Demo/test restore: check the correct restore cancel flag (see RAW branch).
+			if (PartitionManager.stop_restore.get_value() != 0)
+				goto exit;
+		}
+		if (rb < 0) {
+			LOGERR("Restore: Error reading from zstd pipe (%s)\n", strerror(errno));
+			goto exit;
+		}
+		if (zstd_pipe_finish(zp, "Restore_Image_Test") < 0)
+			goto exit;
+	}
+
+	fsync(out_fd);
+	// Post-loop flush (identical to Backup_Image): forces the final state (100%)
+	// to render NOW, while tw_busy=1 and BEFORE the multi-second phase-B
+	// verification. Otherwise the screen would stay stuck at the throttled 99%,
+	// because the only later 100% write (operation end) lands right before the
+	// page change (operation_end -> tw_busy=0) and gets no render frame.
+	if (part_settings->progress)
+		part_settings->progress->UpdateDisplayDetails(true);
+	hash_out = digest_out->return_digest_string();
+	LOGINFO("Restore_Image_Test: extracted %llu bytes, sha256=%s\n", done_size, hash_out.c_str());
+
+	// Phase A ends here (decompress + write + inline hash). The live-partition
+	// hash + comparison no longer runs in this timed restore region — that would
+	// distort "done (X seconds)" and avg_restore_rate (a second 14-GB read).
+	// Instead phase A only stores the result; the verification is done by
+	// Verify_Image_Test(), called from Run_Restore AFTER rStop, or on ADB
+	// restore from Restore_ADB_Backup AFTER the stream end (TWENDADB), untimed.
+	Demo_Test_Hash = hash_out;
+	Demo_Test_Size = done_size;
+	Demo_Test_Pending = true;
+	ret = true;
+
+exit:
+	zstd_pipe_kill(zp);
+	if (in_fd >= 0)
+		close(in_fd);
+	if (out_fd >= 0) {
+		// fsync only on success — on abort (cancel) or error, flushing the 14-GB
+		// partial file achieves nothing and would drag out the cancel needlessly
+		// (against the UFS wear reduction this is meant to serve).
+		if (ret)
+			fsync(out_fd);
+		close(out_fd);
+		// On abort/error discard the incomplete TestRestore file instead of
+		// leaving a multi-GB partial on internal storage. On success it stays
+		// (overwritten anyway on the next demo restore via O_TRUNC).
+		if (!ret)
+			unlink(destfn.c_str());
+	}
+	if (digest_out)
+		delete digest_out;
+	if (buffer)
+		free(buffer);
+	return ret;
+}
+
+// Phase B (UNTIMED): verify the live partition against the hash decompressed in
+// phase A. Called from Run_Restore AFTER rStop so the second 14-GB read does not
+// distort the restore time/rate ("done (X seconds)" / avg_restore_rate). Reads
+// the partition ONLY O_RDONLY — never writes to the block device. Size/hash
+// source: exclusively the Demo_Test_* values recorded in phase A (NO .info).
+bool TWPartition::Verify_Image_Test() {
+	const unsigned long long RW_Block_Size = 4ULL * 1024ULL * 1024ULL;
+	bool ret = false;
+	int blk_fd = -1;
+	void* buffer = NULL;
+	twrpDigest* digest_src = NULL;
+	unsigned long long Remain = Demo_Test_Size;
+	time_t vStart, vStop;
+	string hash_src;
+
+	Demo_Test_Pending = false;   // whatever the outcome: do not verify again
+
+	gui_print("Verifying %s test-restore against live partition (SHA256)...\n", Backup_Name.c_str());
+	LOGINFO("Verify_Image_Test: hashing live '%s' (%llu bytes)\n",
+	        Actual_Block_Device.c_str(), (unsigned long long)Demo_Test_Size);
+	time(&vStart);
+
+	blk_fd = open(Actual_Block_Device.c_str(), O_RDONLY | O_LARGEFILE);
+	if (blk_fd < 0) {
+		LOGERR("Verify_Image_Test: cannot open block device '%s' (%s)\n", Actual_Block_Device.c_str(), strerror(errno));
+		goto exit;
+	}
+	posix_fadvise64(blk_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+	buffer = malloc((size_t)RW_Block_Size);
+	if (!buffer) {
+		LOGERR("Verify_Image_Test failed to malloc\n");
+		goto exit;
+	}
+	digest_src = new twrpSHA256();
+	digest_src->init();
+	while (Remain > 0) {
+		ssize_t want = (Remain < RW_Block_Size) ? (ssize_t)Remain : (ssize_t)RW_Block_Size;
+		ssize_t rb = read(blk_fd, buffer, (size_t)want);
+		if (rb != want) {
+			LOGERR("Restore: Error reading block device for hash (%s)\n", strerror(errno));
+			goto exit;
+		}
+		digest_src->update((const unsigned char*)buffer, (size_t)rb);
+		Remain -= (unsigned long long)rb;
+	}
+	hash_src = digest_src->return_digest_string();
+	time(&vStop);
+	{
+		int vsec = (int)difftime(vStop, vStart);
+		if (vsec > 0)
+			gui_print("Verify read rate: %llu MB/sec\n", Demo_Test_Size / (unsigned long long)vsec / 1048576);
+	}
+	LOGINFO("Verify_Image_Test: live '%s' sha256=%s\n", Backup_Name.c_str(), hash_src.c_str());
+
+	if (Demo_Test_Hash == hash_src) {
+		gui_print_color("highlight", "%s test-restore MATCH: decompressed image is byte-exact to the live partition (dd-restore would be safe).\n", Backup_Name.c_str());
+		LOGINFO("Verify_Image_Test: MATCH (%s)\n", hash_src.c_str());
+		ret = true;
+	} else {
+		gui_print_color("error", "%s test-restore MISMATCH: decompressed image differs from live partition!\n", Backup_Name.c_str());
+		LOGERR("Verify_Image_Test: MISMATCH out=%s src=%s\n", Demo_Test_Hash.c_str(), hash_src.c_str());
+		ret = false;
+	}
+
+exit:
+	if (blk_fd >= 0)
+		close(blk_fd);
+	if (digest_src)
+		delete digest_src;
+	if (buffer)
+		free(buffer);
+	return ret;
+}
+#endif // TWRP_RESTORE_DEMO_MODE
+
 bool TWPartition::Restore_Image(PartitionSettings *part_settings) {
 	string Full_FileName;
 	string Restore_File_System = Get_Restore_File_System(part_settings);
+
+#ifdef TWRP_RESTORE_DEMO_MODE
+	// === Restore demo mode ===
+	// NO real dd restore on the daily driver: EVERY image partition (super,
+	// boot, modem, dtbo, ...) is instead test-restored into a file under
+	// /data/TestRestore/<Backup_Name>/ (Restore_Image_Test) + a SHA256 round-trip
+	// comparison against the live partition (phase B, O_RDONLY only). NEVER
+	// writes to the block device. Applies to GUI AND ADB restores: the ADB
+	// branch reads raw from the data FIFO TW_ADB_RESTORE (details in the
+	// Restore_Image_Test header); phase B is triggered there by
+	// Restore_ADB_Backup after the stream end. The destructive
+	// Raw_Read_Write/BlkDiscard path below is unreachable for images in demo mode.
+	if (!Restore_Image_Test(part_settings))
+		return false;
+	// bu waits for TWEOF after EVERY image partition (closing the data FIFO,
+	// freeing the stream for the next partition or the final TWENDADB). The real
+	// restore path below sends it (adbbackup branch at the function end) — in
+	// demo mode it MUST happen here too, otherwise bu spins forever after the
+	// LAST dd image (livelock with Restore_ADB_Backup, proven on-device). Mirror
+	// of the adbbackup branch at the real function end.
+	if (part_settings->adbbackup) {
+		if (!twadbbu::Write_TWEOF())
+			return false;
+	}
+	return true;
+#endif
 
 	TWFunc::GUI_Operation_Text(TW_RESTORE_TEXT, Backup_Display_Name, gui_parse_text("{@restoring_hdr}"));
 	gui_msg(Msg("restoring=Restoring {1}...")(Backup_Display_Name));
@@ -2976,8 +4044,15 @@ bool TWPartition::Restore_Image(PartitionSettings *part_settings) {
 		Full_FileName = part_settings->Backup_Folder + "/" + Backup_FileName;
 
 	if (Restore_File_System == "emmc") {
+		// Set partition_size deliberately ONLY in the !adbbackup branch. For ADB,
+		// Full_FileName == TW_ADB_RESTORE is a FIFO -> Get_File_Size would be
+		// pointless (-1/0/blocks). The authoritative size is set per image in the
+		// ADB path from the TWIMG stream header (twrpAdbBuFifo.cpp,
+		// part_settings.partition_size = twimghdr.size, BEFORE Restore_Partition)
+		// -> never stale. Setting it unconditionally here would overwrite that
+		// correct value.
 		if (!part_settings->adbbackup)
-			part_settings->total_restore_size = (uint64_t)(TWFunc::Get_File_Size(Full_FileName));
+			part_settings->partition_size = (uint64_t)(TWFunc::Get_File_Size(Full_FileName));
 		if (!Raw_Read_Write(part_settings))
 			return false;
 	} else if (Restore_File_System == "mtd" || Restore_File_System == "bml") {
@@ -3291,6 +4366,10 @@ bool TWPartition::Is_Sparse_Image(const string& Filename) {
 
 bool TWPartition::Flash_Sparse_Image(const string& Filename) {
 	string Command;
+
+#ifdef TW_ENABLE_BLKDISCARD
+	BlkDiscard();
+#endif
 
 	gui_msg(Msg("flashing=Flashing {1}...")(Display_Name));
 

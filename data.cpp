@@ -518,8 +518,10 @@ int DataManager::ShowProgress(float Portion, const float Seconds)
 
 void DataManager::update_tz_environment_variables(void)
 {
-	setenv("TZ", GetStrValue(TW_TIME_ZONE_VAR).c_str(), 1);
+	string TZ = GetStrValue(TW_TIME_ZONE_VAR);
+	setenv("TZ", TZ.c_str(), 1);
 	tzset();
+	property_set("persist.sys.timezone", TZ.c_str());
 }
 
 void DataManager::SetBackupFolder()
@@ -751,6 +753,14 @@ void DataManager::SetDefaultValues()
 #endif
 #endif
 	mConst.SetValue(TW_MIN_SYSTEM_VAR, TW_MIN_SYSTEM_SIZE);
+	// zstd-compress the /super image during backup (default on). GUI checkbox; mPersist so it survives reboots.
+	mPersist.SetValue("tw_compress_super", "1");
+	// zstd compression level for backup (1=fastest .. 19=smallest). GUI slider on
+	// the backup options page; the backup path clamps to 1..19 (twrpTar.cpp).
+	mPersist.SetValue("tw_zstd_level", "1");
+	// Include external app data (/data/media/0/Android) in backups (default off).
+	// GUI checkbox on the backup options page.
+	mPersist.SetValue("tw_backup_external_app_data", "0");
 	mData.SetValue(TW_BACKUP_NAME, "(Auto Generate)");
 
 	mPersist.SetValue(TW_INSTALL_REBOOT_VAR, "0");
@@ -771,6 +781,10 @@ void DataManager::SetDefaultValues()
 	mPersist.SetValue(TW_TIME_ZONE_GUIOFFSET, "0");
 	mPersist.SetValue(TW_TIME_ZONE_GUIDST, "1");
 	mPersist.SetValue(TW_AUTO_REFLASHTWRP_VAR, "0");
+	// Privacy log: 0 (default) = log file/folder names during backup/restore only
+	// on error paths; 1 = verbose per-entry lines. Must be seeded in mPersist —
+	// otherwise the checkbox toggle only lands in mData and is not reboot-persistent.
+	mPersist.SetValue("tw_verbose_log", "0");
 
 	mData.SetValue(TW_ACTION_BUSY, "0");
 	mData.SetValue("tw_wipe_cache", "0");
@@ -1143,8 +1157,8 @@ void DataManager::ReadSettingsFile(void)
 
 	memset(mkdir_path, 0, sizeof(mkdir_path));
 	memset(settings_file, 0, sizeof(settings_file));
-	sprintf(mkdir_path, "%s%s", GetSettingsStoragePath().c_str(), GetStrValue(TW_RECOVERY_FOLDER_VAR).c_str());
-	sprintf(settings_file, "%s/%s", mkdir_path, TW_SETTINGS_FILE);
+	sprintf(mkdir_path, "%s%s", GetSettingsStoragePath().c_str(), GetStrValue(TW_RECOVERY_NAME).c_str());
+	sprintf(settings_file, "%s%s", mkdir_path, TW_SETTINGS_FILE);
 
 	if (!PartitionManager.Mount_Settings_Storage(false))
 	{
@@ -1188,7 +1202,6 @@ void DataManager::Vibrate(const string& varName)
 
 void DataManager::LoadTWRPFolderInfo(void)
 {
-	string mainPath = GetCurrentStoragePath();
 	SetValue(TW_RECOVERY_FOLDER_VAR, TWFunc::Check_For_TwrpFolder());
-	mBackingFile = mainPath + GetStrValue(TW_RECOVERY_FOLDER_VAR) + '/' + TW_SETTINGS_FILE;
+	mBackingFile = GetSettingsStoragePath() + GetStrValue(TW_RECOVERY_NAME) + TW_SETTINGS_FILE;
 }

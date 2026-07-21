@@ -19,13 +19,11 @@
 #ifndef _TARWRITE_HEADER
 #define _TARWRITE_HEADER
 
-void reinit_libtar_buffer();
-void init_libtar_buffer(unsigned new_buff_size, int pipe_fd);
-void free_libtar_buffer();
-writefunc_t write_libtar_buffer(int fd, const void *buffer, size_t size);
-void flush_libtar_buffer(int fd);
-
-void init_libtar_no_buffer(int pipe_fd);
-writefunc_t write_libtar_no_buffer(int fd, const void *buffer, size_t size);
+/* Return type is ssize_t (not writefunc_t) — matches the definition in
+ * tarWrite.c and the writefunc_t signature itself. Upstream TWRP wrongly
+ * declares writefunc_t (a function pointer type) as the return type here;
+ * calling through that prototype is UB that only works by AArch64 ABI
+ * accident (pointer and ssize_t both live in x0). */
+ssize_t write_libtar_no_buffer(int fd, const void *buffer, size_t size);
 
 #endif  // _TARWRITE_HEADER

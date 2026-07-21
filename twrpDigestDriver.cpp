@@ -17,7 +17,10 @@
 */
 
 
+#include <cerrno>
+#include <cstring>
 #include <fcntl.h>
+#include <glob.h>
 #include <string>
 #include <unistd.h>
 #include "data.hpp"
@@ -103,22 +106,29 @@ bool twrpDigestDriver::Check_File_Digest(const string& Filename) {
 }
 
 bool twrpDigestDriver::Check_Digest(string Full_Filename) {
-	char split_filename[512];
-	int index = 0;
-
 	sync();
 	if (!TWFunc::Path_Exists(Full_Filename)) {
-		// This is a split archive, we presume
-		memset(split_filename, 0, sizeof(split_filename));
-		while (index < 1000) {
-			sprintf(split_filename, "%s%03i", Full_Filename.c_str(), index);
-			if (!TWFunc::Path_Exists(split_filename))
-				break;
-				LOGINFO("split_filename: %s\n", split_filename);
-				if (!Check_File_Digest(split_filename))
-					return false;
-				index++;
+		// Split archive: collect segments via glob "<base>[0-9][0-9][0-9]" rather
+		// than counting "%s%03i" upward — multi-pipe writes pipe-blocked segment
+		// names (win000/win100/win200...), so a sequential scan would stop at the
+		// first gap and leave win100+ unchecked. The glob covers both the DFP
+		// %i%02i and the legacy %03i scheme (same as discover_segments()).
+		glob_t gl;
+		std::string pattern = Full_Filename + "[0-9][0-9][0-9]";
+		int rc = glob(pattern.c_str(), 0, NULL, &gl);
+		if (rc != 0) {
+			// No segment found — nothing to check (lenient true).
+			globfree(&gl);
+			return true;
 		}
+		for (size_t k = 0; k < gl.gl_pathc; ++k) {
+			LOGINFO("split_filename: %s\n", gl.gl_pathv[k]);
+			if (!Check_File_Digest(gl.gl_pathv[k])) {
+				globfree(&gl);
+				return false;
+			}
+		}
+		globfree(&gl);
 		return true;
 	}
 	return Check_File_Digest(Full_Filename); // Single file archive
@@ -191,39 +201,48 @@ bool twrpDigestDriver::Make_Digest(string Full_Filename) {
 		if (!Write_Digest(Full_Filename))
 			return false;
 	} else {
-		char filename[512];
-		int index = 0;
-		sprintf(filename, "%s%03i", Full_Filename.c_str(), index);
-		while (index < 1000) {
-			string digest_src(filename);
-			if (TWFunc::Path_Exists(filename)) {
-				if (!Write_Digest(filename))
-					return false;
-				}
-				else
-					break;
-				index++;
-				sprintf(filename, "%s%03i", Full_Filename.c_str(), index);
+		// Collect segments via glob (see Check_Digest): sequential "%s%03i" would
+		// stop at the first gap in the pipe-blocked win000/win100/win200 naming
+		// and win100+ would never get a .sha2/.md5.
+		glob_t gl;
+		std::string pattern = Full_Filename + "[0-9][0-9][0-9]";
+		int rc = glob(pattern.c_str(), 0, NULL, &gl);
+		if (rc != 0 || gl.gl_pathc == 0) {
+			globfree(&gl);
+			LOGERR("Backup file: '%s' (bzw. '%s000') not found!\n", Full_Filename.c_str(), Full_Filename.c_str());
+			return false;
+		}
+		for (size_t k = 0; k < gl.gl_pathc; ++k) {
+			if (!Write_Digest(gl.gl_pathv[k])) {
+				globfree(&gl);
+				return false;
 			}
-			if (index == 0) {
-				LOGERR("Backup file: '%s' not found!\n", filename);
-					return false;
-			}
-			gui_msg("digest_created= * Digest Created.");
+		}
+		globfree(&gl);
+		gui_msg("digest_created= * Digest Created.");
 	}
 	return true;
 }
 
 bool twrpDigestDriver::stream_file_to_digest(string filename, twrpDigest* digest) {
 	char buf[4096];
-	int bytes;
+	ssize_t bytes;
 
 	int fd = open(filename.c_str(), O_RDONLY);
 	if (fd < 0) {
 		return false;
 	}
-	while ((bytes = read(fd, &buf, sizeof(buf))) != 0) {
+	// The loop must terminate on EOF (== 0) AND on read() error (< 0). Passing a
+	// -1 through to digest->update(buf, len) would convert to size_t (~4GiB) and
+	// read out of bounds of the 4096-byte buffer; on EINTR it would also loop
+	// forever.
+	while ((bytes = read(fd, buf, sizeof(buf))) > 0) {
 		digest->update((unsigned char*)buf, bytes);
+	}
+	if (bytes < 0) {
+		LOGERR("stream_file_to_digest: read('%s') failed: %s\n", filename.c_str(), strerror(errno));
+		close(fd);
+		return false;
 	}
 	close(fd);
 	return true;
