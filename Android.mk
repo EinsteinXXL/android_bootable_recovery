@@ -535,6 +535,13 @@ TWRP_REQUIRED_MODULES += \
     adbd_system_api_recovery \
     libsync.recovery
 
+# verify_backup.py device-side companion tools — fixed part of this fork's
+# recovery image, independent of the device tree.
+TWRP_REQUIRED_MODULES += \
+    listxattr \
+    hash_files \
+    fscrypt_policy_reader
+
 ifneq ($(TW_EXCLUDE_TZDATA), true)
 TWRP_REQUIRED_MODULES += \
     tzdata_twrp
@@ -767,7 +774,7 @@ include $(commands_TWRP_local_path)/injecttwrp/Android.mk \
     $(commands_TWRP_local_path)/twrpDigest/Android.mk \
     $(commands_TWRP_local_path)/attr/Android.mk \
     $(commands_TWRP_local_path)/hash_files/Android.mk \
-    $(commands_TWRP_local_path)/fscrypt_policy/Android.mk
+    $(commands_TWRP_local_path)/fscrypt_policy_reader/Android.mk
 
 ifneq ($(TW_OZIP_DECRYPT_KEY),)
     TWRP_REQUIRED_MODULES += ozip_decrypt

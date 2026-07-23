@@ -1,9 +1,9 @@
 LOCAL_PATH := $(call my-dir)
 
 include $(CLEAR_VARS)
-LOCAL_SRC_FILES := fscrypt_policy.c
+LOCAL_SRC_FILES := fscrypt_policy_reader.c
 LOCAL_CFLAGS := -O2 -Wall -Wextra
-LOCAL_MODULE := fscrypt_policy
+LOCAL_MODULE := fscrypt_policy_reader
 LOCAL_MODULE_TAGS := optional
 LOCAL_MODULE_CLASS := RECOVERY_EXECUTABLES
 LOCAL_MODULE_PATH := $(TARGET_RECOVERY_ROOT_OUT)/

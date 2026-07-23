@@ -1,6 +1,6 @@
 /*
- * fscrypt_policy — read fscrypt v1/v2 policy of a directory via ioctl and
- * emit it as a hex string. Companion to /hash_files and /listxattr for the
+ * fscrypt_policy_reader — read fscrypt v1/v2 policy of a directory via ioctl
+ * and emit it as a hex string. Companion to /hash_files and /listxattr for the
  * verify_backup.py tool: lets the device side fill the `fscrypt_policy`
  * column instead of the previous stub `-`.
  *
@@ -29,7 +29,7 @@
  *   On hard error (ENOENT, EACCES, ...): line goes to stderr, "-  <path>"
  *   still emitted on stdout so the awk loader keeps alignment with input.
  *
- * Usage:  fscrypt_policy [-v1|-v2|-auto] dir1 [dir2 ...]
+ * Usage:  fscrypt_policy_reader [-v1|-v2|-auto] dir1 [dir2 ...]
  *   -auto  (default) try _EX (returns v1 or v2 depending on kernel/fs),
  *          fall back to legacy v1 ioctl on EINVAL/ENOTTY.
  *   -v1    force legacy FS_IOC_GET_ENCRYPTION_POLICY (32-byte v1 struct).
@@ -128,7 +128,7 @@ enum { MODE_AUTO, MODE_V1, MODE_V2 };
 static int read_policy(const char *path, int mode, char *hex_out) {
     struct stat st;
     if (lstat(path, &st) != 0) {
-        fprintf(stderr, "fscrypt_policy: %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "fscrypt_policy_reader: %s: %s\n", path, strerror(errno));
         return -1;
     }
     /* fscrypt is a directory-level property. Plain files inherit from
@@ -139,10 +139,10 @@ static int read_policy(const char *path, int mode, char *hex_out) {
     int fd = open(path, O_DIRECTORY | O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
         if (errno == ENOENT || errno == EACCES) {
-            fprintf(stderr, "fscrypt_policy: %s: %s\n", path, strerror(errno));
+            fprintf(stderr, "fscrypt_policy_reader: %s: %s\n", path, strerror(errno));
             return -1;
         }
-        fprintf(stderr, "fscrypt_policy: %s: open: %s\n", path, strerror(errno));
+        fprintf(stderr, "fscrypt_policy_reader: %s: open: %s\n", path, strerror(errno));
         return -1;
     }
 
@@ -165,7 +165,7 @@ static int read_policy(const char *path, int mode, char *hex_out) {
         } else if (errno == ENODATA) {
             rc = 1;  /* no policy on this dir */
         } else if (mode == MODE_V2) {
-            fprintf(stderr, "fscrypt_policy: %s: ioctl_ex: %s\n", path, strerror(errno));
+            fprintf(stderr, "fscrypt_policy_reader: %s: ioctl_ex: %s\n", path, strerror(errno));
             rc = -1;
         } else {
             /* fall through to legacy */
@@ -181,7 +181,7 @@ static int read_policy(const char *path, int mode, char *hex_out) {
         } else if (errno == ENODATA) {
             rc = 1;
         } else {
-            fprintf(stderr, "fscrypt_policy: %s: ioctl: %s\n", path, strerror(errno));
+            fprintf(stderr, "fscrypt_policy_reader: %s: ioctl: %s\n", path, strerror(errno));
             rc = -1;
         }
     }
@@ -192,7 +192,7 @@ static int read_policy(const char *path, int mode, char *hex_out) {
 
 static void usage(void) {
     fprintf(stderr,
-        "Usage: fscrypt_policy [-v1|-v2|-auto] dir1 [dir2 ...]\n"
+        "Usage: fscrypt_policy_reader [-v1|-v2|-auto] dir1 [dir2 ...]\n"
         "  -auto  (default) try v2 then fall back to v1\n"
         "  -v1    force legacy FS_IOC_GET_ENCRYPTION_POLICY\n"
         "  -v2    force FS_IOC_GET_ENCRYPTION_POLICY_EX\n"
