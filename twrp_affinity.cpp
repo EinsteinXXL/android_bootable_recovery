@@ -182,7 +182,7 @@ namespace tw_affinity {
 		        gui_performance_core, gui_efficiency_core, mtp_core, nproc);
 
 		// Log the soft/hard flags (1=range/soft/cluster, 0=comma/hard/sliceable).
-		LOGINFO("[tw_affinity] cluster-flags tar_worker=%d zstd=%d enc_only_aes=%d enc_and_comp_aes=%d (1=Range/Soft, 0=Komma/Hard)\n",
+		LOGINFO("[tw_affinity] cluster-flags tar_worker=%d zstd=%d enc_only_aes=%d enc_and_comp_aes=%d (1=Range/Soft, 0=Comma/Hard)\n",
 		        tar_worker_is_cluster, zstd_is_cluster, enc_only_aes_is_cluster, enc_and_comp_aes_is_cluster);
 
 		// Prime-core diagnostics (cpu_capacity per core, fallback cpuinfo_max_freq).
