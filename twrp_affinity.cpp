@@ -44,8 +44,8 @@ namespace tw_affinity {
 
 	std::vector<int> tar_worker_cores;
 	std::vector<int> zstd_cores;
-	std::vector<int> enc_cores;
-	std::vector<int> comp_enc_cores;
+	std::vector<int> enc_only_aes_cores;
+	std::vector<int> enc_and_comp_aes_cores;
 
 	int gui_performance_core = -1;
 	int gui_efficiency_core  = -1;
@@ -53,10 +53,10 @@ namespace tw_affinity {
 
 	int active_pipes = 1;   // runtime; init() defaults it to compute_pipe_count()
 
-	bool tar_worker_is_cluster = false;   // soft (range) / hard (comma list) per list, set by init()
-	bool zstd_is_cluster    = false;
-	bool enc_is_cluster        = false;
-	bool comp_enc_is_cluster   = false;
+	bool tar_worker_is_cluster       = false;   // soft (range) / hard (comma list) per list, set by init()
+	bool zstd_is_cluster             = false;
+	bool enc_only_aes_is_cluster     = false;
+	bool enc_and_comp_aes_is_cluster = false;
 
 	// --- Helpers ---
 
@@ -141,11 +141,11 @@ namespace tw_affinity {
 #ifdef TW_AFFINITY_ZSTD_CORES
 		zstd_cores = parse_cpu_list(TW_AFFINITY_ZSTD_CORES, &zstd_is_cluster);
 #endif
-#ifdef TW_AFFINITY_ENC_CORES
-		enc_cores = parse_cpu_list(TW_AFFINITY_ENC_CORES, &enc_is_cluster);
+#ifdef TW_AFFINITY_ENC_ONLY_AES_CORES
+		enc_only_aes_cores = parse_cpu_list(TW_AFFINITY_ENC_ONLY_AES_CORES, &enc_only_aes_is_cluster);
 #endif
-#ifdef TW_AFFINITY_COMP_ENC_CORES
-		comp_enc_cores = parse_cpu_list(TW_AFFINITY_COMP_ENC_CORES, &comp_enc_is_cluster);
+#ifdef TW_AFFINITY_ENC_AND_COMP_AES_CORES
+		enc_and_comp_aes_cores = parse_cpu_list(TW_AFFINITY_ENC_AND_COMP_AES_CORES, &enc_and_comp_aes_is_cluster);
 #endif
 
 #ifdef TW_AFFINITY_GUI_PERFORMANCE
@@ -175,15 +175,15 @@ namespace tw_affinity {
 
 		LOGINFO("[tw_affinity] use=%d max_pipes=%d max_comp_threads=%d\n",
 		        use_cpu_affinity, set_max_pipes, max_comp_threads);
-		LOGINFO("[tw_affinity] tar_worker=%s zstd=%s enc=%s comp_enc=%s\n",
+		LOGINFO("[tw_affinity] tar_worker=%s zstd=%s enc_only_aes=%s enc_and_comp_aes=%s\n",
 		        fmt_list(tar_worker_cores).c_str(), fmt_list(zstd_cores).c_str(),
-		        fmt_list(enc_cores).c_str(), fmt_list(comp_enc_cores).c_str());
+		        fmt_list(enc_only_aes_cores).c_str(), fmt_list(enc_and_comp_aes_cores).c_str());
 		LOGINFO("[tw_affinity] gui_perf=%d gui_eff=%d mtp=%d nproc=%ld\n",
 		        gui_performance_core, gui_efficiency_core, mtp_core, nproc);
 
 		// Log the soft/hard flags (1=range/soft/cluster, 0=comma/hard/sliceable).
-		LOGINFO("[tw_affinity] cluster-flags tar_worker=%d zstd=%d enc=%d comp_enc=%d (1=Range/Soft, 0=Komma/Hard)\n",
-		        tar_worker_is_cluster, zstd_is_cluster, enc_is_cluster, comp_enc_is_cluster);
+		LOGINFO("[tw_affinity] cluster-flags tar_worker=%d zstd=%d enc_only_aes=%d enc_and_comp_aes=%d (1=Range/Soft, 0=Komma/Hard)\n",
+		        tar_worker_is_cluster, zstd_is_cluster, enc_only_aes_is_cluster, enc_and_comp_aes_is_cluster);
 
 		// Prime-core diagnostics (cpu_capacity per core, fallback cpuinfo_max_freq).
 		// PURELY INFORMATIONAL — does not influence pinning (BoardConfig is the

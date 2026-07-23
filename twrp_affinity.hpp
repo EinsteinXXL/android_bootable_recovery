@@ -44,10 +44,10 @@ namespace tw_affinity {
 	extern int  active_pipes;
 
 	// --- Affinity lists (element -1 = no-pin for that slot) ---
-	extern std::vector<int> tar_worker_cores;      // tar parent per pipe (all modes)
-	extern std::vector<int> zstd_cores;            // zstd sub-child per pipe + -T
-	extern std::vector<int> enc_cores;             // AES sub-child per pipe in ENCRYPTED mode (tar + AEAD)
-	extern std::vector<int> comp_enc_cores;        // AES sub-child per pipe in COMPRESSED_ENCRYPTED mode (zstd + AEAD)
+	extern std::vector<int> tar_worker_cores;       // tar parent per pipe (all modes)
+	extern std::vector<int> zstd_cores;             // zstd sub-child per pipe + -T
+	extern std::vector<int> enc_only_aes_cores;     // AES sub-child per pipe in ENCRYPTED mode (tar + AEAD, no compression)
+	extern std::vector<int> enc_and_comp_aes_cores; // AES sub-child per pipe in COMPRESSED_ENCRYPTED mode (zstd + AEAD)
 
 	// --- Soft/hard-pin flags per list ---
 	// true = range notation in BoardConfig ("4-7") = SOFT pin (cluster, never
@@ -56,8 +56,8 @@ namespace tw_affinity {
 	// active<MAX). Set by init().
 	extern bool tar_worker_is_cluster;
 	extern bool zstd_is_cluster;
-	extern bool enc_is_cluster;
-	extern bool comp_enc_is_cluster;
+	extern bool enc_only_aes_is_cluster;
+	extern bool enc_and_comp_aes_is_cluster;
 
 	// --- Single-core pinnings (-1 = no pin) ---
 	extern int gui_performance_core;               // GUI while idle

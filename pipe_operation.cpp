@@ -69,8 +69,8 @@ void PipeOperation::build_stages() {
 	}
 }
 
-// Core SLICE per stage. AES is mode-dependent (invariant): COMPRESSED_ENCRYPTED
-// -> comp_enc_cores, ENCRYPTED -> enc_cores; zstd always zstd_cores. core_slice uses
+// Core SLICE per stage. AES is mode-dependent (invariant): COMPRESSED_ENCRYPTED ->
+// enc_and_comp_aes_cores, ENCRYPTED -> enc_only_aes_cores; zstd always zstd_cores. core_slice uses
 // active_pipes + the list's is_cluster flag; at active==MAX one-core slices,
 // with fewer pipes wider slices/cluster.
 std::vector<int> PipeOperation::core_for(PipeStage s) const {
@@ -82,9 +82,9 @@ std::vector<int> PipeOperation::core_for(PipeStage s) const {
 		return tw_affinity::core_slice(tw_affinity::zstd_cores, tw_affinity::zstd_is_cluster,
 		                               tw_affinity::active_pipes, tw_.thread_id);
 	if (tw_.current_archive_type == COMPRESSED_ENCRYPTED)
-		return tw_affinity::core_slice(tw_affinity::comp_enc_cores, tw_affinity::comp_enc_is_cluster,
+		return tw_affinity::core_slice(tw_affinity::enc_and_comp_aes_cores, tw_affinity::enc_and_comp_aes_is_cluster,
 		                               tw_affinity::active_pipes, tw_.thread_id);
-	return tw_affinity::core_slice(tw_affinity::enc_cores, tw_affinity::enc_is_cluster,
+	return tw_affinity::core_slice(tw_affinity::enc_only_aes_cores, tw_affinity::enc_only_aes_is_cluster,
 	                               tw_affinity::active_pipes, tw_.thread_id);
 #endif
 }
