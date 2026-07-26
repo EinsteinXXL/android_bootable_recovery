@@ -51,7 +51,7 @@ public:
 	unsigned long long GetBackupSize() const;  // TWRP.backup_size: 0  = no marker
 	unsigned long long GetExtAppDataSize() const; // TWRP.ext_app_data_size: 0 = no marker
 
-	// Detection result (consolidated via TWFunc::detect_archive_type in Load).
+	// Detection result (produced by the private detect_archive_type() in Load).
 	Archive_Type GetType() const;              // detected archive type (outer type even on reject)
 	DetectResult GetStatus() const;            // DET_OK / reject reason (for TWFunc::emit_detect_reject)
 	bool         IsLegacy() const;             // is_legacy_type(GetType()): legacy (0-3) vs this build (4-7)
@@ -82,9 +82,9 @@ private:
 	Archive_Type mType;     // set by Load (always, outer type even on reject)
 	DetectResult mStatus;   // set by Load (DET_OK / reject reason)
 
-	// Peels the plaintext tar head for the (already detected) DFP type; plain =
-	// the first chunk decrypted by TWFunc::detect_archive_type via
-	// Try_Decrypting_File (only set for 5/7).
+	// Peels the plaintext tar head for the (already detected) type; plain = the
+	// first chunk decrypted by detect_archive_type() via Try_Decrypting_File()
+	// (only set for 5/7).
 	bool decode_head(const string& segment, Archive_Type t, const string& plain, string& tarhead);
 	static bool zstd_head(const char* src, size_t src_len, string& out, size_t out_cap); // zstd-decode the first KBs
 	void parse(const string& tarhead);                                                   // scans ALL "TWRP.*=" -> mHeader

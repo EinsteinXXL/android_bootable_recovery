@@ -343,7 +343,7 @@ tar_extract_regfile(TAR *t, const char *realname, const int *progress_fd)
 		return -1;
 	}
 
-	/* extract the file -- 128 KB aggregate chunks (per Sec. 8.7) */
+	/* extract the file -- 128 KB aggregate chunks (TAR_DATA_BUF_SIZE) */
 	/* TWRP restore output cache trim: otherwise the extracted files are NEVER
 	 * dropped from the page cache -> the cache grows to the RAM limit during
 	 * restore. Trim large files every 128 MB inline (via output_trim_cb ->

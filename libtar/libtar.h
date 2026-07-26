@@ -38,10 +38,9 @@ extern "C"
 #define T_MAXPATHLEN		(T_NAMELEN + T_PREFIXLEN)
 
 /* Data buffer for file content reads/writes — 128 KB matches zstd's
-   ZSTD_CStreamInSize(), halving compression API calls and matching the
-   optimal input chunk for the (de)compressor. Used by both append.c
-   (backup write path) and extract.c (restore read path -- Phase 3 patch
-   per Restore_Konzept.md Sec. 8.7). */
+   ZSTD_CStreamInSize(), which keeps the compression API call count low and hits
+   the optimal input chunk for the (de)compressor. Used by both append.c
+   (backup write path) and extract.c (restore read path). */
 #define TAR_DATA_BUF_SIZE	131072
 
 /* GNU extensions for typeflag */
@@ -116,9 +115,9 @@ typedef ssize_t (*readfunc_t)(int, void *, size_t);
 typedef ssize_t (*writefunc_t)(int, const void *, size_t);
 
 /* Robust block-I/O primitives (block.c) -- EINTR-/short-read-/partial-write-safe.
- * default_type (handle.c) and all TWRP tartype_t instances point here so that
- * tar fds may also be pipes (multi-pipe backup/restore: a bare read() returns
- * transient short reads on pipes -> th_read abort). */
+ * default_type (handle.c) and all TWRP tartype_t instances point here because a
+ * tar fd is not always a regular file: on the ADB paths it is a FIFO, where a
+ * bare read() returns transient short reads that would abort th_read. */
 ssize_t tar_io_read(int fd, void *buf, size_t count);
 ssize_t tar_io_write(int fd, const void *buf, size_t count);
 
@@ -192,8 +191,9 @@ typedef struct
 	/* fd ring (restore write side): do NOT close extracted fds immediately, keep
 	 * them in a ring -> when they fall out they are written back (clean) -> FADV
 	 * really drops (instead of fizzling at close because smallfiles are still dirty).
-	 * fd_ring = malloc'd array (NULL = off -> old posix_fadvise64+close; ADB/alloc
-	 * error). cap=R, count, head (circular). Auto-0/NULL via calloc in tar_init.
+	 * fd_ring = malloc'd array (NULL = off -> tar_extract_regfile falls back to an
+	 * immediate posix_fadvise64+close; that is the ADB and allocation-failure
+	 * case). cap=R, count, head (circular). Auto-0/NULL via calloc in tar_init.
 	 * dd-image/super never run through here. */
 	int *fd_ring;
 	int fd_ring_cap;
@@ -451,7 +451,7 @@ void print_caps(struct vfs_cap_data *cap_data);
 
 /* extract groups of files */
 int tar_extract_glob(TAR *t, char *globname, char *prefix);
-/* dfp_done_fd: Directory-First-Processing signal (DFP-R1). If >= 0,
+/* dfp_done_fd: directory-first-processing signal. If >= 0,
  * tar_extract_all() writes 1 byte once to this fd on the FIRST non-DIR header
  * (= all directories of this archive extracted). The restore parent then
  * releases the file pipes. -1 = no signal. */

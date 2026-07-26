@@ -59,6 +59,10 @@ LOCAL_SRC_FILES := \
     fixContexts.cpp \
     twrpTar.cpp \
     pipe_operation.cpp \
+    stage_engine.cpp \
+    stage_ring.cpp \
+    stage_io.c \
+    tw_bssl_aes/baes_stream.c \
     twrp_affinity.cpp \
     exclude.cpp \
     find_file.cpp \
@@ -137,11 +141,12 @@ LOCAL_C_INCLUDES += \
     $(LOCAL_PATH)/twinstall/include
 
 LOCAL_STATIC_LIBRARIES += libguitwrp
-# zstd decode (in-process) for the self-describing-backup ead peek (P3). Static lib
-# -> links into the recovery binary (no .so -> no ramdisk-restage trap as with
-# libtar). Lazy inclusion: 0 contribution to the binary until P3 code references
-# ZSTD_decompressStream. Include via $(LOCAL_PATH)/zstd/lib (zstd.h).
-LOCAL_STATIC_LIBRARIES += libzstddec_twrp
+# Full in-process zstd (compress + decompress). Serves the pipeline-in-process
+# engine (stage_engine.cpp: run_zstd_*) AND the self-describing-backup peek
+# (BackupHeaderManager: ZSTD_decompressStream). Static lib -> links into the
+# recovery binary (no .so -> no ramdisk-restage trap as with libtar). Exports
+# zstd.h via $(LOCAL_PATH)/zstd/lib.
+LOCAL_STATIC_LIBRARIES += libzstd_twrp
 LOCAL_C_INCLUDES += $(LOCAL_PATH)/zstd/lib
 LOCAL_SHARED_LIBRARIES += libz libc libcutils libstdc++ libtar libblkid libminuitwrp libmtdutils libtwadbbu 
 LOCAL_SHARED_LIBRARIES += libbootloader_message libcrecovery libtwrpdigest libc++ libaosprecovery libcrypto libbase 
@@ -378,9 +383,10 @@ endif
 ifneq ($(TW_CUSTOM_CPU_TEMP_PATH),)
 	LOCAL_CFLAGS += -DTW_CUSTOM_CPU_TEMP_PATH=$(TW_CUSTOM_CPU_TEMP_PATH)
 endif
-# TW_EXCLUDE_ENCRYPTED_BACKUPS := true  -> exclude backup encryption (BoringSSL
-# tw_bssl_aes) entirely. Empty/false/any other value -> crypto ON (default). OpenAES
-# has been removed; BoringSSL (libcrypto) is linked above anyway.
+# TW_EXCLUDE_ENCRYPTED_BACKUPS := true  -> exclude backup encryption (the BAES
+# AEAD core) entirely. Empty/false/any other value -> crypto ON (default);
+# BoringSSL (libcrypto) is linked above regardless. OpenAES-format backups are
+# hard-rejected via REJECT_OPENAES, they are never decrypted.
 ifeq ($(TW_EXCLUDE_ENCRYPTED_BACKUPS), true)
     LOCAL_CFLAGS += -DTW_EXCLUDE_ENCRYPTED_BACKUPS
 endif
@@ -422,10 +428,11 @@ endif
 ifneq ($(TW_SET_MAX_PIPES),)
     LOCAL_CFLAGS += -DTW_SET_MAX_PIPES=$(TW_SET_MAX_PIPES)
 endif
-# Unified MAX thread budget for zstd (-T) AND pigz (-p). Set (>=1) -> a budget
-# counter in compute_compressor_threads (= budget/active) caps -T (1 pipe -> -T<MAX>,
-# MAX pipes -> -T1), not a fixed value. := 0 -> all physical cores (nproc, = zstd
-# -T0 semantics: 1 pipe -> -Tnproc, N pipes -> nproc/N).
+# MAX compressor-thread budget, feeding the zstd stage's ZSTD_c_nbWorkers. Set
+# (>=1) -> a budget counter in compute_compressor_threads (= budget/active) caps
+# the per-pipe thread count (1 pipe -> MAX threads, MAX pipes -> 1 thread each),
+# not a fixed value. := 0 -> all physical cores (nproc: 1 pipe -> nproc threads,
+# N pipes -> nproc/N).
 # Unset -> budget = MAX_PIPES (nproc/2 class, leaves headroom for AES + workers).
 ifneq ($(TW_MAX_COMPRESSOR_THREADS),)
     LOCAL_CFLAGS += -DTW_MAX_COMPRESSOR_THREADS=$(TW_MAX_COMPRESSOR_THREADS)
@@ -507,7 +514,6 @@ TWRP_REQUIRED_MODULES += \
     flash_image \
     mke2fs.conf \
     pigz \
-    zstd \
     teamwin \
     twrp \
     fsck.fat \
@@ -605,9 +611,10 @@ endif
 ifeq ($(BOARD_HAS_NO_REAL_SDCARD),)
     TWRP_REQUIRED_MODULES += sgdisk
 endif
-ifneq ($(TW_EXCLUDE_ENCRYPTED_BACKUPS), true)
-    TWRP_REQUIRED_MODULES += tw_bssl_aes
-endif
+# NOTE: backup encryption runs in-process, so no separate crypto module is
+# required here -- baes_stream.c is compiled straight into recovery (see
+# LOCAL_SRC_FILES above). TW_EXCLUDE_ENCRYPTED_BACKUPS gates the crypto CODE via
+# LOCAL_CFLAGS.
 ifeq ($(TW_INCLUDE_DUMLOCK), true)
     TWRP_REQUIRED_MODULES += \
         htcdumlock htcdumlocksys flash_imagesys dump_imagesys libbmlutils.so \

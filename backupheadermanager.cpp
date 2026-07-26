@@ -27,7 +27,7 @@
 #include <string.h>    // memcmp/memmem/strncmp/strlen/memset/strerror
 #include <errno.h>     // errno (Try_Decrypting_File I/O errors)
 #include <glob.h>
-#include <zstd.h>   // in-process zstd decode (libzstddec_twrp), types 6/7
+#include <zstd.h>   // in-process zstd decode (libzstd_twrp), types 6/7
 
 #include <string>
 #include <fstream>  // ifstream (Get_File_Type magic read)
@@ -57,16 +57,16 @@ BackupHeaderManager::BackupHeaderManager() : mLoaded(false), mType(LEGACY_UNCOMP
 // ============================================================================================
 
 Archive_Type BackupHeaderManager::Get_File_Type(string fn) {
-	/* Binary magic detection. Deliberate differences from upstream:
-	 * (1) ifstream::read() instead of ::get() — the latter is the string API
-	 *     that stops at '\n' and NUL-terminates; semantically wrong for raw
-	 *     binary data. read() reads exactly count bytes, no delimiter, no NUL.
-	 * (2) zstd check over the full 4-byte magic (RFC 8478: 0x28 0xB5 0x2F
-	 *     0xFD). A 2-byte check has a ~1/65536 collision rate (vs ~1/2^32) —
-	 *     worst case a false-positive zstd detection followed by a pigz/zstd
-	 *     crash on non-zstd bytes.
-	 * (3) is_open() guard: without it, a failed open() would test
-	 *     uninitialized header bytes for magic → random detection.
+	/* Binary magic detection. Design points:
+	 * (1) ifstream::read(), NOT ::get() — get() is the string API that stops at
+	 *     '\n' and NUL-terminates, which is semantically wrong for raw binary
+	 *     data. read() reads exactly count bytes, no delimiter, no NUL.
+	 * (2) the zstd check covers the FULL 4-byte magic (RFC 8478: 0x28 0xB5 0x2F
+	 *     0xFD). A 2-byte check would carry a ~1/65536 collision rate (vs
+	 *     ~1/2^32) — worst case a false-positive zstd detection followed by a
+	 *     decoder failure on non-zstd bytes.
+	 * (3) is_open() guard: without it a failed open() would test uninitialized
+	 *     header bytes for magic -> random detection.
 	 * (4) header[] initialized to {0,0,0,0} — if the file yields < 4 bytes the
 	 *     unwritten slots are defined zeros instead of UB. */
 	unsigned char header[4] = {0, 0, 0, 0};
@@ -156,7 +156,8 @@ int BackupHeaderManager::Try_Decrypting_File(string fn, const string& password, 
 		return -1;
 	}
 
-	// Only tw_bssl_aes (magic "BAES") is supported; OpenAES was removed in TWRP 3.7+.
+	// Only the BAES format (magic "BAES") is supported; legacy OpenAES ("OA")
+	// backups are rejected.
 	uint8_t magic[10];
 	if (fread(magic, 1, 10, f) != 10) {
 		LOGERR("Failed to read magic from '%s'\n", fn.c_str());
@@ -328,7 +329,7 @@ int BackupHeaderManager::Try_Decrypting_File(string fn, const string& password, 
 // needed) — never a .info. Mapping:
 //   gzip magic (1f 8b)       -> LEGACY_COMPRESSED (1)          legacy TWRP, single-pipe
 //   zstd magic (28 b5 2f fd) -> COMPRESSED (6)        multi-pipe
-//   "OA" (OpenAES)           -> DET_REJECT_OPENAES             removed from TWRP 3.7+
+//   "OA" (OpenAES)           -> DET_REJECT_OPENAES             unsupported, always rejected
 //   "BA" (BAES, encrypted)   -> inner sniff decrypts the 1st chunk:
 //        ustar -> ENCRYPTED (5) | zstd -> COMPRESSED_ENCRYPTED (7)
 //   else (magic==LEGACY_UNCOMPRESSED, plain tar): ustar @257 present?
@@ -341,8 +342,8 @@ int BackupHeaderManager::Try_Decrypting_File(string fn, const string& password, 
 // standard tar; every pax archive has 'g'), so the self-describing value
 // TWRP.tartype==4 (written by createTar/write_global_headers) is positively
 // verified — otherwise reject (broken/foreign rather than blindly DFP).
-// Callers: extractTarFork() (parent, single + multi) + per-segment prescan +
-// BackupHeaderManager::Load.
+// Private: the only caller is BackupHeaderManager::Load(), which the outside
+// world reaches through Load()/GetType()/GetStatus().
 DetectResult BackupHeaderManager::detect_archive_type(const std::string &probe, const std::string &password,
                                          Archive_Type *out, std::string *out_plaintext) {
 	Archive_Type m = Get_Archive_Type_From_Segments(probe);   // partition type: all segments (detects heterogeneous OpenAES)
@@ -407,7 +408,7 @@ DetectResult BackupHeaderManager::detect_archive_type(const std::string &probe, 
 	return DET_REJECT_UNKNOWN;
 }
 
-// Decompresses the first bytes of a zstd stream in-process (libzstddec_twrp) up
+// Decompresses the first bytes of a zstd stream in-process (libzstd_twrp) up
 // to out_cap bytes — enough for the PAX g-header at the tar head. true on >0
 // output; partial output/incomplete status is fine (we only need the first KBs).
 bool BackupHeaderManager::zstd_head(const char *src, size_t src_len, string &out, size_t out_cap) {
@@ -428,7 +429,7 @@ bool BackupHeaderManager::zstd_head(const char *src, size_t src_len, string &out
 // Peels the plaintext tar head for the (already detected) DFP type (enough for
 // the PAX g-header at the start). plain = the first chunk decrypted by
 // detect_archive_type via Try_Decrypting_File — only set for types 5/7 -> NO
-// second decrypt. Type 6 reads+decompresses itself (libzstddec_twrp), type 4 is
+// second decrypt. Type 6 reads+decompresses itself (libzstd_twrp), type 4 is
 // plain tar. DFP (4-7) only; legacy/reject never reach this (Load).
 bool BackupHeaderManager::decode_head(const string &segment, Archive_Type t, const string &plain, string &tarhead) {
 	if (t == ENCRYPTED) {
@@ -486,11 +487,12 @@ void BackupHeaderManager::parse(const string &tarhead) {
 	}
 }
 
-// Detects type + status via detect_archive_type (ONE detection, shared with
-// extractTarFork) and parses — only for DFP — the TWRP.* g-records.
+// Detects type + status via detect_archive_type (ONE detection; extractTarFork
+// consumes the result through GetType()/GetStatus()) and parses the TWRP.*
+// g-records — only for this build's own types, which carry them.
 // detect_archive_type sets mType ALWAYS (outer type even on reject) so
-// Get_Restore_Size picks its DFP/legacy branch unchanged — no second segment
-// scan needed on the reject path. Returns true only if a g-header was parsed
+// Get_Restore_Size picks its own/legacy branch without a second segment scan on
+// the reject path. Returns true only if a g-header was parsed
 // (DFP 4-7). Exactly ONE BAES decrypt: detect delivers the plaintext chunk in
 // plain; decode_head reuses it.
 bool BackupHeaderManager::Load(const string &segment, const string &password) {

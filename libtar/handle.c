@@ -28,10 +28,9 @@
 const char libtar_version[] = PACKAGE_VERSION;
 
 /* tar_io_* (block.c): short-read-/EINTR-/partial-write-safe. ALL
- * tar_fdopen(..., NULL, ...) callers land here -- in particular the restore
- * pipelines (pipe_operation.cpp RestorePipeline, twrpTar.cpp
- * adb/uncompressed/legacy). A bare read() aborted on pipes at transient short
- * reads (raw+aes restore at the end of the DFP pre-run). */
+ * tar_fdopen(..., NULL, ...) callers land here -- in particular the plain-tar
+ * restore paths in twrpTar.cpp (ADB FIFO and uncompressed file). A bare read()
+ * would abort on the transient short reads a FIFO delivers. */
 static tartype_t default_type = { open, close, tar_io_read, tar_io_write };
 
 

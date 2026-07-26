@@ -25,33 +25,24 @@ extern "C" {
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <sys/file.h>
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
 #include <glob.h>
 #include <fcntl.h>
-#include <stdlib.h>             /* setenv/getenv — Cipher-Force-Knob -> Filter-Env */
+#include <stdlib.h>
 #include <strings.h>            /* strcasecmp — force-knob values */
 #include <cutils/properties.h>  /* property_get — twrp.force_aead Force-Knob */
-#include <fstream>
-#include <iostream>
 #include <string>
-#include <sstream>
 #include <vector>
 #include <csignal>
 #include <dirent.h>
-#include <libgen.h>
 #include <sys/mman.h>
-#include <sys/ioctl.h>
 #include <poll.h>
 #include <sys/signalfd.h>
-#include <sys/prctl.h>
-#include <zlib.h>
-#include <semaphore.h>
 #include <time.h>
 #include "twrpTar.hpp"
-#include "pipe_operation.hpp"
+#include "pipe_operation.hpp"   // BackupPipeline/RestorePipeline + complete PipeOperation type (pipeline_ member, ~twrpTar)
 #include "twrp_affinity.hpp"
 #include "twcommon.h"
 #include "variables.h"
@@ -60,17 +51,12 @@ extern "C" {
 #ifndef HWCAP_AES
 #define HWCAP_AES	(1 << 3)
 #endif
-#include <sys/resource.h>
-#include <sys/syscall.h>
 #include "adbbu/libtwadbbu.hpp"
 #include "twrp-functions.hpp"
-#include "backupheadermanager.hpp"   // GetFileType()/Load()/getters instead of free TWFunc detection
+#include "backupheadermanager.hpp"   // BackupHeaderManager::Load()/GetFileType() + getters (archive-type detection)
 #include "gui/gui.hpp"
-#include <chrono>
-#include <random>
 #include <new>              // placement-new for SegmentClaim (restore work queue)
 #include <algorithm>
-#include <unordered_map>
 #include "progresstracking.hpp"
 
 #ifndef BUILD_TWRPTAR_MAIN
@@ -85,44 +71,43 @@ extern "C" {
 #endif
 #endif
 
-// TWTAR_FLAGS moved to pipe_operation.hpp (shared by twrpTar.cpp and
-// pipe_operation.cpp; pipe_operation.hpp is included above).
+// TWTAR_FLAGS is defined in pipe_operation.hpp (included above): both this file
+// and pipe_operation.cpp pass it to tar_open/tar_fdopen.
 
 using namespace std;
 
 // ---------------------------------------------------------------------------
-// File-local constants. CPU affinity constants live in tw_affinity (via
-// BoardConfig flags). Only topology-independent values remain here.
+// File-local constants (topology-independent). The CPU-affinity constants live
+// in tw_affinity, fed by BoardConfig flags.
 // ---------------------------------------------------------------------------
 namespace {
-	constexpr int PIPE_SIZE_BYTES = 262144;   // 256 KB per pipe (F_SETPIPE_SZ)
-	// Array dimension for pipe-related data structures. The real pipe count per
+	// Array dimension for pipeline-related data structures. The real pipe count per
 	// backup/restore run comes from tw_affinity::compute_pipe_count().
 	constexpr int MAX_PIPELINES = tw_affinity::MAX_PIPELINES_HARDCAP;
+	// Source read-ahead window for tarList. Kernel readahead cannot cross file
+	// boundaries, so a stream of small files stalls on cold data pages. A budgeted
+	// POSIX_FADV_WILLNEED over the upcoming TarList entries warms them in advance.
+	// Cap per file: large files only need their head warmed, the rest is covered by
+	// the POSIX_FADV_SEQUENTIAL that tar_append_regfile sets (libtar/append.c).
+	constexpr long long PREFETCH_PER_FILE_CAP   = 4LL  << 20;  // 4 MB per file
+	constexpr long long PREFETCH_DEFAULT_BUDGET = 32LL << 20;  // 32 MB in-flight (0 = off)
+	// Stage-join budget for the backup segment close (closeTar). Deliberately not
+	// blocking: if a stage ever wedged — e.g. an ADB reader that stopped draining
+	// the data FIFO, leaving the last stage stuck in write() — the worker would
+	// hang forever and the parent with it in poll(). Generous on purpose, because
+	// ADB backpressure can legitimately stall a write for many seconds; this is an
+	// anti-wedge net, not a latency budget. On timeout the segment fails loudly:
+	// the thread is abandoned and the worker _exit()s (isolation boundary).
+	// The restore side uses 10 s (closeTarRestore) — it reads from a file/FIFO and
+	// has no comparable legitimate stall.
+	constexpr int BACKUP_JOIN_TIMEOUT_SECS = 120;
 }
 
 // ---------------------------------------------------------------------------
-// File-local helper: bundled data-pipe setup. pipe2(O_CLOEXEC) + F_SETPIPE_SZ
-// on both ends. Returns 0=ok, -1=error. F_SETPIPE_SZ is best-effort; failures
-// are logged but not escalated, because the default pipe buffer (64 KB) is
-// suboptimal but functional.
-// ---------------------------------------------------------------------------
-int make_data_pipe(int p[2]) {
-	if (pipe2(p, O_CLOEXEC) < 0)
-		return -1;
-	if (fcntl(p[0], F_SETPIPE_SZ, PIPE_SIZE_BYTES) < 0)
-		LOGINFO("Warning: F_SETPIPE_SZ %d failed on read end: %s\n", PIPE_SIZE_BYTES, strerror(errno));
-	if (fcntl(p[1], F_SETPIPE_SZ, PIPE_SIZE_BYTES) < 0)
-		LOGINFO("Warning: F_SETPIPE_SZ %d failed on write end: %s\n", PIPE_SIZE_BYTES, strerror(errno));
-	return 0;
-}
-
-// ---------------------------------------------------------------------------
-// Tier-2 cleanup consolidation. The createTar() setup-error cleanup moved to
-// PipeOperation::abort() (pipe_operation.cpp) — the pipeline owns its pipes_,
-// and the reap/fd/unlink part uses the private reap_subchildren + the tw_ fds
-// via friend. The close-stage cleanups (finish_pipeline/abort_pipeline) are
-// further down next to reap_subchildren.
+// Stage teardown lives in PipeOperation::join_stages, behind the named intents
+// finish()/abort()/abort_setup() (pipe_operation.cpp). The close-stage entry
+// points here (finish_pipeline/abort_pipeline, further down) are null-safe
+// delegates: they consume pipeline_ and close the twrpTar-owned file ends.
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
@@ -136,7 +121,7 @@ int make_data_pipe(int p[2]) {
 // distinguishes the two paths ("Killing child" vs "Killing restore child").
 //
 // Publish order in add(): pid first, then count — the cancel path must never
-// see a set count_ without the corresponding pids_ entry (J2 race fix).
+// see a set count_ without the corresponding pids_ entry.
 // ---------------------------------------------------------------------------
 namespace {
 class PipeChildRegistry {
@@ -145,9 +130,9 @@ class PipeChildRegistry {
 	// Cancel-vs-crash disambiguation for the SIGCHLD crash-detect loop.
 	// kill_all_usr2() sets the flag — the parent SIGCHLD branch then suppresses
 	// the "abnormal exit" abort, because a cancel terminates all workers anyway.
-	// Without it the cancel path would detect itself as a crash (a worker
-	// exit(0) is normal, but sub-child signals from kill_all_usr2 can pass a
-	// NON-zero status through).
+	// Without it the cancel path could detect itself as a crash: a worker that has
+	// not yet installed the SIGUSR2 handler (child_init_pipeline) dies from the
+	// default action, so waitpid reports a signal status instead of exit(0).
 	std::atomic<bool>  cancel_in_flight_{false};
 	const char*        kill_tag_;
 public:
@@ -161,7 +146,7 @@ public:
 	}
 
 	// idx must be < MAX_PIPELINES. PID first, then count -- see the class header
-	// comment (J2 race fix).
+	// comment.
 	void add(int idx, pid_t pid) noexcept {
 		pids_[idx].store(pid);
 		count_.store(idx + 1);
@@ -211,13 +196,13 @@ public:
 PipeChildRegistry g_backup_children("child");
 PipeChildRegistry g_restore_children("restore child");
 
-// Pin the calling pipe-worker process to its assigned big core. Called by the
-// pipe child right after fork() in createTarFork()/extractTarFork() so the
-// worker + the later-forked zstd sub-child land on the same core (shared L2 ->
-// better cache locality between tar_block_read/write and zstd
-// compress/decompress). p is the pipe slot index. Pinning comes from
-// TW_AFFINITY_TAR_WORKER_CORES (mod-wrap, -1 = no pinning for that slot). Complete
-// no-op if TW_USE_CPU_AFFINITY=false or the list is unset.
+// Pin the calling pipe-worker process to its assigned core slice. Called by the
+// pipe child right after fork() in createTarFork()/extractTarFork(); p is the
+// pipe slot index. The slice comes from TW_AFFINITY_TAR_WORKER_CORES (mod-wrap,
+// -1 = no pinning for that slot). Complete no-op if TW_USE_CPU_AFFINITY=false or
+// the list is unset. The stage threads are pinned separately and to their own
+// lists (zstd_cores / *_aes_cores via PipeOperation::core_for), so they do not
+// inherit this mask.
 void pin_pipe_worker_to_big_core(int p) {
 	// Core slice instead of a single core. At active < MAX the worker gets a
 	// wider slice (or the whole cluster with range notation); at active==MAX
@@ -236,11 +221,10 @@ void pin_pipe_worker_to_big_core(int p) {
 // the name is meaningless: after the DFP directory lead (win000) all segments
 // are position- and pipe-independent (the libtar hardlink inode cache hangs off
 // the TAR* handle -> no cross-segment references). extractTarFork() therefore
-// distributes the segments via a work queue (SegmentClaim) instead of a fixed
-// block p -> pipe p.
+// distributes the segments via a work queue (SegmentClaim).
 //
-// Discovery via glob() instead of a 9999 Path_Exists loop: one readdir() pass,
-// tolerant of sequence gaps, much faster for large backups.
+// Discovery via glob(): one readdir() pass, tolerant of sequence gaps, fast even
+// for large backups.
 // ---------------------------------------------------------------------------
 
 // Cross-process work-queue counter for the multi-pipe restore. A single
@@ -278,17 +262,18 @@ struct SegmentClaim {
 // ===========================================================================
 // Cipher agility (BAES): AEAD choice per backup. 0 = AES-256-GCM (HW AES),
 // 1 = ChaCha20-Poly1305 (software). The cipher id lives self-describing in the
-// stream header (flags field, offset 12) — filter/pw-probe/PC-tool read it from
-// there (== the cipher SSoT). These helpers serve ONLY the GUI/log banner and
-// the test/benchmark force knob; the real crypto choice is made by tw_bssl_aes
-// itself.
+// stream header (flags field, offset 12) — decrypt/pw-probe/PC-tool read it from
+// there (== the cipher SSoT), so RESTORE never needs to be told. Only the BACKUP
+// direction picks a cipher: resolve_backup_cipher() -> aead_cipher_id ->
+// spawn_aes_stage -> baes_stream_encrypt. The label helpers below serve the
+// GUI/log banner.
 // ===========================================================================
 
 // Backup: determine the effective AEAD cipher. The force knob 'twrp.force_aead'
 // (chacha|gcm; test/benchmark, e.g. force ChaCha on a HW-AES device) wins over
-// HW detection. The result is passed to the filter via env (tw_bssl_aes reads
-// TW_AEAD_CIPHER) and used by the banner. Returns: 0 = AES-256-GCM,
-// 1 = ChaCha20-Poly1305.
+// HW detection. The result is stored in aead_cipher_id and handed to the AES stage
+// as a parameter (spawn_aes_stage -> StageThread::aead_cipher_id); it also drives the
+// banner. Returns: 0 = AES-256-GCM, 1 = ChaCha20-Poly1305.
 static int resolve_backup_cipher() {
 	char prop[PROPERTY_VALUE_MAX] = {0};
 #ifndef BUILD_TWRPTAR_MAIN
@@ -303,7 +288,6 @@ static int resolve_backup_cipher() {
 		cid = BAES_CIPHER_AES_256_GCM;
 	else
 		cid = (getauxval(AT_HWCAP) & HWCAP_AES) ? BAES_CIPHER_AES_256_GCM : BAES_CIPHER_CHACHA20_POLY1305;
-	setenv("TW_AEAD_CIPHER", cid == BAES_CIPHER_CHACHA20_POLY1305 ? "chacha" : "gcm", 1);
 	return cid;
 }
 
@@ -335,17 +319,19 @@ static const char* hw_suffix(int cipher_id) {
 	return (cipher_id == BAES_CIPHER_AES_256_GCM && (getauxval(AT_HWCAP) & HWCAP_AES)) ? " HW" : "";
 }
 
-// detect_archive_type / DetectResult / is_legacy_type / emit_detect_reject moved to
-// TWFunc (twrp-functions.cpp/.hpp): one detection, linkable in both build
-// modules. Callers here use TWFunc::detect_archive_type / TWFunc::is_legacy_type /
-// TWFunc::emit_detect_reject; BackupHeaderManager::Load likewise.
+// Archive-type detection runs inside BackupHeaderManager: Load() drives the
+// private detect_archive_type(), and GetType()/GetStatus() hand out the result.
+// This file calls hdr.Load() (extractTarFork) and BackupHeaderManager::GetFileType()
+// (uncompressedSize). Only the shared vocabulary lives in TWFunc
+// (twrp-functions.cpp/.hpp), linkable from both build modules: the DetectResult
+// enum plus TWFunc::is_legacy_type() and TWFunc::emit_detect_reject().
 
 // Segment discovery for the restore: all archives `basefn[0-9][0-9][0-9]`
 // (matches both the DFP scheme `%s%i%02i` AND legacy `%s%03i`) as a sorted path
 // list. Lexical sorting is identical to numeric here (fixed 3-digit suffix,
 // same length) -> win000 is guaranteed to be element 0 (DFP directory lead
 // first). The pipe assignment happens at runtime via a work queue
-// (SegmentClaim), no longer statically via the block prefix. Empty list ->
+// (SegmentClaim), not statically via the block prefix. Empty list ->
 // nothing to restore (the caller handles that).
 //
 // Caller: extractTarFork() once per restore (legacy and DFP multi-pipe branch).
@@ -534,11 +520,10 @@ static void reset_msg_pipe_parser(void) {
  * years to reach this value in one tick). Thus collision-free against the normal
  * progress path, which only writes real fs values (0 or file bytes).
  *
- * Legacy compatibility: the old sentinel 0xFFFFFFFFFFFFFFFFULL also matches the
- * MAGIC prefix. Its lower 32 = 0xFFFFFFFF (= 2^32-1) fails the bounds check
- * (>= pipe_count) and is shown by the reader as "source pipe unknown". So any
- * forgotten migration site can never become a crash/UB risk, only log less
- * informatively.
+ * Robustness: every 8-byte value carrying the MAGIC prefix counts as a sentinel.
+ * If its lower 32 bits fall outside [0, pipe_count) the reader reports "source
+ * pipe unknown" instead of indexing out of range — a malformed sentinel can only
+ * log less precisely, never cause a crash or UB.
  */
 static constexpr unsigned long long SENTINEL_MAGIC      = 0xFFFFFFFF00000000ULL;
 static constexpr unsigned long long SENTINEL_MAGIC_MASK = 0xFFFFFFFF00000000ULL;
@@ -550,14 +535,37 @@ static inline unsigned long long make_failure_sentinel(int pipe_idx) {
 }
 
 // Returns true if fs is a failure sentinel. *out_pipe is set to the encoded
-// pipe index if it is in the valid range [0, pipe_count), else -1 (=
-// legacy/unknown). pipe_count is the worker count of the current job — without
-// that context the range cannot be validated.
+// pipe index if it is in the valid range [0, pipe_count), else -1 (= unknown).
+// pipe_count is the worker count of the current job — without that context the
+// range cannot be validated.
 static inline bool is_failure_sentinel(unsigned long long fs, int pipe_count, int* out_pipe) {
 	if ((fs & SENTINEL_MAGIC_MASK) != SENTINEL_MAGIC) return false;
 	int p = (int)(fs & SENTINEL_PIPE_MASK);
 	*out_pipe = (p >= 0 && p < pipe_count) ? p : -1;
 	return true;
+}
+
+/* Set once a worker has reported a fatal error and still has to tear its
+ * pipeline down. The parent answers the sentinel with the SIGUSR2 broadcast,
+ * which also reaches the reporting worker -- Signal_Kill honours this flag and
+ * returns instead of _exit()ing, so the stage join completes. Without it the
+ * signal cut the teardown short: the concrete stage reason (join_stages LOGERR)
+ * was lost AND the worker died with status 0, hiding its own failure from the
+ * reap. volatile sig_atomic_t = the only shape a handler may read.
+ * The worker _exit()s at the end of that path anyway; the teardown is bounded by
+ * the stage-join timeouts (and the parent's SIGKILL fallback, which no flag can
+ * block). */
+static volatile sig_atomic_t failure_teardown_active = 0;
+
+/* Report a fatal worker error to the parent: arm the teardown flag, then write
+ * the 8-byte sentinel. Single choke point for BOTH directions (backup +
+ * restore) so the flag can never be forgotten at one of the sites. The write
+ * return code is deliberately ignored: the worker _exit()s right after, and the
+ * parent's waitpid is the fallback path. */
+static void report_failure_sentinel(int progress_fd, int pipe_idx) {
+	failure_teardown_active = 1;
+	unsigned long long sentinel = make_failure_sentinel(pipe_idx);
+	(void)write(progress_fd, &sentinel, sizeof(sentinel));
 }
 
 /*
@@ -569,7 +577,7 @@ static inline bool is_failure_sentinel(unsigned long long fs, int pipe_count, in
  *
  * Use ONLY where a lost progress value is acceptable. NOT for sentinel writes
  * right before _exit() — there the suppression would be pointless since the
- * worker ends immediately anyway (see (void)write + waitpid fallback at the 3
+ * worker ends immediately anyway (see the (void)write + waitpid fallback at the
  * sentinel sites).
  */
 static void progress_write_best_effort(int fd, unsigned long long v) {
@@ -587,33 +595,11 @@ static void progress_write_best_effort(int fd, unsigned long long v) {
 	// Ignore other errno values (e.g. EINTR) — best effort.
 }
 
-/*
- * Strict password-pipe writer. A truncated write would give tw_bssl_aes an
- * empty/cut password -> wrong key -> unusable backup or restore corruption.
- * Atomic guarantee: PW+\0 < 100 bytes << PIPE_BUF (4096), so either complete or
- * error.
- *
- * Returns true on a complete write, else false (the caller must escalate). The
- * strict check n == expected (rather than only n < 0) is defensive against
- * partial writes.
- */
-bool write_password_or_log(int fd, const std::string& password) {
-	size_t expected = password.size() + 1;
-	ssize_t n = write(fd, password.c_str(), expected);
-	if (n == (ssize_t)expected)
-		return true;
-	LOGERR("[H1] write password to tw_bssl_aes pipe failed: n=%zd errno=%d (%s)\n",
-	       n, errno, strerror(errno));
-	return false;
-}
-
 twrpTar::twrpTar(void) {
 	use_encryption = 0;
 	userdata_encryption = 0;
 	use_compression = 0;
 	split_archives = 0;
-	comp_pid = 0;
-	crypt_pid = 0;
 	Total_Backup_Size = 0;
 	exact_backup_size = 0;   // exact content sum (also reset per backup in createTarFork)
 	exact_ext_app_data_size = 0;   // ext-app-data portion (g-header TWRP.ext_app_data_size)
@@ -621,16 +607,18 @@ twrpTar::twrpTar(void) {
 	include_root_dir = true;
 	tar_type.openfunc = open;
 	tar_type.closefunc = close;
-	// tar_io_* (libtar/block.c): robust block I/O, short-read-safe on
-	// pipes (same primitive as default_type in handle.c). writefunc
-	// defensively co-initialized -- was uninitialized until createTar() (write_tar_no_buffer,
-	// which internally also delegates to tar_io_write).
+	// tar_io_* (libtar/block.c): robust block I/O -- EINTR-safe and
+	// partial-read/write-safe, the same primitives default_type uses in handle.c.
+	// tar_type reaches libtar only through createTar()'s plain-tar branches, and
+	// both overwrite writefunc with write_tar_no_buffer (which itself delegates to
+	// tar_io_write). readfunc is initialised for completeness: the plain-tar
+	// RESTORE path passes NULL and libtar then uses its own default_type.
 	tar_type.readfunc = tar_io_read;
 	tar_type.writefunc = tar_io_write;
 	input_fd = -1;
 	output_fd = -1;
 	output_trim_offset = 0;   // output cache trimmer: write-behind offset (also reset per segment in createTar())
-	progress_pipe_fd = -1;   // defensive (-1 idiom like input/output_fd); the backup child sets it in child_pipe_preamble
+	progress_pipe_fd = -1;   // defensive (-1 idiom like input/output_fd); every pipe child sets it in child_pipe_preamble
 	backup_exclusions = NULL;
 	current_archive_type = LEGACY_UNCOMPRESSED;   // default (0 = pre-detection sentinel) — overwritten by Set_Archive_Type or magic detection
 
@@ -640,7 +628,11 @@ twrpTar::twrpTar(void) {
 }
 
 twrpTar::~twrpTar(void) {
-	// Do nothing
+	// Out-of-line on purpose: destroying pipeline_ (unique_ptr) needs the complete
+	// PipeOperation type (pipe_operation.hpp is included HERE, not in every
+	// twrpTar.hpp includer). ~PipeOperation is the stage/ring safety net; every
+	// regular path consumes the pipeline via finish_pipeline()/abort_pipeline()
+	// long before this runs, and _exit() paths skip destructors entirely.
 }
 
 void twrpTar::setfn(string fn) {
@@ -659,21 +651,28 @@ void twrpTar::setpassword(string pass) {
 	password = pass;
 }
 
+// SIGUSR2 handler of the pipe workers (cancel broadcast). Ends the worker at
+// once -- EXCEPT while a failure teardown is running: then it returns, letting
+// the worker finish the stage join (which logs the concrete reason) and exit
+// with its own -1. Returning is safe because the handler carries SA_RESTART and
+// every stage loop is EINTR-safe.
 void twrpTar::Signal_Kill(int signum) {
+	if (failure_teardown_active)
+		return;
 	_exit(0);
 }
 
 // Setup routine for each pipeline child right after fork(). Idempotent.
 // SIGPIPE-IGN is doubly ensured (the parent also sets SIG_IGN via
-// sigaction+restore — see createTarFork). SIG_IGN survives exec.
+// sigaction+restore — see createTarFork).
 //
 // Uses sigaction() instead of signal(): signal() is marked "obsolescent" since
 // POSIX.1-2001 and varies in reset/restart semantics between BSD and SysV.
 // sigaction with sa_mask=empty + SA_RESTART gives deterministic behavior across
 // platforms (persistent handler, EINTR restart on blocking syscalls).
-// Signal_Kill calls _exit(0) — the handler never returns, so SA_RESTART is
-// practically irrelevant but semantically correct. _exit is async-signal-safe
-// (POSIX § 2.4.3).
+// Signal_Kill normally calls _exit(0); it returns only while a failure teardown
+// is in progress, and SA_RESTART then resumes the interrupted stage I/O. _exit is
+// async-signal-safe (POSIX § 2.4.3).
 void twrpTar::child_init_pipeline(void) {
 	struct sigaction sa;
 	sigemptyset(&sa.sa_mask);
@@ -684,67 +683,18 @@ void twrpTar::child_init_pipeline(void) {
 	sigaction(SIGUSR2, &sa, nullptr);
 }
 
-// Shared pipeline-child setup after fork() for zstd.
-// slice = core slice (from tw_affinity::core_slice); empty = un-pin to all cores
-// (apply_core_list_pin resets to the default mask so the sub-child does NOT keep
-// the mask inherited from the worker), 1 element = single core, several =
-// cluster/soft pin.
-void twrpTar::setup_pipeline_child_zstd(int fd_in, int fd_out, const std::vector<int>& slice) {
-	child_init_pipeline();
-	// Tier2Guard: kernel guarantee "worker dead => sub-child dead" — structurally
-	// covers EVERY worker exit (_exit on error, Signal_Kill/cancel, SIGSEGV,
-	// OOM kill) without any exit path having to cooperate. SIGKILL not SIGTERM:
-	// PDEATHSIG only fires on paths where the archive is lost anyway (the normal
-	// path reaps BEFORE the worker exit — so it never fires). Survives execve
-	// (zstd/tw_bssl_aes without setuid/file-caps); hangs off the death of the
-	// forking THREAD — workers are single-threaded. The getppid check closes the
-	// fork->prctl window: if the worker already died, the child is reparented to
-	// init (PID 1) (no subreaper in recovery).
-	prctl(PR_SET_PDEATHSIG, SIGKILL);
-	if (getppid() == 1) _exit(1);
-#ifndef BUILD_TWRPTAR_MAIN
-	tw_affinity::apply_core_list_pin(slice);   // core slice (1 core = single pin, several = cluster)
-#endif
-	dup2(fd_in, STDIN_FILENO);
-	dup2(fd_out, STDOUT_FILENO);
-}
-
-// Pipeline-child setup for tw_bssl_aes.
-// pw_fd_keep: read end of the password pipe (strip CLOEXEC so execv sees it).
-// slice = core slice (from core_slice); empty = un-pin to all cores (reset to
-// the default mask, no worker inheritance).
-void twrpTar::setup_pipeline_child_crypt(int fd_in, int fd_out, int pw_fd_keep, const std::vector<int>& slice) {
-	child_init_pipeline();
-	// Tier2Guard: see setup_pipeline_child_zstd().
-	prctl(PR_SET_PDEATHSIG, SIGKILL);
-	if (getppid() == 1) _exit(1);
-	fcntl(pw_fd_keep, F_SETFD, 0);   // strip CLOEXEC so tw_bssl_aes sees the FD
-#ifndef BUILD_TWRPTAR_MAIN
-	tw_affinity::apply_core_list_pin(slice);   // core slice instead of a single core
-#endif
-	dup2(fd_in, STDIN_FILENO);
-	dup2(fd_out, STDOUT_FILENO);
-}
-
-// The zstd/pigz thread argument ("-T<n>" / "-p<n>") is built by the PARENT
-// (PipeOperation::fork_zstd) BEFORE the fork() — directly via
-// tw_affinity::compute_compressor_threads(active_pipes, pipe_id) + snprintf into
-// a stack buffer, NOT as a std::string in the forked child (allocation ->
-// malloc-lock deadlock risk). The thread COUNT always comes from the
-// remainder-free budget law compute_compressor_threads (Σ over all pipes ==
-// budget); it is INDEPENDENT of pinning (slice = WHICH cores, not HOW MANY).
-
 void twrpTar::Set_Archive_Type(Archive_Type archive_type) {
 	current_archive_type = archive_type;
 }
 
 // ---------------------------------------------------------------------------
-// Shared parent-side pipeline mechanics extracted from createTarFork() (backup)
-// and extractTarFork() (restore). Parametrized are only the real differences:
+// Shared parent-side pipeline mechanics for createTarFork() (backup) and
+// extractTarFork() (restore). Parametrized are only the real differences:
 // registry, reap_label/tag, count_files (backup file tick), pipe_count, progress
-// target. FD-close/reap order, J2 (PID before count), C2 (clear before waitpid),
-// signalfd crash detect and the sentinel format stay identical. The fork loop +
-// child body remain inline in the respective methods.
+// target. The fd-close/reap order, the registration order (PID before count), the
+// clear-before-waitpid order, the signalfd crash detect and the sentinel format
+// are identical for both. The fork loop + child body stay inline in the
+// respective methods.
 // ---------------------------------------------------------------------------
 struct PipeParentState {
 	bool reaped[MAX_PIPELINES] = {false};
@@ -839,8 +789,9 @@ static void run_pipe_poll(PipeParentState& st, int prog_fd, int msg_fd, int sigc
 		}
 
 		// SIGCHLD branch: out-of-band crash detection. Per-PID waitpid(WNOHANG),
-		// never waitpid(-1) — other threads keep reaping their own sub-children.
-		// clear(p) hides the slot from kill_all_usr2() (C2 reasoning).
+		// never waitpid(-1) — other threads of this process fork their own children
+		// (TWFunc::Exec_Cmd and friends) and must be able to reap them themselves.
+		// clear(p) hides the slot from kill_all_usr2().
 		if (pollfds[2].fd >= 0 && (pollfds[2].revents & POLLIN)) {
 			struct signalfd_siginfo si;
 			while (read(pollfds[2].fd, &si, sizeof(si)) == sizeof(si)) {
@@ -909,8 +860,9 @@ static void run_pipe_poll(PipeParentState& st, int prog_fd, int msg_fd, int sigc
 }
 
 // Reap loop for all pipe children. Slots already reaped in the poll loop
-// (SIGCHLD branch, st.reaped[p]) are skipped; the rest via Wait_For_Child with
-// C2 clear-before-waitpid. Returns the number of abnormally terminated children.
+// (SIGCHLD branch, st.reaped[p]) are skipped; the rest go through Wait_For_Child,
+// clearing the registry slot first. Returns the number of abnormally terminated
+// children.
 static int run_pipe_reap(PipeParentState& st, int pipe_count, pid_t* child_pids,
                          PipeChildRegistry& reg, const char* reap_label) {
 	int child_status = 0;
@@ -925,8 +877,8 @@ static int run_pipe_reap(PipeParentState& st, int pipe_count, pid_t* child_pids,
 			continue;
 		}
 		if (child_pids[p] > 0) {
-			// C2: clear(p) BEFORE Wait_For_Child — closes the PID-recycling
-			// window against a concurrent cancel.
+			// clear(p) BEFORE Wait_For_Child — closes the PID-recycling window
+			// against a concurrent cancel.
 			pid_t local_pid = child_pids[p];
 			reg.clear(p);
 			if (TWFunc::Wait_For_Child(local_pid, &child_status, reap_label) != 0) {
@@ -961,11 +913,10 @@ static bool finalize_pipe_log(const PipeParentState& st, int failed_children, co
 }
 
 // ---------------------------------------------------------------------------
-// Four fork-adjacent blocks extracted from createTarFork() (backup) and
-// extractTarFork() (restore). The order of the race/signal-critical steps is
-// preserved. The fork-loop skeleton, the J2 registration (add()=PID before
-// count), *tar_fork_pid (backup) and the differing child bodies stay inline in
-// the respective methods.
+// Four fork-adjacent helpers shared by createTarFork() (backup) and
+// extractTarFork() (restore). The fork-loop skeleton, the registration
+// (add() = PID before count), *tar_fork_pid (backup) and the differing child
+// bodies stay inline in the respective methods.
 // ---------------------------------------------------------------------------
 
 // Set SIGPIPE to SIG_IGN in the parent, save the old handler in `old`. This is
@@ -981,8 +932,8 @@ static void save_and_ignore_sigpipe(struct sigaction& old) {
 // Block SIGCHLD before the fork loop and arm a signalfd for it (crash detect
 // for abnormal worker death). The block mask is saved in old_chld_mask. Returns
 // the signalfd (>=0) or -1 if signalfd() failed — then the mask is already
-// restored and the parent poll runs gracefully in the old semantics (in-band
-// sentinel only, no crash detect).
+// restored and the parent poll degrades gracefully to the in-band sentinel only,
+// without crash detection.
 static int arm_sigchld_signalfd(sigset_t& old_chld_mask) {
 	sigset_t chld_mask;
 	sigemptyset(&chld_mask);
@@ -1068,16 +1019,6 @@ int twrpTar::createTarFork(std::atomic<pid_t> *tar_fork_pid) {
 	}
 #endif
 
-	// Increase kernel pipe max for larger data pipes
-	{
-		int pmax_fd = open("/proc/sys/fs/pipe-max-size", O_WRONLY);
-		if (pmax_fd >= 0) {
-			if (write(pmax_fd, "1048576", 7) != 7)
-				LOGINFO("Warning: could not set /proc/sys/fs/pipe-max-size\n");
-			close(pmax_fd);
-		}
-	}
-
 	if (pipe2(progress_pipe, O_CLOEXEC) < 0) {
 		LOGERR("Error creating progress tracking pipe\n");
 		gui_err("backup_error=Error creating backup.");
@@ -1094,26 +1035,24 @@ int twrpTar::createTarFork(std::atomic<pid_t> *tar_fork_pid) {
 	}
 
 	// Pipeline count: size-dependent via compute_pipe_count(used_bytes) =
-	// min( ceil(Total_Backup_Size / LADDER_UNIT), MAX budget ). Fixes the
-	// size-blind bug (a small partition always got MAX_PIPES -> mini segments).
+	// min( ceil(Total_Backup_Size / LADDER_UNIT), MAX budget ), so a small
+	// partition gets few pipes instead of MAX_PIPES worth of mini segments.
 	// The MAX budget resolves TW_SET_MAX_PIPES > fallback (nproc/2), incl. the
 	// nproc-2 safety net (central in compute_pipe_count(), the same budget as
 	// compute_compressor_threads()).
 #ifdef BUILD_TWRPTAR_MAIN
 	int num_pipes = 1;   // standalone twrpTar: hard single-pipe core (no affinity/size scaling)
 #else
-	// adbbackup: HARD single-pipe (like the original TWRP reference, which never
-	// splits/parallelizes adb). The adb stream is ONE stream over the wire under
+	// adbbackup: HARD single-pipe. The adb stream is ONE stream over the wire under
 	// ONE Write_TWFN header — multiple pipes would write into it interleaved ->
 	// corrupt, non-restorable backup. With num_pipes==1 -> active_pipes==1 ->
-	// compute_compressor_threads(1,0)==max_comp_threads (=8) -> the single zstd
-	// gets -T8 (full CPU use, like upstream pigz all-cores; total budget unchanged).
+	// compute_compressor_threads(1,0) yields the full thread budget, so the single
+	// zstd stage runs with that many ZSTD_c_nbWorkers (total budget unchanged).
 	int num_pipes = part_settings->adbbackup ? 1 : tw_affinity::compute_pipe_count(Total_Backup_Size);
 #endif
 	LOGINFO("Parallel pipelines: %d\n", num_pipes);
 
 	// ---- Build file list (in parent, before fork) ----
-	unsigned long long file_count_local = 0;
 	unsigned last_thread_id = 0;
 	std::vector<TarListStruct> FileList;
 
@@ -1123,8 +1062,9 @@ int twrpTar::createTarFork(std::atomic<pid_t> *tar_fork_pid) {
 	// done post-hoc by apply_lpt_distribution(); all directories go to pipe 0 as
 	// the lead (fill loop below). Only the HWCAP_AES banner is AES-specific.
 	if (use_encryption || userdata_encryption) {
-		// Cipher agility: determine the effective AEAD (force knob/HWCAP), pass
-		// it to the filter via env and choose the banner from it (not raw HWCAP).
+		// Cipher agility: determine the effective AEAD (force knob/HWCAP) and store
+		// it in aead_cipher_id — the worker copy below passes it to the AES stage as
+		// a parameter. The banner is chosen from that value, not from raw HWCAP.
 		aead_cipher_id = resolve_backup_cipher();
 		bool gcm = (aead_cipher_id == BAES_CIPHER_AES_256_GCM);
 		LOGINFO("Using encryption (parallel, %s)\n", aead_cipher_label(aead_cipher_id));
@@ -1158,7 +1098,6 @@ int twrpTar::createTarFork(std::atomic<pid_t> *tar_fork_pid) {
 			return -1;
 		}
 		file_count = (unsigned long long)ret;
-		file_count_local = file_count;
 	}
 
 	// per-file LPT: assigns each file its thread_id (pipe), byte-balanced. DIRs
@@ -1222,8 +1161,8 @@ int twrpTar::createTarFork(std::atomic<pid_t> *tar_fork_pid) {
 	                       Total_Backup_Size <= MAX_ARCHIVE_SIZE);
 
 	// Active pipe count for the zstd thread budget (compute_compressor_threads()
-	// in fork_zstd) — set BEFORE the fork loop, the comp sub-children inherit it
-	// via fork().
+	// in spawn_zstd_stage) — set BEFORE the worker fork loop, so each worker process
+	// inherits it and its zstd stage thread reads the right budget.
 #ifndef BUILD_TWRPTAR_MAIN
 	tw_affinity::active_pipes = actual_pipes;
 #endif
@@ -1236,20 +1175,20 @@ int twrpTar::createTarFork(std::atomic<pid_t> *tar_fork_pid) {
 	LOGINFO("Pipeline: %d active pipe(s) (twrpTar single-pipe core)\n", actual_pipes);
 #else
 	if (use_compression)
-		LOGINFO("Pipeline: %d active pipe(s); zstd -T per pipe first=%d last=%d (MAX_PIPES=%d)\n",
+		LOGINFO("Pipeline: %d active pipe(s); zstd worker threads per pipe first=%d last=%d (MAX_PIPES=%d)\n",
 		        actual_pipes, tw_affinity::compute_compressor_threads(actual_pipes, 0),
 		        tw_affinity::compute_compressor_threads(actual_pipes, actual_pipes - 1),
 		        tw_affinity::compute_pipe_count());
 	else
-		LOGINFO("Pipeline: %d active pipe(s) (uncompressed -- no zstd -T)\n", actual_pipes);
+		LOGINFO("Pipeline: %d active pipe(s) (uncompressed -- no zstd stage)\n", actual_pipes);
 #endif
 
 	// Reset static cancel-state to avoid Cancel_Backup() seeing stale PIDs from a previous backup
 	g_backup_children.reset();
 
 	// Set SIGPIPE to SIG_IGN, save the old handler. Children inherit SIG_IGN via
-	// fork; exec preserves SIG_IGN. The parent handler is restored on every exit
-	// path from here so the rest of TWRP keeps its previous behavior.
+	// fork. The parent handler is restored on every exit path from here, so the
+	// rest of TWRP is unaffected.
 	struct sigaction sigpipe_old;
 	save_and_ignore_sigpipe(sigpipe_old);
 
@@ -1304,6 +1243,11 @@ int twrpTar::createTarFork(std::atomic<pid_t> *tar_fork_pid) {
 				pipe_tar.use_encryption = use_encryption;
 				pipe_tar.userdata_encryption = userdata_encryption;
 				pipe_tar.setpassword(password);
+				// The worker's AES stage THREAD reads the resolved cipher from
+				// aead_cipher_id (encrypt). resolve_backup_cipher() set it on the
+				// parent before the fork loop; copy it into the worker object so
+				// spawn_aes_stage can pass it on.
+				pipe_tar.aead_cipher_id = aead_cipher_id;
 			} else {
 				pipe_tar.use_encryption = 0;
 			}
@@ -1319,24 +1263,22 @@ int twrpTar::createTarFork(std::atomic<pid_t> *tar_fork_pid) {
 			if (createList((void*)&pipe_tar) != 0) {
 				LOGINFO("Error creating backup for pipe %d\n", p);
 				// Failure sentinel FIRST over the progress pipe (mirror of
-				// extractTarFork). Reports the internally detected error
-				// (zstd/aes death -> EPIPE -> tarList) reliably over the fd the
-				// parent ALWAYS reads in poll -> "Pipe X reported fatal error",
-				// rather than only over the racy signalfd(SIGCHLD).
+				// extractTarFork). Reports the internally detected error (a failed
+				// stage poisons its ring -> the tar read/write returns EIO ->
+				// tarList aborts) reliably over the fd the parent ALWAYS reads in
+				// poll -> "Pipe X reported fatal error", rather than only over the
+				// racy signalfd(SIGCHLD).
 				// is_failure_sentinel is checked in run_pipe_poll BEFORE the
 				// count_files logic -> no collision with the 0-file tick. Covers
 				// only the INTERNAL error; an external kill/crash cannot send a
-				// sentinel -> relies on signalfd. The write return code is
-				// deliberately ignored (_exit follows; waitpid fallback).
-				unsigned long long sentinel = make_failure_sentinel(p);
-				(void)write(progress_pipe_fd, &sentinel, sizeof(sentinel));
-				// Tier2Guard (mirror of the restore side): terminate the
-				// comp/crypt sub-children in order (SIGTERM) + reap them BEFORE
-				// the worker dies — otherwise they orphan and AES flushes a
+				// sentinel -> relies on signalfd.
+				report_failure_sentinel(progress_pipe_fd, p);
+				// Tear down the stage pipeline (poison rings + timed join) BEFORE
+				// the worker dies — otherwise a still-running AES thread flushes a
 				// well-formed-looking truncated tail into the partial archive.
-				// Idempotent for all tarList error codes (already-reaped PIDs are
-				// 0). Timeout-protected (10s SIGKILL fallback); PDEATHSIG remains
-				// the net.
+				// Null-safe/idempotent for all tarList error codes (a split-error
+				// closeTar already consumed pipeline_). 10s timed join; a wedged
+				// thread dies with the _exit below (isolation boundary).
 				pipe_tar.abort_pipeline(/*timeout_secs=*/10);
 				gui_deactivate_msg_pipe();
 				close(progress_pipe[1]);
@@ -1351,7 +1293,7 @@ int twrpTar::createTarFork(std::atomic<pid_t> *tar_fork_pid) {
 	}
 
 	// ---- Parent process ----
-	// g_backup_children was populated inside the fork loop (J2 race fix).
+	// g_backup_children was populated inside the fork loop.
 	// *tar_fork_pid was already set in the loop at p==0 — no redundancy here.
 	close(progress_pipe[1]);
 	close(msg_pipe[1]);
@@ -1399,11 +1341,12 @@ int twrpTar::createTarFork(std::atomic<pid_t> *tar_fork_pid) {
 //     c. Staggered gate: pipe 0 does the win000 directory lead, wave B starts
 //        only after it ends (dfp_pipe/go_pipe)
 //     d. Fork loop for pipe_count pipes; each child claims segments via the
-//        SegmentClaim work queue (no longer a fixed block p -> pipe p)
+//        SegmentClaim work queue
 //        - In the child: child_init_pipeline, CPU pin via
 //          tw_affinity::core_slice(tar_worker_cores, ...), thread_id=p,
-//          stop_restore check between archives, openTar/extractTar/closeTar per
-//          archive, on error SENTINEL + _exit(-1).
+//          stop_restore check between archives, extractTar()/closeTarRestore()
+//          per archive (extractTar calls openTar internally), on error
+//          SENTINEL + _exit(-1).
 //     e. Parent: GUI efficiency core, poll loop with sentinel handling
 //     f. waitpid all children + g_restore_children.clear(p)
 //     g. return -1 if sentinel or failed_children
@@ -1523,8 +1466,7 @@ int twrpTar::extractTarFork() {
 			// (compute_pipe_count(), incl. the nproc-2 safety net) EXACTLY mirrors
 			// the createTarFork() choice, so the restore never starts more pipes
 			// than the backup used / the device tolerates. Segments are
-			// distributed at runtime via SegmentClaim (no longer a fixed block p
-			// -> pipe p).
+			// distributed at runtime via SegmentClaim.
 #ifdef BUILD_TWRPTAR_MAIN
 			pipe_count = 1;
 #else
@@ -1539,8 +1481,8 @@ int twrpTar::extractTarFork() {
 			// dirs). Only once it is in place (signalled at the first non-DIR via
 			// dfp_pipe) does the parent release the file pipes (wave B) over
 			// go_pipe. Every file is thus written into an already correctly
-			// policed directory — the old mkdirhier() cross-pipe policy race is
-			// structurally excluded. At pipe_count == 1 the gate is dropped (no
+			// policed directory, so no cross-pipe mkdirhier() policy race can
+			// occur. At pipe_count == 1 the gate is dropped (no
 			// wave B); pipe 0 then extracts everything sequentially.
 			if (pipe_count > 1) {
 				if (pipe2(dfp_pipe, O_CLOEXEC) < 0 ||
@@ -1560,7 +1502,7 @@ int twrpTar::extractTarFork() {
 	} else if (!part_settings->adbbackup) {
 		// Single-file restore (unsplit `.win` / twrpTarMain): run the same
 		// detector in the parent so current_archive_type + the AES banner below
-		// are correct (extract() in the child no longer detects itself). ADB is
+		// are correct (extract() in the child does no detection of its own). ADB is
 		// exempt — there the type comes from adb_compression in extract().
 		Archive_Type at = LEGACY_UNCOMPRESSED;
 		BackupHeaderManager hdr;
@@ -1626,14 +1568,14 @@ int twrpTar::extractTarFork() {
 	// signalfd delivers SIGCHLD synchronously into the poll loop so abnormal
 	// worker death (SIGKILL via OOM, SIGSEGV in libtar on a corrupt archive,
 	// SIGABRT) is detected — the in-band failure sentinel does not fire there
-	// (the worker no longer reaches the write site, see the make_failure_sentinel
-	// calls below).
+	// (the worker no longer reaches the write site, see the
+	// report_failure_sentinel calls below).
 	sigset_t old_chld_mask;
 	int sigchld_fd = arm_sigchld_signalfd(old_chld_mask);
 
-	// Set the active pipe count (for worker pinning; restore zstd -d ignores -T,
-	// so it has no effect on the thread budget, but this stays consistent with
-	// the backup path).
+	// Set the active pipe count. It sizes the core slices of the worker and of its
+	// stage threads (tw_affinity::core_slice); a decompress stage takes no thread
+	// budget of its own — only compression does.
 #ifndef BUILD_TWRPTAR_MAIN
 	tw_affinity::active_pipes = pipe_count;
 #endif
@@ -1668,7 +1610,7 @@ int twrpTar::extractTarFork() {
 		// child_pipe_preamble().
 		child_pipe_preamble(p, progress_pipe, msg_pipe, sigchld_fd, old_chld_mask);
 
-		this->thread_id = p;   // important for openTar() sub-child pinning
+		this->thread_id = p;   // important for the stage-thread core slices (core_for uses thread_id)
 
 		// ---- Staggered-restore gate (DFP multi-pipe path only) ----
 		if (dfp_pipe[0] >= 0) {
@@ -1706,13 +1648,10 @@ int twrpTar::extractTarFork() {
 			if (extract() != 0) {
 				LOGINFO("Pipe %d: extract() failed\n", p);
 				gui_print_color("error", "Restore pipe %d failed during single-archive extract()\n", p);
-				unsigned long long sentinel = make_failure_sentinel(p);
-				// Return code deliberately ignored — _exit(-1) follows right
-				// below, the parent detects the failure via waitpid() as fallback.
-				(void)write(progress_pipe_fd, &sentinel, sizeof(sentinel));
-				// Reap the sub-children (comp_pid/crypt_pid), else zombies. The
-				// multi branch below also calls this after each extractTar().
-				// Timeout-protected (10s SIGKILL fallback).
+				report_failure_sentinel(progress_pipe_fd, p);
+				// Join the stage threads (else they + their rings leak). The multi
+				// branch below also calls this after each extractTar().
+				// Timeout-protected (10s timed-join fallback).
 				closeTarRestore();
 				gui_deactivate_msg_pipe();
 				close(progress_pipe[1]);
@@ -1721,21 +1660,17 @@ int twrpTar::extractTarFork() {
 			// Same cleanup on the success path.
 			closeTarRestore();
 #ifndef BUILD_TWRPTAR_MAIN
-			// Send TWEOF only AFTER closeTarRestore(): finish_pipeline reaped
-			// comp/crypt and closed input_fd -> from here nobody holds a read end
-			// of the data FIFO. Previously the TWEOF went out while input_fd +
-			// zstd-stdin were still open -> bu's next open(TW_ADB_RESTORE,
-			// O_WRONLY) hit the dying old reader and pumped the next partition
-			// into the void via EPIPE ("Broken pipe" cascade in adb.log,
-			// "unexpected EOF" in TWRP). The protocol invariant is now the same
-			// everywhere: all read fds closed, THEN TWEOF (mirror of
-			// Restore_Image_Test close->Write_TWEOF and closeTar
-			// finish_pipeline->TWEOF).
+			// Send TWEOF only AFTER closeTarRestore(): it joins the stage threads and
+			// closes input_fd, so from here nobody holds a read end of the data FIFO.
+			// Sending it earlier would leave a reader alive, and bu's next
+			// open(TW_ADB_RESTORE, O_WRONLY) would hit that dying reader and pump the
+			// next partition into the void via EPIPE ("Broken pipe" in adb.log,
+			// "unexpected EOF" in TWRP). Protocol invariant, identical everywhere:
+			// all read fds closed, THEN TWEOF (same as Restore_Image_Test
+			// close->Write_TWEOF and closeTar finish_pipeline->TWEOF).
 			if (part_settings->adbbackup && !twadbbu::Write_TWEOF()) {
 				LOGINFO("Pipe %d: Write_TWEOF after pipeline teardown failed\n", p);
-				unsigned long long sentinel = make_failure_sentinel(p);
-				// Return code deliberately ignored — _exit(-1) follows, waitpid fallback.
-				(void)write(progress_pipe_fd, &sentinel, sizeof(sentinel));
+				report_failure_sentinel(progress_pipe_fd, p);
 				gui_deactivate_msg_pipe();
 				close(progress_pipe[1]);
 				_exit(-1);
@@ -1747,11 +1682,10 @@ int twrpTar::extractTarFork() {
 		}
 
 		// ---- Multi-archive branch: claim segments via the work queue ----
-		// Instead of reading a fixed "block p", each pipe pulls its segment
-		// indices dynamically from the shared SegmentClaim counter
-		// (self-balancing, pipe-independent after the DFP lead). Pipe 0 runs alone
-		// in wave A and thus necessarily claims index 0 (win000) as its first
-		// segment.
+		// Each pipe pulls its segment indices dynamically from the shared
+		// SegmentClaim counter (self-balancing, pipe-independent after the
+		// directory-first lead). Pipe 0 runs alone in wave A and thus necessarily
+		// claims index 0 (win000) as its first segment.
 		int n_segments = (int)segments.size();
 		int claimed = 0;
 
@@ -1773,20 +1707,18 @@ int twrpTar::extractTarFork() {
 			tarfn = segments[idx];
 			claimed++;
 
-			// extractTar() internally calls openTar() (with a sub-child fork) and
-			// tar_close(). closeTar() must NOT be called here (tar_append_eof()
-			// fails on RDONLY). closeTarRestore() only reaps the sub-children and
-			// closes input_fd.
+			// extractTar() internally calls openTar() (which starts the stage
+			// threads) and tar_close(). closeTar() must NOT be called here
+			// (tar_append_eof() fails on RDONLY). closeTarRestore() only joins the
+			// stage threads and closes input_fd.
 			if (extractTar() != 0) {
 				LOGINFO("Pipe %d: extractTar() failed for '%s'\n", p, tarfn.c_str());
 				char errbuf[256];
 				snprintf(errbuf, sizeof(errbuf),
 				         "Restore pipe %d failed extracting %s", p, tarfn.c_str());
 				gui_print_color("error", "%s\n", errbuf);
-				unsigned long long sentinel = make_failure_sentinel(p);
-				// Return code deliberately ignored — _exit(-1) follows, waitpid fallback.
-				(void)write(progress_pipe_fd, &sentinel, sizeof(sentinel));
-				// Reap the sub-children (comp_pid/crypt_pid), else zombies.
+				report_failure_sentinel(progress_pipe_fd, p);
+				// Join the stage threads (else they + their rings leak).
 				// Symmetric to the single/ADB error path (above) and the
 				// multi-success pattern (closeTarRestore() per iteration below).
 				closeTarRestore();
@@ -1798,12 +1730,10 @@ int twrpTar::extractTarFork() {
 				LOGINFO("Pipe %d: closeTarRestore() failed for '%s'\n", p, tarfn.c_str());
 				char errbuf[256];
 				snprintf(errbuf, sizeof(errbuf),
-				         "Restore pipe %d failed reaping subprocesses for %s",
+				         "Restore pipe %d failed closing the stage pipeline for %s",
 				         p, tarfn.c_str());
 				gui_print_color("error", "%s\n", errbuf);
-				unsigned long long sentinel = make_failure_sentinel(p);
-				// Return code deliberately ignored — _exit(-1) follows, waitpid fallback.
-				(void)write(progress_pipe_fd, &sentinel, sizeof(sentinel));
+				report_failure_sentinel(progress_pipe_fd, p);
 				gui_deactivate_msg_pipe();
 				close(progress_pipe[1]);
 				_exit(-1);
@@ -1862,12 +1792,11 @@ int twrpTar::extractTarFork() {
 	// there — a double SETMASK on old_chld_mask is idempotent.
 	sigprocmask(SIG_SETMASK, &old_chld_mask, nullptr);
 
-	// GUI affinity back to the performance core (default) — the efficiency-core
-	// pin before the fork loop only applied for the duration of the parallel
-	// restore phase, so the parent poll loop left the big cores to the pipe
-	// children and their sub-children (zstd/tw_bssl_aes) undisturbed. Mirror of
-	// the backup path, which implements the same logic via the GuiAffinityGuard
-	// RAII in partitionmanager.cpp.
+	// GUI affinity back to the performance core (default). The efficiency-core pin
+	// set at the top of the parent section covers exactly the parallel restore
+	// phase, so the parent poll loop leaves the big cores to the pipe workers and
+	// their stage threads. Mirror of the backup path, which implements the same
+	// logic via the GuiAffinityGuard RAII in partitionmanager.cpp.
 	Set_GUI_Efficiency(false);
 
 #ifndef BUILD_TWRPTAR_MAIN
@@ -1987,19 +1916,17 @@ int twrpTar::Generate_TarList(string Path, std::vector<TarListStruct> *TarList) 
 // Restore-specific pipeline teardown. closeTar() calls tar_append_eof(), which
 // fails on a RDONLY restore fd (write to RDONLY) — so the restore path must NOT
 // use closeTar(). Instead extractTar() closes the tar fd itself via tar_close();
-// the sub-children forked in openTar() (comp_pid/crypt_pid) then still need
-// reaping, or zombies accumulate (2 per archive; multi-pipe with 4x100 archives
-// == 800 zombies per restore).
+// the stage threads started in openTar() then still need joining (finish_pipeline),
+// or they + their rings leak.
 int twrpTar::closeTarRestore() {
-	// Deadlock-hardening layer 2 (belt and braces): finish_pipeline(10) reaps
-	// comp→crypt via Wait_For_Child_Timeout (10s SIGKILL fallback against unknown
-	// wedges — e.g. zstd CPU hang, kernel bug) and closes input_fd. Happy-path
-	// latency stays 0 (the internal WNOHANG returns immediately if the child
-	// already exited — typical after tar_extract_all + tar_close). report=true ->
-	// a sub-child timeout/error is propagated as -1. Layer 1 (the extractTar
-	// error path always calls tar_close) eliminates the concrete tar_extract_all
-	// deadlock source; layer 2 is the generic backstop beneath it. No kill:
-	// comp/crypt die via EOF/SIGPIPE. (output_fd is never set on restore ->
+	// Deadlock-hardening layer 2 (belt and braces): finish_pipeline(10) joins the
+	// stage threads via stage_thread_join (10s timed-join fallback against unknown
+	// wedges — e.g. a zstd CPU hang) and closes input_fd. Happy-path latency stays 0
+	// (the join returns at once when the thread already finished — typical after
+	// tar_extract_all + tar_close drove the EOF cascade). report=true -> a stage
+	// timeout/error is propagated as -1. Layer 1 (the extractTar error path always
+	// calls tar_close) eliminates the concrete tar_extract_all deadlock source; layer
+	// 2 is the generic backstop beneath it. (output_fd is never set on restore ->
 	// finish_pipeline skips it.)
 	return finish_pipeline(/*timeout_secs=*/10);
 }
@@ -2027,15 +1954,15 @@ int twrpTar::extractTar() {
 		// ONLY: ADB (adbbackup) is left untouched by design -> no ring. dd-image/
 		// super never go through tar_extract_regfile.
 		if (part_settings && !part_settings->adbbackup)
-			fd_ring_setup(t, 512);   // fix-R 512 (P1); setrlimit->hard + malloc, NULL=safe
+			fd_ring_setup(t, 512);   // ring capacity 512; raises RLIMIT_NOFILE to hard + mallocs, NULL = safe fallback
 	}
 	if (tar_extract_all(t, charRootDir, &progress_pipe_fd, dfp_done_fd,
 	                    restore_exclude_path.empty() ? NULL : restore_exclude_path.c_str()) != 0) {
 		LOGERR("Unable to extract tar archive '%s'\n", tarfn.c_str());
 		gui_err("restore_error=Error during restore process.");
-		// Deadlock-hardening layer 1: release the fd via tar_close so zstd's
-		// write to pipes[3] gets SIGPIPE and dies naturally — otherwise
-		// closeTarRestore() would later block indefinitely in waitpid(comp_pid).
+		// Deadlock-hardening layer 1: release the tar fd via tar_close so the
+		// upstream stage thread's next ring write returns -1 (EPIPE analogue) and it
+		// exits — otherwise closeTarRestore() would later block in the stage join.
 		// The tar_close return code is ignored: we are already on the error path.
 		fd_ring_drain(t);   // fd ring: FADV+close+free remaining fds before tar_close (NULL-safe)
 		tar_close(t);
@@ -2050,9 +1977,9 @@ int twrpTar::extractTar() {
 	// otherwise get NO close-FADV (finish_pipeline only FADVs input_fd>=0;
 	// tar_close closes t->fd without a drop). Symmetric to the backup's
 	// posix_fadvise64(filefd,0,0) (append.c): drops the segment tail (<128 MB
-	// behind the in-file gate + counter drift). Pipeline: t->fd = pipe -> ESPIPE
-	// no-op (the .win is covered by finish_pipeline). Success path only, like the
-	// backup.
+	// behind the in-file gate + counter drift). The engine modes never reach this
+	// line — there input_fd is always >= 0 and their .win is dropped by
+	// finish_pipeline. Success path only, like the backup.
 	fd_ring_drain(t);   // fd ring: FADV+close+free remaining fds before tar_close (NULL-safe)
 	if (input_fd < 0)
 		posix_fadvise64(t->fd, 0, 0, POSIX_FADV_DONTNEED);
@@ -2061,28 +1988,56 @@ int twrpTar::extractTar() {
 		gui_err("restore_error=Error during restore process.");
 		return -1;
 	}
-	// ADB TWEOF no longer lives here: at this point input_fd (FIFO read end) +
-	// the zstd/aes sub-child are still open — the TWEOF went out to bu before all
-	// read fds were closed. It is now sent by the single_or_adb child branch in
-	// extractTarFork() AFTER closeTarRestore().
+	// The ADB TWEOF is deliberately NOT sent here: at this point input_fd (the FIFO
+	// read end) is still open and the stage threads still run. It goes out in the
+	// single_or_adb child branch of extractTarFork(), AFTER closeTarRestore().
 	return 0;
 }
 
 int twrpTar::extract() {
 	// Type source (self-describing): ADB backups set current_archive_type from
 	// the adb_compression flag (stream, no magic). ALL file-based restores
-	// (single + multi) already have the type from the parent (extractTarFork ->
-	// detect_archive_type) — incl. the BAES inner sniff 5<->7. No detection here;
-	// openTar() (via extractTar()) dispatches on current_archive_type and the
-	// pipeline decompresses self-describing. This MUST mirror the backup's DFP
-	// types: the adb backup writes zstd (createTar -> COMPRESSED). The
-	// old legacy type LEGACY_COMPRESSED would decompress with pigz instead of zstd
-	// here (decomp_spec_for(LEGACY_COMPRESSED)=pigz) -> restore error.
+	// (single + multi) already have the type from the parent
+	// (extractTarFork -> BackupHeaderManager::Load) — incl. the BAES inner sniff
+	// 5<->7. No detection here; openTar() (via extractTar()) dispatches on
+	// current_archive_type and the pipeline decompresses self-describing. This MUST
+	// mirror the backup's directory-first types: the adb backup writes zstd
+	// (createTar -> COMPRESSED). Setting LEGACY_COMPRESSED here would select the
+	// gzip leaf loop (zlib) instead of zstd (spawn_zstd_stage picks it for
+	// LEGACY_COMPRESSED) -> restore error.
 	if (part_settings->adbbackup)
 		current_archive_type = (part_settings->adb_compression == 1) ? COMPRESSED : UNCOMPRESSED;
 
 	LOGINFO("extract: archive type %d\n", (int)current_archive_type);
 	return extractTar();
+}
+
+// Advance the prefetch cursor pf_idx over the pipe's own
+// TarList (per-pipe list -> the order IS this worker's processing order) until
+// bytes_ahead reaches the budget. REG-only: DIR/SYM carry size 0 in the list.
+// Hardlink members ARE prefetched (the first member does read data; duplicate
+// members waste a few cached KB at most). Best-effort by design: any open
+// failure is silently skipped — correctness stays with the real path in
+// tar_append_file/tar_append_regfile. The open/close pair additionally
+// pre-warms dentry/inode for the real open; the WILLNEED itself only QUEUES
+// async readahead and returns.
+static void tarlist_prefetch_ahead(const std::vector<TarListStruct>* list,
+                                   size_t& pf_idx, long long& bytes_ahead,
+                                   long long budget) {
+	while (bytes_ahead < budget && pf_idx < list->size()) {
+		const TarListStruct& e = (*list)[pf_idx++];
+		if (e.is_dir || e.size == 0)
+			continue;
+		int fd = open(e.fn.c_str(), O_RDONLY | O_CLOEXEC);
+		if (fd < 0)
+			continue;   // vanished/EPERM etc. -> real path decides, not the prefetch
+		long long want = (long long)e.size;
+		if (want > PREFETCH_PER_FILE_CAP)
+			want = PREFETCH_PER_FILE_CAP;
+		posix_fadvise64(fd, 0, want, POSIX_FADV_WILLNEED);   // async readahead
+		close(fd);
+		bytes_ahead += want;
+	}
 }
 
 int twrpTar::tarList(std::vector<TarListStruct> *TarList, unsigned thread_id) {
@@ -2094,16 +2049,47 @@ int twrpTar::tarList(std::vector<TarListStruct> *TarList, unsigned thread_id) {
 	char actual_filename[PATH_MAX];
 	unsigned long long fs;
 
-	// Invariant: tarList() is called only from the pipe-child path (createList),
-	// where split_archives==1. There is no single-archive path anymore
-	// (multi-pipe design replaced it).
-	assert(split_archives == 1);
+	// Resolve the source-prefetch budget ONCE per worker. Runtime knob:
+	// twrp.tar_prefetch = off|0 | <MB ahead>, default 32 MB. CLI
+	// (BUILD_TWRPTAR_MAIN): no property read -> fixed default (same pattern as
+	// twrp.force_aead above).
+	long long pf_budget = PREFETCH_DEFAULT_BUDGET;
+#ifndef BUILD_TWRPTAR_MAIN
+	{
+		char pfp[PROPERTY_VALUE_MAX] = {0};
+		property_get("twrp.tar_prefetch", pfp, "");
+		if (pfp[0]) {
+			if (strcasecmp(pfp, "off") == 0) {
+				pf_budget = 0;
+			} else {
+				long v = atol(pfp);
+				pf_budget = (v <= 0) ? 0 : ((long long)v << 20);   // MB -> bytes
+			}
+		}
+	}
+#endif
+	size_t pf_idx = 0;              // prefetch cursor into TarList
+	long long pf_bytes_ahead = 0;   // capped bytes currently prefetched ahead of i
+	if (pf_budget > 0)
+		LOGINFO("tarList thread %u: source prefetch window %lld MB (cap %lld MB/file)\n",
+		        thread_id, pf_budget >> 20, PREFETCH_PER_FILE_CAP >> 20);
+
+	// Invariant: tarList() runs only in the pipe child (via createList), where
+	// split_archives == 1. Enforced rather than asserted — assert is compiled out
+	// under NDEBUG, so the check would not exist in a release build at all.
+	// Unreachable on every existing path; if it ever fires, the segment naming
+	// below would be wrong, so abort instead of writing mis-named archives.
+	if (split_archives != 1) {
+		LOGERR("tarList: split_archives=%d (expected 1) for thread %i -- aborting backup\n",
+		       split_archives, thread_id);
+		return -6;
+	}
 	basefn = tarfn;
-	// DFP naming scheme: "%s%i%02i" — pipe i writes win[i*100 .. i*100+99].
+	// Segment naming "%s%i%02i" — pipe i writes win[i*100 .. i*100+99].
 	// Exception single_segment (Total_Backup_Size <= MAX_ARCHIVE_SIZE => 1 pipe,
-	// no split possible): the first/only archive without a number suffix as plain
-	// ".win" (the original unsplit scheme; mode-independent). temp stays set for
-	// the split branch that is unreachable under single_segment.
+	// no split possible): the first and only archive is plain ".win" without a
+	// number suffix (mode-independent). temp stays set for the split branch, which
+	// is unreachable under single_segment.
 	temp = basefn + "%i%02i";
 	if (single_segment) {
 		tarfn = basefn;
@@ -2127,6 +2113,11 @@ int twrpTar::tarList(std::vector<TarListStruct> *TarList, unsigned thread_id) {
 	Archive_Current_Size = 0;
 
 	while (i < list_size) {
+		// Keep the read-ahead window filled BEFORE processing entry i — the async
+		// WILLNEED I/O of the NEXT files overlaps the tar->zstd->aes processing of
+		// the CURRENT one.
+		if (pf_budget > 0)
+			tarlist_prefetch_ahead(TarList, pf_idx, pf_bytes_ahead, pf_budget);
 		const std::string& fn_ref = TarList->at(i).fn;
 		if (fn_ref.size() >= sizeof(buf)) {
 			LOGERR("Path too long (%zu B, max %zu) in tarList() for thread %i: '%.200s...'\n",
@@ -2142,11 +2133,10 @@ int twrpTar::tarList(std::vector<TarListStruct> *TarList, unsigned thread_id) {
 		// MAX_ARCHIVE_SIZE limit.
 		if (lstat(buf, &st) == 0 && (S_ISREG(st.st_mode) || S_ISLNK(st.st_mode))) { // item is a regular file
 			fs = (unsigned long long)(st.st_size);
-			// NEVER split adbbackup (like original TWRP `&& !adbbackup`): the adb
-			// stream has ONE Write_TWFN header; multiple concatenated tar archives
-			// => restore stops at the first tar EOF => rest lost. adb stays ONE
-			// continuous tar stream (size irrelevant, no disk file). CLI-safe
-			// (adbbackup=false).
+			// NEVER split adbbackup: the adb stream has ONE Write_TWFN header;
+			// multiple concatenated tar archives => the restore stops at the first
+			// tar EOF => the rest is lost. adb stays ONE continuous tar stream (size
+			// irrelevant, no disk file). CLI-safe (adbbackup=false).
 			if (!TarList->at(i).is_hardlink_member && !(part_settings && part_settings->adbbackup) && Archive_Current_Size + fs > MAX_ARCHIVE_SIZE) {
 				// single_segment invariant: with Total_Backup_Size <=
 				// MAX_ARCHIVE_SIZE, Archive_Current_Size <= Total <= MAX -> the
@@ -2187,13 +2177,13 @@ int twrpTar::tarList(std::vector<TarListStruct> *TarList, unsigned thread_id) {
 			if (!TarList->at(i).is_hardlink_member)
 				Archive_Current_Size += fs;
 			{
-				// The BYTE progress now comes from tar_append_regfile (actually
-				// written content bytes), NOT from the lstat st_size here —
-				// otherwise symlink target lengths + hardlink duplicates would
-				// count, which the restore does not reproduce (-> 99% instead of
-				// 100%). The SPLIT logic still uses fs (= st_size) unchanged
-				// (Archive_Current_Size above). Only the file tick (0 = increment
-				// the file counter) remains here. Best-effort:
+				// The BYTE progress is reported by tar_append_regfile (content bytes
+				// actually written), NOT from the lstat st_size here — otherwise
+				// symlink target lengths + hardlink duplicates would count, which
+				// the restore does not reproduce (-> 99% instead of 100%). The SPLIT
+				// logic uses fs (= st_size), see Archive_Current_Size above. Only the
+				// file tick (0 = increment the file counter) is written here.
+				// Best-effort:
 				// progress_write_best_effort() suppresses further writes after
 				// EPIPE (parent read end closed), no backup data loss.
 				progress_write_best_effort(progress_pipe_fd, 0ULL);
@@ -2216,6 +2206,20 @@ int twrpTar::tarList(std::vector<TarListStruct> *TarList, unsigned thread_id) {
 			int trim_fd = (output_fd >= 0) ? output_fd : (t ? t->fd : -1);
 			TWFunc::Trim_Output_Cache(trim_fd, output_trim_offset);
 		}
+		// Consume accounting — entry i has left the read-ahead window.
+		// Uses the LIST size (same capping as the prefetch side), not the lstat
+		// fs above (file may have changed since the walk; heuristic is fine).
+		if (pf_budget > 0 && (size_t)i < pf_idx) {
+			const TarListStruct& ce = TarList->at(i);
+			if (!ce.is_dir && ce.size > 0) {
+				long long w = (long long)ce.size;
+				if (w > PREFETCH_PER_FILE_CAP)
+					w = PREFETCH_PER_FILE_CAP;
+				pf_bytes_ahead -= w;
+				if (pf_bytes_ahead < 0)
+					pf_bytes_ahead = 0;
+			}
+		}
 		i++;
 	}
 	if (closeTar() != 0) {
@@ -2237,62 +2241,13 @@ void* twrpTar::createList(void *cookie) {
 	return (void*)0;
 }
 
-// extractMulti() was removed. It was replaced by the multi-pipe fork loop in
-// extractTarFork(), which distributes archives dynamically via the SegmentClaim
-// work queue (no longer statically per block prefix) over up-to-4 parallel child
-// processes — instead of sequentially in a loop in a single child.
-
-// ---------------------------------------------------------------------------
-// Child exec body for the zstd/pigz compressor sub-children (compress +
-// decompress). Runs in the forked child right after fork() and NEVER returns to
-// the parent.
-//
-// FORK SAFETY: the child is async-signal-safe — ONLY setup_pipeline_child_zstd
-// (sigaction/prctl/sched_setaffinity/dup2) + execv(absolute path, argv).
-// path/argv are built by the PARENT (PipeOperation::fork_zstd) BEFORE the fork()
-// (core_slice vector, -T/-N args, DataManager level, binary/path choice); the
-// child inherits them. Reason: out of the multithreaded multi-pipe fork() the
-// child must take neither malloc nor a lock — a sibling pipe thread may hold the
-// malloc/DataManager lock -> futex deadlock before exec. Covers compress AND
-// decompress (zstd/pigz) — the difference is entirely in path/argv. gui_err_msg
-// is NOT used (no gui_err/LOGERR in the child) — the parent reaps the !=0 exit
-// and reports the error.
-// ---------------------------------------------------------------------------
-void twrpTar::exec_comp_child(int fd_in, int fd_out, const std::vector<int>& slice,
-                              const char* path, const char* const argv[], const char* gui_err_msg) {
-	setup_pipeline_child_zstd(fd_in, fd_out, slice);   // child_init + Tier2Guard + slice pin + dup2
-	execv(path, (char* const*)argv);
-	// execv only returns on error -> report async-signal-safe (write to the inherited
-	// log fd 2) + _exit. NO gui_err/LOGERR (malloc/lock) in the child.
-	(void)gui_err_msg;
-	static const char emsg[] = "execv compressor child ERROR!\n";
-	if (write(STDERR_FILENO, emsg, sizeof(emsg) - 1) < 0) { /* nothing to do */ }
-	_exit(-1);
-}
-
-// tw_bssl_aes sub-child. pw_pipe[2] = password pipe; the child closes the write
-// end [1] and keeps the read end [0] (setup_pipeline_child_crypt strips CLOEXEC
-// there so tw_bssl_aes sees the FD via --pwfd). FORK SAFETY: argv (incl.
-// "enc"/"dec" + "--pwfd" <fd>) is built by the PARENT (PipeOperation::fork_aes)
-// before the fork(); the child does ONLY setup + execv(absolute path) — no
-// allocation/lock. See exec_comp_child.
-void twrpTar::exec_crypt_child(int fd_in, int fd_out, int pw_pipe[2], const std::vector<int>& slice, const char* const argv[], const char* gui_err_msg) {
-	close(pw_pipe[1]);
-	setup_pipeline_child_crypt(fd_in, fd_out, pw_pipe[0], slice);
-	execv("/system/bin/tw_bssl_aes", (char* const*)argv);
-	// execv only returns on error -> report async-signal-safe + _exit (no gui_err in the child).
-	(void)gui_err_msg;
-	static const char emsg[] = "execv tw_bssl_aes child ERROR!\n";
-	if (write(STDERR_FILENO, emsg, sizeof(emsg) - 1) < 0) { /* nothing to do */ }
-	_exit(-1);
-}
-
 // ===========================================================================
-// The tier-2 per-archive pipeline (PipeOperation / BackupPipeline /
-// RestorePipeline + the declarative stage engine) lives in
-// pipe_operation.cpp/.hpp. createTar()/openTar() below instantiate
-// BackupPipeline/RestorePipeline from it; the write-through into
-// comp_pid/crypt_pid keeps the internal reap_subchildren primitive untouched.
+// The per-archive pipeline (PipeOperation / BackupPipeline / RestorePipeline +
+// the declarative stage engine) lives in pipe_operation.cpp/.hpp and owns the
+// in-process stage THREADS + StageRings. createTar()/openTar() below create it
+// into the pipeline_ member, which spans the segment until closeTar()/
+// closeTarRestore(); finish_pipeline()/abort_pipeline() consume it and close the
+// twrpTar-owned file ends.
 // ===========================================================================
 
 // Consolidated writer of the self-describing PAX g-header records (TWRP.*) — as
@@ -2336,23 +2291,17 @@ int twrpTar::createTar() {
 		LOGINFO("Using encryption (BoringSSL %s%s) and compression...\n",
 			aead_cipher_label(aead_cipher_id),
 			hw_suffix(aead_cipher_id));
-		BackupPipeline op(*this);
-		return op.setup();
 	} else if (use_compression) {
 		current_archive_type = COMPRESSED;
 		LOGINFO("Using compression...\n");
-		BackupPipeline op(*this);
-		return op.setup();
 	} else if (use_encryption) {
 		current_archive_type = ENCRYPTED;
 		LOGINFO("Using encryption (BoringSSL %s%s)...\n",
 			aead_cipher_label(aead_cipher_id),
 			hw_suffix(aead_cipher_id));
-		BackupPipeline op(*this);
-		return op.setup();
 	} else {
 		// Not compressed or encrypted (plain tar, DFP) — direct path (no
-		// pipeline/sub-child), outside the engine.
+		// pipeline), outside the engine.
 		char* charTarFile = (char*) tarfn.c_str();
 		char* charRootDir = (char*) tardir.c_str();
 		current_archive_type = UNCOMPRESSED;
@@ -2397,26 +2346,39 @@ int twrpTar::createTar() {
 		}
 		return 0;
 	}
+	// Engine modes (5/6/7): create the owning pipeline for this segment. It spans
+	// until closeTar() -> finish_pipeline() (split: consumed + re-created per
+	// segment). A setup() failure already tore the stages down via abort_setup()
+	// — reset so no stale object lingers.
+	// Segment invariant, enforced rather than asserted (assert is compiled out
+	// under NDEBUG): a stale pipeline_ would be destroyed by the reset() below,
+	// and ~PipeOperation deliberately does NOT join — its stage threads would be
+	// orphaned instead of torn down. Unreachable on every existing path
+	// (closeTar/closeTarRestore always consume first); if it ever fires, tear the
+	// old pipeline down properly and say so.
+	if (pipeline_) {
+		LOGERR("createTar: stale pipeline from the previous segment -- tearing it down\n");
+		abort_pipeline(/*timeout_secs=*/10);
+	}
+	pipeline_.reset(new (std::nothrow) BackupPipeline(*this));
+	if (!pipeline_) {
+		LOGERR("createTar: out of memory\n");
+		gui_err("backup_error=Error creating backup.");
+		return -1;
+	}
+	int rc = pipeline_->setup();
+	if (rc != 0)
+		pipeline_.reset();
+	return rc;
 }
 
 int twrpTar::openTar() {
 	char* charRootDir = (char*) tardir.c_str();
 	char* charTarFile = (char*) tarfn.c_str();
-	string Password;
-
-	// Increase kernel pipe max for larger data pipes
-	{
-		int pmax_fd = open("/proc/sys/fs/pipe-max-size", O_WRONLY);
-		if (pmax_fd >= 0) {
-			if (write(pmax_fd, "1048576", 7) != 7)
-				LOGINFO("Warning: could not set /proc/sys/fs/pipe-max-size\n");
-			close(pmax_fd);
-		}
-	}
 
 	// Read the cipher label for the LOGINFO banner from the header if not yet
-	// determined (single-pipe path without extractTarFork). Purely cosmetic —
-	// the filter decrypts self-describing from the header flags field.
+	// determined (single-pipe path without extractTarFork). Purely cosmetic — the
+	// AES stage decrypts self-describing from the header flags field.
 	if (aead_cipher_id < 0 &&
 	    (current_archive_type == ENCRYPTED ||
 	     current_archive_type == COMPRESSED_ENCRYPTED)) {
@@ -2426,35 +2388,28 @@ int twrpTar::openTar() {
 	}
 
 	if (current_archive_type == COMPRESSED_ENCRYPTED) {
-		// DFP: only zstd+BSSL-AES now (legacy gzip+OpenAES is rejected in the
-		// detector detect_archive_type). Compressor fixed = zstd.
+		// COMPRESSED_ENCRYPTED is always zstd + BSSL-AES; legacy gzip+OpenAES is
+		// rejected earlier by BackupHeaderManager::Load.
 		LOGINFO("Opening zstd+BSSL-AES backup (BoringSSL %s%s)...\n",
 			aead_cipher_label(aead_cipher_id),
 			hw_suffix(aead_cipher_id));
-		RestorePipeline op(*this);
-		return op.setup();
 	} else if (current_archive_type == ENCRYPTED) {
 		// The GUI AES banner is deliberately NOT here (this runs per pipe child
-		// -> N times); extractTarFork emits it once in the parent. Same structure
-		// as the COMPRESSED_ENCRYPTED branch above (only LOGINFO + RestorePipeline).
+		// -> N times); extractTarFork emits it once in the parent.
 		LOGINFO("Opening BSSL-AES backup (BoringSSL %s%s)...\n",
 			aead_cipher_label(aead_cipher_id),
 			hw_suffix(aead_cipher_id));
-		RestorePipeline op(*this);
-		return op.setup();
 	} else if (current_archive_type == LEGACY_COMPRESSED ||
 	           current_archive_type == COMPRESSED) {
 		// Compress-only zstd (COMPRESSED) and legacy gzip (LEGACY_COMPRESSED)
-		// now run through RestorePipeline instead of a dedicated direct fork. The
-		// 1-stage decompress pipeline (build_stages -> {ZSTD}) forks via
-		// exec_comp_child; the binary (zstd/pigz), pin strategy and thread flag
-		// (-T/-p) come from decomp_spec_for(). The adbbackup input is handled in
+		// run through RestorePipeline. The 1-stage decompress pipeline
+		// (build_stages -> {ZSTD}) runs an in-process thread: zstd via libzstd,
+		// legacy gzip via zlib inflate (spawn_zstd_stage picks the leaf loop from
+		// the archive type). The adbbackup input is handled in
 		// RestorePipeline::open_input(), the setup-error cleanup by
-		// PipeOperation::abort().
+		// PipeOperation::abort_setup().
 		LOGINFO("Opening %s-compressed tar...\n",
-			(current_archive_type == COMPRESSED) ? "zstd" : "pigz");
-		RestorePipeline op(*this);
-		return op.setup();
+			(current_archive_type == COMPRESSED) ? "zstd" : "gzip");
 	} else  {
 		if (part_settings->adbbackup) {
 			LOGINFO("Opening TW_ADB_RESTORE uncompressed stream\n");
@@ -2482,8 +2437,28 @@ int twrpTar::openTar() {
 				return -1;
 			}
 		}
+		return 0;
 	}
-	return 0;
+	// Engine modes: create the owning pipeline for this segment. It spans until
+	// closeTarRestore() -> finish_pipeline() (multi-archive loop: consumed +
+	// re-created per segment). A setup() failure already tore the stages down via
+	// abort_setup() — reset so no stale object lingers. Segment invariant enforced
+	// as in createTar() (see there): a stale pipeline_ would lose its stage
+	// threads to the non-joining destructor.
+	if (pipeline_) {
+		LOGERR("openTar: stale pipeline from the previous segment -- tearing it down\n");
+		abort_pipeline(/*timeout_secs=*/10);
+	}
+	pipeline_.reset(new (std::nothrow) RestorePipeline(*this));
+	if (!pipeline_) {
+		LOGERR("openTar: out of memory\n");
+		gui_err("restore_error=Error during restore process.");
+		return -1;
+	}
+	int rc = pipeline_->setup();
+	if (rc != 0)
+		pipeline_.reset();
+	return rc;
 }
 
 string twrpTar::Strip_Root_Dir(string Path) {
@@ -2497,21 +2472,15 @@ string twrpTar::Strip_Root_Dir(string Path) {
 	slash = temp.find("/");
 	if (slash == string::npos)
 		return temp;
-	else {
-		string stripped;
-
-		stripped = temp.substr(slash, temp.size() - slash);
-		return stripped;
-	}
-	return temp;
+	return temp.substr(slash, temp.size() - slash);
 }
 
 int twrpTar::addFile(string fn, bool include_root) {
 	// Store the progress-pipe fd on the TAR handle so tar_append_regfile reports
 	// the real content bytes (symmetric to restore). addFile is the ONLY backup
 	// append choke point and covers plain-tar AND pipeline backups (the TAR is opened
-	// in createTar or BackupPipeline::setup). Restore/get_size never call addFile
-	// -> their TARs keep progress_fd == 0.
+	// in createTar or BackupPipeline::setup). The restore TARs never go through
+	// addFile -> they keep progress_fd == 0; get_size opens no TAR at all.
 	if (t) {
 		t->progress_fd = progress_pipe_fd;
 		// In-file cache trim: give the libtar append path the seekable output fd
@@ -2537,55 +2506,36 @@ int twrpTar::addFile(string fn, bool include_root) {
 	return 0;
 }
 
-// Single source of truth for the tier-2 sub-child reap (comp_pid=zstd/pigz,
-// crypt_pid=tw_bssl_aes — the sub-children every pipe worker forks in
-// createTar/openTar). Fixed comp→crypt order. kill_first=true sends SIGTERM
-// before the reap (error/setup-abort paths where the sub-child may block);
-// timeout_secs>0 uses Wait_For_Child_Timeout (restore deadlock hardening), else
-// a blocking Wait_For_Child. comp_label = (LEGACY_COMPRESSED)?"pigz":"zstd" (createTar
-// never uses pigz -> "zstd"; a pure log string). Returns -1 if report_failures
-// && a reap return code !=0. Deliberately closes NO fds — that is per-caller.
-int twrpTar::reap_subchildren(bool kill_first, int timeout_secs, bool report_failures) {
-	int rc = 0, status;
-	const char *comp_label = (current_archive_type == LEGACY_COMPRESSED) ? "pigz" : "zstd";
-	if (comp_pid > 0) {
-		if (kill_first) kill(comp_pid, SIGTERM);
-		int wrc = (timeout_secs > 0)
-			? TWFunc::Wait_For_Child_Timeout(comp_pid, &status, comp_label, timeout_secs)
-			: TWFunc::Wait_For_Child(comp_pid, &status, comp_label);
-		comp_pid = 0;
-		if (report_failures && wrc != 0) rc = -1;
-	}
-	if (crypt_pid > 0) {
-		if (kill_first) kill(crypt_pid, SIGTERM);
-		int wrc = (timeout_secs > 0)
-			? TWFunc::Wait_For_Child_Timeout(crypt_pid, &status, "tw_bssl_aes", timeout_secs)
-			: TWFunc::Wait_For_Child(crypt_pid, &status, "tw_bssl_aes");
-		crypt_pid = 0;
-		if (report_failures && wrc != 0) rc = -1;
-	}
-	return rc;
-}
-
-// Close-stage cleanup with named intent. finish_pipeline = success close: end
-// comp/crypt naturally via EOF (NO kill), report=true (the sub-child exit status
-// cascades onto the return code), close input_fd + output_fd. timeout_secs=0
-// (blocking, backup) or 10 (restore hardening).
+// Close-stage cleanup with named intent. Both are null-safe delegates: the stage
+// join itself is PipeOperation::join_stages, behind finish()/abort().
+// finish_pipeline = success close: consume pipeline_ letting the stage threads
+// end naturally via EOF (NO poison; a stage rc cascades onto the return code),
+// then close input_fd + output_fd. timeout_secs bounds each stage join:
+// BACKUP_JOIN_TIMEOUT_SECS from closeTar, 10 s from closeTarRestore.
+// pipeline_ == null (plain tar): rc 0, and the fd closes
+// still run — the plain-tar ADB paths open them without any pipeline.
 int twrpTar::finish_pipeline(int timeout_secs) {
-	int rc = reap_subchildren(/*kill_first=*/false, timeout_secs, /*report_failures=*/true);
+	int rc = 0;
+	if (pipeline_) {
+		rc = pipeline_->finish(timeout_secs);
+		pipeline_.reset();
+	}
 	if (input_fd >= 0)  { posix_fadvise64(input_fd, 0, 0, POSIX_FADV_DONTNEED); close(input_fd);  input_fd = -1; }
 	if (output_fd >= 0) { posix_fadvise64(output_fd, 0, 0, POSIX_FADV_DONTNEED); close(output_fd); output_fd = -1; }
 	return rc;
 }
 
-// abort_pipeline = error close: end comp/crypt via SIGTERM + reap (report is
-// irrelevant here -> false), close input_fd + output_fd. NO gui_err and NO
-// unlink (the caller or PipeOperation::abort handles that). Always returns -1 so
-// callers can write `return abort_pipeline(...)`. Used where NO live
-// PipeOperation object exists anymore (createTarFork error path, openTar legacy
-// decompress).
+// abort_pipeline = error close: consume pipeline_ with poison (stage status
+// irrelevant), close input_fd + output_fd. NO gui_err and NO unlink (the caller
+// or PipeOperation::abort_setup handles that). Always returns -1 so callers can
+// write `return abort_pipeline(...)`. Called from the createTarFork error path
+// and from the stale-pipeline guards in createTar()/openTar(); null-safe for
+// plain tar and for an already-consumed segment.
 int twrpTar::abort_pipeline(int timeout_secs) {
-	reap_subchildren(/*kill_first=*/true, timeout_secs, /*report_failures=*/false);
+	if (pipeline_) {
+		pipeline_->abort(timeout_secs);
+		pipeline_.reset();
+	}
 	if (input_fd >= 0)  { close(input_fd);  input_fd = -1; }
 	if (output_fd >= 0) { close(output_fd); output_fd = -1; }
 	return -1;
@@ -2597,21 +2547,19 @@ int twrpTar::closeTar() {
 		LOGINFO("tar_append_eof(): %s\n", strerror(errno));
 		posix_fadvise64(t->fd, 0, 0, POSIX_FADV_DONTNEED);
 		tar_close(t);
-		finish_pipeline(/*timeout_secs=*/0);   // reap + fd close; rc irrelevant, we fail anyway
+		finish_pipeline(BACKUP_JOIN_TIMEOUT_SECS);   // stage join + fd close; rc irrelevant, we fail anyway
 		return -1;
 	}
 	posix_fadvise64(t->fd, 0, 0, POSIX_FADV_DONTNEED);
 	if (tar_close(t) != 0) {
 		LOGINFO("Unable to close tar archive: '%s'\n", tarfn.c_str());
-		finish_pipeline(/*timeout_secs=*/0);   // reap + fd close; rc irrelevant
+		finish_pipeline(BACKUP_JOIN_TIMEOUT_SECS);   // stage join + fd close; rc irrelevant
 		return -1;
 	}
-	if (finish_pipeline(/*timeout_secs=*/0) != 0)
+	if (finish_pipeline(BACKUP_JOIN_TIMEOUT_SECS) != 0)
 		return -1;
 	if (!part_settings->adbbackup) {
-		// createTar() uses only zstd '-c stdout' or tw_bssl_aes — no compressor
-		// appends '.gz' to the output file. (Legacy pigz lives only in the
-		// openTar()/restore path as a decompressor.)
+		// The output file is exactly tarfn: no stage appends an extension.
 		if (TWFunc::Get_File_Size(tarfn) == 0) {
 			gui_msg(Msg(msg::kError, "backup_size=Backup file size for '{1}' is 0 bytes.")(tarfn));
 			return -1;
@@ -2716,41 +2664,38 @@ unsigned long long twrpTar::get_size() {
 	if (part_settings->adbbackup || TWFunc::Path_Exists(tarfn)) {
 		LOGINFO("Single archive\n");
 		return uncompressedSize(tarfn);
-	} else {
-		LOGINFO("Multiple archives\n");
-		unsigned long long total_restore_size = 0;
-
-		basefn = tarfn;
-		tarfn += "000";
-		thread_id = 0;
-		if (!part_settings->adbbackup) {
-			if (!TWFunc::Path_Exists(tarfn)) {
-				LOGERR("Unable to locate '%s' or '%s'\n", basefn.c_str(), tarfn.c_str());
-				return 0;
-			}
-			// Unified discovery via glob(). The pattern
-			// `<basefn>[0-9][0-9][0-9]` matches both the DFP scheme `%s%i%02i`
-			// (pipe id + 2-digit archive id, e.g. "100", "203") and the legacy
-			// scheme `%s%03i` (3-digit sequence, "000", "001"...). glob has no
-			// artificial limit and is tolerant of sequence gaps. Same strategy as
-			// discover_segments() (restore path).
-			{
-				glob_t gl;
-				string pattern = basefn + "[0-9][0-9][0-9]";
-				if (glob(pattern.c_str(), GLOB_NOSORT, NULL, &gl) == 0) {
-					for (size_t k = 0; k < gl.gl_pathc; ++k) {
-						total_restore_size += uncompressedSize(gl.gl_pathv[k]);
-					}
-				}
-				globfree(&gl);
-			}
-			// No `.info` cache writeback anymore. The restore size comes
-			// self-describing from the PAX g-header; if that is missing, this
-			// function computes it live. /super + ADB untouched.
-		}
-		return total_restore_size;
 	}
-	return 0;
+	// Only reachable with adbbackup == false (the branch above already covers
+	// adbbackup) and without a single unsplit archive on disk.
+	LOGINFO("Multiple archives\n");
+	unsigned long long total_restore_size = 0;
+
+	basefn = tarfn;
+	tarfn += "000";
+	thread_id = 0;
+	if (!TWFunc::Path_Exists(tarfn)) {
+		LOGERR("Unable to locate '%s' or '%s'\n", basefn.c_str(), tarfn.c_str());
+		return 0;
+	}
+	// Unified discovery via glob(). The pattern `<basefn>[0-9][0-9][0-9]` matches
+	// both the segment scheme `%s%i%02i` (pipe id + 2-digit archive id, e.g. "100",
+	// "203") and the legacy scheme `%s%03i` (3-digit sequence, "000", "001"...).
+	// glob has no artificial limit and is tolerant of sequence gaps. Same strategy
+	// as discover_segments() (restore path).
+	{
+		glob_t gl;
+		string pattern = basefn + "[0-9][0-9][0-9]";
+		if (glob(pattern.c_str(), GLOB_NOSORT, NULL, &gl) == 0) {
+			for (size_t k = 0; k < gl.gl_pathc; ++k) {
+				total_restore_size += uncompressedSize(gl.gl_pathv[k]);
+			}
+		}
+		globfree(&gl);
+	}
+	// The restore size normally comes self-describing from the PAX g-header; if
+	// that is missing, this function computes it live. There is no `.info` cache
+	// writeback. /super + ADB are not affected.
+	return total_restore_size;
 }
 
 unsigned long long twrpTar::uncompressedSize(string filename) {
@@ -2759,12 +2704,11 @@ unsigned long long twrpTar::uncompressedSize(string filename) {
 	vector<string> split;
 
 	// Under the strict restore preflight, uncompressedSize is only reached by
-	// legacy gzip — DFP gets the size from the g-header, legacy plain tar from
-	// the .info (else reject before the wipe). Hence ONLY the gzip branch: `pigz -l`
-	// reads the uncompressed size reliably from the gzip footer. The plain-tar
-	// Get_File_Size fallback (confusable with corrupt DFP plain tar) and the
-	// zstd-full-decompress branches are gone. Everything else -> 0 (defensive;
-	// not reached under the strict preflight).
+	// legacy gzip — this build's own archives get the size from the g-header,
+	// legacy plain tar from the .info (else reject before the wipe). Hence ONLY the
+	// gzip branch: `pigz -l` reads the uncompressed size reliably from the gzip
+	// footer. Any other type -> 0 (defensive; not reached under the strict
+	// preflight).
 	Set_Archive_Type(BackupHeaderManager::GetFileType(filename));   // outer magic via the class
 	if (current_archive_type == LEGACY_COMPRESSED) {
 		// Compressed (pigz/gzip)
@@ -2778,9 +2722,9 @@ unsigned long long twrpTar::uncompressedSize(string filename) {
 			split[5]
 			*/
 			split = TWFunc::split_string(result, ' ', true);
-			// > 5 (not > 4): index 5 needs at least 6 elements — the upstream
-			// guard allowed an out-of-bounds access at exactly 5 tokens. strtoull
-			// not atoi: atoi (int) overflowed at > 2 GiB uncompressed size.
+			// > 5 (not > 4): index 5 needs at least 6 elements, otherwise exactly 5
+			// tokens would index out of bounds. strtoull, not atoi — an int
+			// overflows above 2 GiB uncompressed size.
 			if (split.size() > 5)
 				total_size = strtoull(split[5].c_str(), NULL, 10);
 		}

@@ -20,14 +20,10 @@ extern "C" {
 	#include "libtar/libtar.h"
 }
 #include <sys/types.h>
-#include <sys/stat.h>
-#include <string.h>
-#include <errno.h>
 #include <signal.h>   // sigset_t (child_pipe_preamble signature)
 #include <atomic>
 #include <cstdint>
-#include <fcntl.h>
-#include <fstream>
+#include <memory>     // std::unique_ptr<PipeOperation> pipeline_
 #include <string>
 #include <vector>
 #include <set>        // hardlink inode dedup set
@@ -51,19 +47,11 @@ struct TarListStruct {
 	                                       // split exemption (the whole set stays in one inode hash)
 };
 
-struct thread_data_struct {
-	std::vector<TarListStruct> *TarList;
-	unsigned thread_id;
-};
-
-// Compressor descriptor for the restore decompress path. Encapsulates the
-// differences between zstd and pigz decompress (binary + thread flag) so both
-// run through the same exec_comp_child()/RestorePipeline path.
-// decomp_spec_for() (pipe_operation.cpp) derives it from Archive_Type.
-struct DecompSpec {
-	const char* binary;     // "zstd" | "pigz"
-	bool        flag_is_p;  // true="-p<N>" (pigz); false="-T<N>" (zstd) — fork_zstd builds the arg in the parent
-};
+// Per-archive stage pipeline (pipe_operation.hpp). Forward-declared so twrpTar
+// can hold the unique_ptr member without pulling the pipeline/engine headers
+// into every includer of twrpTar.hpp; the out-of-line destructor in twrpTar.cpp
+// (which does include pipe_operation.hpp) destroys it.
+class PipeOperation;
 
 class twrpTar {
 public:
@@ -102,9 +90,10 @@ public:
 	int split_archives;
 	// Cipher agility: AEAD cipher id of the current backup/restore (0=AES-256-
 	// GCM, 1=ChaCha20-Poly1305). Backup: set in createTarFork from the force
-	// knob/HWCAP and passed to the filter via setenv("TW_AEAD_CIPHER"); restore:
-	// read from the .win000 header. -1 = not yet determined (the banner falls
-	// back to the HWCAP heuristic).
+	// knob/HWCAP and passed to the AES stage as a parameter (spawn_aes_stage ->
+	// StageThread::aead_cipher_id); restore: read from the .win000 header (the stream is
+	// self-describing, so decrypt never needs it). -1 = not yet determined (the
+	// banner falls back to the HWCAP heuristic).
 	int aead_cipher_id = -1;
 	int progress_pipe_fd;
 	// DFP signal fd: set in the restore child of pipe 0 to the write end of
@@ -128,26 +117,22 @@ private:
 	int addFile(string fn, bool include_root);
 	int closeTar();
 	int extractTar();
-	int closeTarRestore();          // restore-side reap without tar_append_eof
-	// Consolidated tier-2 cleanup API with NAMED intent instead of a 3-bool flag
-	// salad at the call sites. Both close input_fd/output_fd and delegate the
-	// reap to reap_subchildren (comp→crypt order).
-	//   finish_pipeline = success close: NO kill, report=true (a sub-child exit
-	//     cascades onto the return code); timeout_secs (0=blocking backup,
-	//     10=restore hardening). closeTar→(0), closeTarRestore→(10).
-	//   abort_pipeline = error close: SIGTERM+reap, report=false (status
-	//     irrelevant), returns -1. NO gui_err/unlink (the caller or
-	//     PipeOperation::abort handles that). Used where NO PipeOperation object
-	//     lives (createTarFork error path, openTar legacy).
+	int closeTarRestore();          // restore-side pipeline close (stage join, no tar_append_eof)
+	// Cleanup API with NAMED intent. Both are null-safe delegates: they consume
+	// pipeline_ (finish()/abort() + reset — the stage join itself lives in
+	// PipeOperation::join_stages, comp→aes order), then close input_fd/output_fd
+	// (the file ends belong to twrpTar; they can be open without any pipeline on
+	// the plain-tar ADB paths).
+	//   finish_pipeline = success close: NO poison, a stage rc cascades onto the
+	//     return code; timeout_secs bounds each stage join — closeTar passes the
+	//     120 s anti-wedge net, closeTarRestore 10 s (restore hardening). Both only
+	//     take effect if a stage wedges; a finished stage joins instantly.
+	//   abort_pipeline = error close: poison rings + join, stage status
+	//     irrelevant, returns -1. NO gui_err/unlink (the caller or
+	//     PipeOperation::abort_setup handles that). Called from the createTarFork
+	//     error path and the stale-pipeline guards in createTar()/openTar().
 	int finish_pipeline(int timeout_secs);
 	int abort_pipeline(int timeout_secs);
-	// Private reap primitive (single source of truth, comp_pid→crypt_pid). Only
-	// called internally by finish_pipeline/abort_pipeline (twrpTar) +
-	// PipeOperation::abort (friend) — the flags live only here, not at the call
-	// sites. kill_first=SIGTERM before reap; timeout_secs>0=Wait_For_Child_
-	// Timeout (restore hardening), else blocking; report_failures → -1 on
-	// wrc!=0. Closes NO fds.
-	int reap_subchildren(bool kill_first, int timeout_secs, bool report_failures);
 	string Strip_Root_Dir(string Path);
 	int openTar();
 	int Generate_TarList(string Path, std::vector<TarListStruct> *TarList);
@@ -156,33 +141,16 @@ private:
 	unsigned long long uncompressedSize(string filename);
 	static void Signal_Kill(int signum);
 		static void child_init_pipeline(void);
-		// Pin via core slice (vector) instead of a single core. slice = the cores
-		// computed by core_slice() for this pipe; apply_core_list_pin(slice)
-		// (1 element = single core, several = cluster/soft pin). Empty slice = no pin.
-		static void setup_pipeline_child_zstd(int fd_in, int fd_out, const std::vector<int>& slice);
-		static void setup_pipeline_child_crypt(int fd_in, int fd_out, int pw_fd_keep, const std::vector<int>& slice);
 		// Child preamble right after fork(), shared by createTarFork() +
 		// extractTarFork(). progress_pipe/msg_pipe are method locals -> parameters.
 		void child_pipe_preamble(int p, int progress_pipe[2], int msg_pipe[2], int sigchld_fd, const sigset_t& old_chld_mask);
-		// Child exec bodies right after fork() (dead-end code, always ends in
-		// execv/_exit). FORK SAFETY (multi-pipe): the child does ONLY async-
-		// signal-safe setup (setup_pipeline_child_*: sigaction/prctl/
-		// sched_setaffinity/dup2) + execv with an ABSOLUTE path. ALL allocation/
-		// locking (core_slice vector, -T/-N args, DataManager level, binary/path
-		// choice) happens in the PARENT (fork_zstd/fork_aes) BEFORE the fork();
-		// path/argv are parent-built buffers inherited by the child.
-		// exec_comp_child covers zstd compress AND zstd/pigz decompress (the
-		// differences are in path/argv). gui_err_msg remains for signature
-		// symmetry but is NOT used in the child (no gui_err/LOGERR in the child —
-		// the parent reaps and reports).
-		static void exec_comp_child(int fd_in, int fd_out, const std::vector<int>& slice, const char* path, const char* const argv[], const char* gui_err_msg);
-		static void exec_crypt_child(int fd_in, int fd_out, int pw_pipe[2], const std::vector<int>& slice, const char* const argv[], const char* gui_err_msg);
 
-		// The tier-2 pipeline classes encapsulate the declarative comp/crypt
-		// stage engine and store the forked PIDs via write-through into
-		// comp_pid/crypt_pid. PipeOperation::abort() (setup errors) uses the
-		// private reap_subchildren + tw_ fds via friend. Defined in
-		// pipe_operation.cpp.
+		// The pipeline classes encapsulate the declarative stage engine and own the
+		// stage-thread + ring handles. The friend grants cover the file ends
+		// (input_fd/output_fd via open_output/open_input), tarfn (open/unlink), t
+		// (tar_fdopen), write_global_headers and the wiring params (password,
+		// aead_cipher_id, thread_id, verbose_log, current_archive_type, tardir,
+		// part_settings). Defined in pipe_operation.cpp.
 		friend class PipeOperation;
 		friend class BackupPipeline;
 		friend class RestorePipeline;
@@ -203,9 +171,8 @@ private:
 	std::set<std::pair<dev_t, ino_t>> seen_hardlink_inodes;   // dedup nlink>1 (reset per backup)
 	bool include_root_dir;
 	// Single-segment backup: Total_Backup_Size <= MAX_ARCHIVE_SIZE => 1 pipe, no
-	// split possible => the first/only archive is plain ".win" without the
-	// %i%02i suffix (the original unsplit scheme). Set per pipe by the parent in
-	// createTarFork, read in tarList.
+	// split possible => the first and only archive is plain ".win" without the
+	// %i%02i suffix. Set per pipe by the parent in createTarFork, read in tarList.
 	bool single_segment = false;
 	// Privacy log (tw_verbose_log): true = log every file/dir (backup: addFile
 	// LOGINFO in tarList; restore: TAR_TW_VERBOSE_LOG prints in libtar
@@ -215,11 +182,19 @@ private:
 	// stays true.
 	bool verbose_log = true;
 	TAR *t;
-	tartype_t tar_type; // Only used in createTar() but variable must persist while the tar is open
-	int fd;
-	int input_fd;                                                                   // restore: fd of the .win input that zstd/aes read from (-1 in the plain-tar case)
-	pid_t comp_pid;   // compressor/decompressor worker: zstd (backup + DFP restore) or pigz (legacy restore LEGACY_COMPRESSED=1)
-	pid_t crypt_pid;
+	tartype_t tar_type; // initialised in the ctor, handed to libtar only by createTar()'s plain-tar branches; must persist while the tar is open
+	// restore: fd of the input the stage threads read from (a .win segment or the
+	// TW_ADB_RESTORE FIFO). Also set for a plain-tar ADB restore, which has no
+	// pipeline at all; only the plain-tar FILE restore leaves it at -1.
+	int input_fd;
+	// Pipeline of the CURRENT segment: PipeOperation owns
+	// the stage threads + rings. Created per segment in createTar()/openTar()
+	// (engine modes only), consumed (finish/abort + reset) in finish_pipeline()/
+	// abort_pipeline(). null = no active pipeline (plain tar or between
+	// segments). Lives only in the worker CHILD after the fork (backup: the
+	// fresh pipe_tar object, restore: `this`); the createTarFork/extractTarFork
+	// parent never sets it.
+	std::unique_ptr<PipeOperation> pipeline_;
 	unsigned long long file_count;
 
 	string tardir;
@@ -228,7 +203,11 @@ private:
 	string password;
 
 	std::vector<TarListStruct> *ItemList;
-	int output_fd;                                                                  // backup: seekable fd of the .win output the zstd/BAES pipeline writes to (in-file cache trim)
+	// backup: fd of the output the last stage writes to (the .win file, or the
+	// TW_ADB_BACKUP FIFO; also set for a plain-tar ADB backup, which has no
+	// pipeline). Only in the seekable file case does it additionally drive the
+	// in-file cache trim.
+	int output_fd;
 	// Output cache trimmer: last byte offset of the CURRENT segment dropped via
 	// sync_file_range+FADV_DONTNEED (write-behind, keeps the page-cache peak
 	// small). off64_t = 64-bit independent of arch/_FILE_OFFSET_BITS (segments

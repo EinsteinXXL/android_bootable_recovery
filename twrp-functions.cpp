@@ -57,6 +57,7 @@
 #include "data.hpp"
 #include "partitions.hpp"
 #include "variables.h"
+#include "stage_engine.hpp"   // Copy_Log: run_zstd_* + buffer/string StageIO adapters (in-process log compression)
 #include "bootloader_message/include/bootloader_message/bootloader_message.h"
 #include "cutils/properties.h"
 #include "cutils/android_reboot.h"
@@ -197,13 +198,10 @@ int TWFunc::Wait_For_Child_Timeout(pid_t pid, int *status, const string& Child_N
 			gui_msg(Msg(msg::kError, "pid_signal={1} process ended with signal: {2}")(Child_Name)(WTERMSIG(*status))); // Seg fault or some other non-graceful termination
 			return -1;
 		} else if (WEXITSTATUS(*status) != 0) {
-			// A graceful exit with code != 0 is a real error (e.g. tw_bssl_aes
-			// "truncated chunk data" / "authentication failed", zstd decompress
-			// errors). Without this check the restore reap (closeTarRestore ->
-			// finish_pipeline) would swallow sub-child errors on a clean tar EOF.
-			// Symmetric to Wait_For_Child. (Normal path: filters exit 0 on stdin
-			// EOF; an EPIPE exit only happens on cancel, classified as CANCELLED
-			// via stop_restore.)
+			// A graceful exit with code != 0 is a real error (e.g. a decrypt helper
+			// or any timed child that ends cleanly but non-zero). Without this check
+			// the caller's reap would swallow it on a clean exit. Symmetric to
+			// Wait_For_Child. (Normal path: the child exits 0.)
 			gui_msg(Msg(msg::kError, "pid_error={1} process ended with ERROR: {2}")(Child_Name)(WEXITSTATUS(*status)));
 			return -1;
 		}
@@ -251,19 +249,19 @@ unsigned long TWFunc::Get_File_Size(const string& Path) {
 // Generic write-behind page-cache trim of a SEEKABLE output fd. Drops clean
 // pages BEHIND the write head while the file is still being written — bounds
 // the page-cache peak (otherwise written-back clean pages accumulate until
-// close). lseek64(SEEK_CUR) reads the write progress (on an OFD SHARED via
-// fork+dup2 = how far the writing sub-child has come; on direct self-write =
-// our own position). From THRESHOLD on: first sync_file_range (range safely on
+// close). lseek64(SEEK_CUR) reads the write progress: in the engine modes the fd
+// is shared with the stage thread, so it reports how far that stage has written;
+// on a direct self-write it is our own position. From THRESHOLD on: first
+// sync_file_range (range safely on
 // disk), THEN posix_fadvise64 DONTNEED (drops ONLY clean pages), always
 // TAIL_MARGIN behind the head. trim_offset = in/out (last dropped offset; the
 // caller resets it per segment to 0). fd<0 or non-seekable (lseek64 ESPIPE) =>
 // no-op. off64_t/lseek64/posix_fadvise64 are 64-bit independent of
 // arch/_FILE_OFFSET_BITS (output may exceed 2 GB). The adbbackup gating and the
 // output_fd/t->fd choice are done by the twrpTar caller; only the mechanics
-// live here. Shared trim mechanics (output + input): flush=true (output,
-// written) syncs the range to disk first, then drops; flush=false (input/.win,
-// read) — pages are clean anyway -> FADV only, no flush wait.
-static void trim_cache_impl(int fd, off64_t& trim_offset, bool flush) {
+// live here. The restore input trim does NOT come through here — extract.c calls
+// posix_fadvise64 directly.
+static void trim_cache_impl(int fd, off64_t& trim_offset) {
 	static const off64_t THRESHOLD   = 128LL * 1024 * 1024;
 	static const off64_t TAIL_MARGIN =  16LL * 1024 * 1024;
 	if (fd < 0)
@@ -277,16 +275,15 @@ static void trim_cache_impl(int fd, off64_t& trim_offset, bool flush) {
 	if (flush_to <= trim_offset)
 		return;
 	off64_t len = flush_to - trim_offset;
-	// Order is mandatory (output only): flush the range to disk first, THEN drop clean-only.
-	if (flush)
-		sync_file_range(fd, trim_offset, len,
-			SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);
+	// Order is mandatory: flush the range to disk first, THEN drop clean-only.
+	sync_file_range(fd, trim_offset, len,
+		SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE | SYNC_FILE_RANGE_WAIT_AFTER);
 	posix_fadvise64(fd, trim_offset, len, POSIX_FADV_DONTNEED);
 	trim_offset = flush_to;
 }
 
 void TWFunc::Trim_Output_Cache(int fd, off64_t& trim_offset) {
-	trim_cache_impl(fd, trim_offset, /*flush=*/true);
+	trim_cache_impl(fd, trim_offset);
 }
 
 // C wrapper for libtar/append.c (tar_append_regfile, in-file output trim every
@@ -543,8 +540,6 @@ bool TWFunc::Copy_Log_Slices(const string& Source, const string& Destination, lo
 }
 
 void TWFunc::Copy_Log(string Source, string Destination) {
-	int logPipe[2];
-	int comp_pid;
 	int destination_fd;
 	std::string destLogBuffer;
 
@@ -555,16 +550,24 @@ void TWFunc::Copy_Log(string Source, string Destination) {
 	uncompressedLog.replace(extPos, Destination.length(), "");
 
 	if (Path_Exists(Destination)) {
-		// The persistent recovery log is ALWAYS zstd (write side below: zstd -1
-		// -T0; Update_Log_File always passes log.zstd/last_log.zstd) — no
-		// Get_File_Type detour, decompress directly with zstd -c -d.
-		std::string destFileBuffer;
-		std::string getCompressedContents = "zstd -c -d " + Destination;
-		if (Exec_Cmd(getCompressedContents, destFileBuffer, false) < 0) {
-			LOGINFO("Unable to get destination logfile contents.\n");
+		// The persistent recovery log is ALWAYS zstd (write side below;
+		// Update_Log_File always passes log.zstd/last_log.zstd) — no Get_File_Type
+		// detour. Decompressed IN-PROCESS through the same leaf loop the backup
+		// pipeline uses: run_zstd_decompress over an fd source + string sink.
+		int src_fd = open(Destination.c_str(), O_RDONLY | O_CLOEXEC);
+		if (src_fd < 0) {
+			LOGINFO("Unable to open destination logfile: %s\n", strerror(errno));
 			return;
 		}
-		destLogBuffer.append(destFileBuffer);
+		StageIO in  = stage_io_from_fd(&src_fd);
+		StageIO out = stage_io_to_string(&destLogBuffer);
+		char zerr[128] = {0};
+		int zrc = run_zstd_decompress(&in, &out, zerr, sizeof(zerr));
+		close(src_fd);
+		if (zrc != 0) {
+			LOGINFO("Unable to get destination logfile contents: %s\n", zerr);
+			return;
+		}
 	} else if (Path_Exists(uncompressedLog)) {
 		std::ifstream uncompressedIfs(uncompressedLog.c_str());
 		std::stringstream uncompressedSS;
@@ -591,55 +594,28 @@ void TWFunc::Copy_Log(string Source, string Destination) {
 		destLogBuffer.clear();
 	}
 
-	if (pipe2(logPipe, O_CLOEXEC) < 0) {
-		LOGINFO("Unable to open pipe to write to persistent log file: %s\n", Destination.c_str());
-		return;
-	}
-
-	destination_fd = open(Destination.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+	destination_fd = open(Destination.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
 	if (destination_fd < 0) {
 		LOGINFO("Cannot open %s: %s\n", Destination.c_str(), strerror(errno));
-		close(logPipe[0]);
-		close(logPipe[1]);
 		return;
 	}
 
-	comp_pid = fork();
-	if (comp_pid < 0) {
-		LOGINFO("fork() failed\n");
-		close(destination_fd);
-		close(logPipe[0]);
-		close(logPipe[1]);
-	} else if (comp_pid == 0) {
-		close(logPipe[1]);
-		dup2(logPipe[0], fileno(stdin));
-		dup2(destination_fd, fileno(stdout));
-		// The persistent log is a single compressor fork (no multi-pipe). Pinning
-		// + dynamic -T<size> would be overkill for the tiny log file: fixed -T0
-		// (zstd uses all cores), no sched_setaffinity.
-		if (execlp("zstd", "zstd", "-1", "-T0", "-c", "-", NULL) < 0) {
-			close(destination_fd);
-			close(logPipe[0]);
-			_exit(-1);
-		}
-	} else {
-		close(logPipe[0]);
-		if (write(logPipe[1], destLogBuffer.c_str(), destLogBuffer.size()) < 0) {
-			LOGINFO("Unable to append to persistent log: %s\n", Destination.c_str());
-			close(logPipe[1]);
-			close(destination_fd);
-			waitpid(comp_pid, nullptr, 0);
-			return;
-		}
-		if (write(logPipe[1], srcLogBuffer.c_str(), srcLogBuffer.size()) < 0) {
-			LOGINFO("Unable to append to persistent log: %s\n", Destination.c_str());
-			close(logPipe[1]);
-			close(destination_fd);
-			waitpid(comp_pid, nullptr, 0);
-			return;
-		}
-		close(logPipe[1]);
-		waitpid(comp_pid, nullptr, 0);
+	// Compress history + current session IN-PROCESS: the same leaf loop as the
+	// backup pipeline, driven over a buffer source + fd sink. Level 1; nbWorkers 0
+	// means the calling thread compresses synchronously — a log-sized payload does
+	// not warrant async workers. Both buffers go through ONE frame.
+	{
+		std::string combined;
+		combined.reserve(destLogBuffer.size() + srcLogBuffer.size());
+		combined.append(destLogBuffer);
+		combined.append(srcLogBuffer);
+		BufferSource src{ combined.data(), combined.size() };
+		StageIO in  = stage_io_from_buffer(&src);
+		StageIO out = stage_io_from_fd(&destination_fd);
+		char zerr[128] = {0};
+		if (run_zstd_compress(&in, &out, /*level=*/1, /*zstd_worker_count=*/0,
+		                      zerr, sizeof(zerr)) != 0)
+			LOGINFO("Unable to append to persistent log %s: %s\n", Destination.c_str(), zerr);
 	}
 	close(destination_fd);
 }

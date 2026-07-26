@@ -28,26 +28,27 @@ namespace tw_affinity {
 	// --- Master configuration ---
 	extern bool use_cpu_affinity;                  // false default
 	extern int  set_max_pipes;                     // -1 = nproc/2 fallback (1 = force single pipe)
-	// Unified MAX thread budget (TW_MAX_COMPRESSOR_THREADS) for zstd (-T) AND
-	// pigz (-p). -1 = unset -> budget counter = compute_pipe_count() (= MAX_PIPES).
-	// If set (>=1) it is the budget COUNTER in the compute_compressor_threads()
-	// law (= budget/active), NOT a fixed -T value: it caps -T (e.g. =4 -> 4
-	// pipes = -T1, 1 pipe = -T4), so max-pipes never oversubscribes.
-	extern int  max_comp_threads;                  // >=1 = fixed budget counter; 0 = all cores (-T0 semantics); -1 = unset -> budget = MAX_PIPES (nproc/2 class)
+	// MAX compressor-thread budget (TW_MAX_COMPRESSOR_THREADS), feeding the zstd
+	// stage's ZSTD_c_nbWorkers. -1 = unset -> budget counter = compute_pipe_count()
+	// (= MAX_PIPES). If set (>=1) it is the budget COUNTER in the
+	// compute_compressor_threads() law (= budget/active), NOT a fixed per-pipe
+	// thread count: it caps the per-pipe threads (e.g. =4 -> 4 pipes get 1 thread
+	// each, 1 pipe gets 4), so max-pipes never oversubscribes.
+	extern int  max_comp_threads;                  // >=1 = fixed budget counter; 0 = all cores; -1 = unset -> budget = MAX_PIPES (nproc/2 class)
 
 	// --- Runtime state ---
 	// Number of currently active pipes of the running backup/restore. The parent
-	// sets it BEFORE the fork loop; pipe children + compressor sub-children
-	// inherit it via fork() and read it in compute_compressor_threads() (zstd
-	// thread budget). init() defaults it to compute_pipe_count() (=>
-	// compute_compressor_threads==1 => -T1).
+	// sets it BEFORE the fork loop; the pipe workers inherit it via fork() and
+	// their stage threads read it in compute_compressor_threads() (zstd thread
+	// budget) and in core_slice(). init() defaults it to compute_pipe_count()
+	// (=> compute_compressor_threads == 1).
 	extern int  active_pipes;
 
 	// --- Affinity lists (element -1 = no-pin for that slot) ---
-	extern std::vector<int> tar_worker_cores;       // tar parent per pipe (all modes)
-	extern std::vector<int> zstd_cores;             // zstd sub-child per pipe + -T
-	extern std::vector<int> enc_only_aes_cores;     // AES sub-child per pipe in ENCRYPTED mode (tar + AEAD, no compression)
-	extern std::vector<int> enc_and_comp_aes_cores; // AES sub-child per pipe in COMPRESSED_ENCRYPTED mode (zstd + AEAD)
+	extern std::vector<int> tar_worker_cores;       // pipe worker process per pipe (all modes)
+	extern std::vector<int> zstd_cores;             // zstd/gzip stage thread per pipe (also sizes its worker threads)
+	extern std::vector<int> enc_only_aes_cores;     // AES stage thread per pipe in ENCRYPTED mode (tar + AEAD, no compression)
+	extern std::vector<int> enc_and_comp_aes_cores; // AES stage thread per pipe in COMPRESSED_ENCRYPTED mode (zstd + AEAD)
 
 	// --- Soft/hard-pin flags per list ---
 	// true = range notation in BoardConfig ("4-7") = SOFT pin (cluster, never
@@ -93,14 +94,14 @@ namespace tw_affinity {
 	// (also used by compute_compressor_threads).
 	int compute_pipe_count(unsigned long long used_bytes);
 
-	// zstd/pigz thread budget for pipe pipe_id — remainder-free. Budget counter =
-	// max_comp_threads (TW_MAX_COMPRESSOR_THREADS, if >=1); ==0 -> nproc (all
-	// cores, -T0 semantics); unset (<0) -> compute_pipe_count() (= MAX_PIPES).
+	// zstd thread budget for pipe pipe_id (becomes ZSTD_c_nbWorkers) —
+	// remainder-free. Budget counter = max_comp_threads
+	// (TW_MAX_COMPRESSOR_THREADS, if >=1); ==0 -> nproc (all cores); unset (<0) ->
+	// compute_pipe_count() (= MAX_PIPES).
 	// t = base + (pipe_id among the last `budget%active` pipes ? 1 : 0),
 	// base = budget/active. Sum over all pipes == budget (no thread is lost,
 	// never oversubscribed). Remainder goes to the LAST pipes — same direction
-	// as core_slice(). (For hard pins the caller uses slice.size() instead, see
-	// twrpTar comp_thread_count.)
+	// as core_slice().
 	int compute_compressor_threads(int active_pipes, int pipe_id);
 
 	// sched_setaffinity to a single core. core<0 ("not configured") -> un-pin to

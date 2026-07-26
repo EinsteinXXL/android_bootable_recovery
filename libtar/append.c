@@ -48,9 +48,9 @@
 #define DEBUG 1
 #endif
 
-/* TAR_DATA_BUF_SIZE (128 KB) is defined in libtar/libtar.h since Phase 3 of the
-   Multi-Pipe-Restore umbau (Restore_Konzept.md Sec. 8.7) -- shared with extract.c
-   so backup write path and restore read path use the same chunk size. */
+/* TAR_DATA_BUF_SIZE (128 KB) is defined in libtar/libtar.h and shared with
+   extract.c, so the backup write path and the restore read path use the same
+   chunk size. */
 
 struct tar_dev
 {
@@ -178,8 +178,8 @@ tar_append_file(TAR *t, const char *realname, const char *savename)
 				|| strncmp((char *) tar_policy, SYSTEM_DE_FSCRYPT_POLICY, sizeof(SYSTEM_DE_FSCRYPT_POLICY)) == 0) {
 #ifdef USE_FSCRYPT_POLICY_V1
 					memcpy(t->th_buf.fep->master_key_descriptor, tar_policy, FS_KEY_DESCRIPTOR_SIZE);
-					// Verbose log: the "found policy" line only under TAR_TW_VERBOSE_LOG (dedicated bit, NOT
-					// TAR_VERBOSE/L.316); the "failed to ..." cases below always stay visible.
+					// Verbose log: the "found policy" line only under TAR_TW_VERBOSE_LOG (a dedicated
+					// bit, NOT TAR_VERBOSE); the "failed to ..." cases below always stay visible.
 					if (t->options & TAR_TW_VERBOSE_LOG)
 						printf("found fscrypt policy '%s' - '%s' - '%s'\n", realname, t->th_buf.fep->master_key_descriptor, policy_hex);
 #else
@@ -366,8 +366,11 @@ tar_append_eof(TAR *t)
 }
 
 
-/* Bulk I/O goes through the central tar_io_read/tar_io_write (block.c) with
- * identical semantics. */
+/* Bulk I/O: the source read goes through the central tar_io_read (block.c); the
+ * archive write goes through t->type->writefunc like every header block
+ * (tar_block_write macro) -- REQUIRED for ring-backed tar handles (a pseudo-fd,
+ * with no real fd behind t->fd). Behavior-neutral for all fd-backed types:
+ * default_type.writefunc AND write_tar_no_buffer both delegate to tar_io_write. */
 
 /* add file contents to a tarchive */
 int
@@ -418,7 +421,7 @@ tar_append_regfile(TAR *t, const char *realname)
 				errno = EIO;   /* short read = source file truncated mid-archive */
 			goto fail;
 		}
-		if (tar_io_write(t->fd, data_buf, TAR_DATA_BUF_SIZE) != TAR_DATA_BUF_SIZE)
+		if ((*(t->type->writefunc))(t->fd, data_buf, TAR_DATA_BUF_SIZE) != TAR_DATA_BUF_SIZE)
 			goto fail;
 		since_trim += TAR_DATA_BUF_SIZE;
 		if (since_trim >= (128LL << 20))   /* 128 MB */
@@ -437,12 +440,21 @@ tar_append_regfile(TAR *t, const char *realname)
 	if (i > 0)
 	{
 		j = tar_io_read(filefd, data_buf, i);
-		if (j == -1)
+		/* Same rule as the bulk loop above: a short read means the source file
+		 * shrank after its header was written (live /data), so the archive entry
+		 * cannot be filled honestly. Upstream libtar only tested for -1 here and
+		 * padded the gap, which with this shared 128 KB buffer would ship bytes of
+		 * the PREVIOUSLY read file inside the entry. Fail instead. */
+		if (j != i)
+		{
+			if (j != -1)
+				errno = EIO;
 			goto fail;
+		}
 		/* pad last chunk to T_BLOCKSIZE boundary (tar format requirement) */
 		padded = ((i + T_BLOCKSIZE - 1) / T_BLOCKSIZE) * T_BLOCKSIZE;
 		memset(&(data_buf[i]), 0, padded - i);
-		if (tar_io_write(t->fd, data_buf, padded) != padded)
+		if ((*(t->type->writefunc))(t->fd, data_buf, padded) != padded)
 			goto fail;
 	}
 

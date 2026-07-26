@@ -69,8 +69,9 @@ void gui_msg(Message msg)
 void gui_activate_msg_pipe(int) {}
 void gui_deactivate_msg_pipe(void) {}
 
-// fscrypt policy stubs: libtar (append.c/extract.c) calls these TWRP helpers to
-// save/restore /data encryption policies. Their real implementation
+// fscrypt policy stubs: libtar (append.c/extract.c) and twrpTar.cpp
+// (fscrypt_set_mode) call these TWRP helpers to save/restore /data encryption
+// policies. Their real implementation
 // (crypto/fscrypt/fscrypt_policy.cpp) pulls in libbase/libcutils/liblogwrap/
 // libfscrypt/KeyUtil — half the key-management tree — which the lean twrpTar CLI
 // deliberately does not link. As no-ops (extern "C", matched by name at link
@@ -92,9 +93,9 @@ void usage() {
 	printf("         -x extract\n\n");
 	printf(" -d    target directory\n");
 	printf(" -t    output file\n");
-	printf(" -z    compress backup (/system/bin/zstd must be present)\n");
+	printf(" -z    compress backup (zstd, in-process -- no external binary needed)\n");
 #ifndef TW_EXCLUDE_ENCRYPTED_BACKUPS
-	printf(" -e    encrypt/decrypt backup followed by password (/system/bin/tw_bssl_aes must be present)\n");
+	printf(" -e    encrypt/decrypt backup followed by password (BoringSSL AEAD, in-process)\n");
 	printf(" -u    encrypt using userdata encryption (must be used with -e)\n");
 #endif
 	printf("\n\n");

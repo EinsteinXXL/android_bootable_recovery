@@ -14,12 +14,21 @@
 */
 
 // ---------------------------------------------------------------------------
-// Tier-2 per-archive pipeline (comp/crypt). PipeOperation encapsulates the
-// declarative stage chain; BackupPipeline wires it forward (tar -> ... -> file),
-// RestorePipeline backward (file -> ... -> tar). The forked PIDs are stored via
-// write-through into twrpTar::comp_pid/crypt_pid so the proven
-// reap_subchildren/cleanup path in twrpTar stays untouched. Definitions live in
-// pipe_operation.cpp; access to twrpTar members/statics goes through the friend
+// Per-archive stage pipeline. PipeOperation encapsulates the declarative stage
+// chain AND owns its lifecycle: the StageThread + StageRing handles live as
+// members here, join_stages() is the private teardown primitive, finish()/abort()
+// are the named public teardown intents. BackupPipeline wires the stages forward
+// (tar -> ... -> file), RestorePipeline backward (file -> ... -> tar); each stage
+// runs as an in-process THREAD.
+//
+// The object is held by twrpTar as a unique_ptr member (pipeline_) spanning the
+// whole createTar()->closeTar() / openTar()->closeTarRestore() segment cycle —
+// created per segment, consumed (finish/abort + reset) by twrpTar::
+// finish_pipeline()/abort_pipeline(). Ownership boundary (same rule as
+// ZstdStream): the pipeline owns the STAGES (threads + rings + tar-ring
+// registry slot); the FILE ends (input_fd/output_fd) and the tar handle stay on
+// twrpTar — those exist on paths without any pipeline (plain tar). Definitions
+// live in pipe_operation.cpp; access to twrpTar members goes through the friend
 // grants in twrpTar.hpp (friendship spans translation units -> no member
 // becomes public).
 // ---------------------------------------------------------------------------
@@ -27,7 +36,6 @@
 #ifndef __PIPE_OPERATION_HPP
 #define __PIPE_OPERATION_HPP
 
-#include <string>
 #include <cstdint>
 #include <vector>   // core_for() returns a core slice (std::vector<int>)
 
@@ -43,12 +51,9 @@ extern "C" {
 #define TWTAR_FLAGS TAR_GNU | TAR_STORE_SELINUX | TAR_STORE_POSIX_CAP | TAR_STORE_ANDROID_USER_XATTR
 #endif
 
-// Shared low-level helpers: defined in twrpTar.cpp (they use file-local
-// constants/logging there), declared here for use in pipe_operation.cpp.
-int  make_data_pipe(int p[2]);
-bool write_password_or_log(int fd, const std::string& password);
-
-class twrpTar;   // back reference; friend of twrpTar (see twrpTar.hpp)
+class twrpTar;      // back reference; friend of twrpTar (see twrpTar.hpp)
+struct StageThread; // in-process stage (stage_engine.hpp) -- pointer-only here
+class StageRing;    // SPSC stage-transport ring (stage_ring.h) -- pointer-only here
 
 // Declarative pipeline description (backup data direction tar -> ... -> file).
 enum class PipeStage : uint8_t { ZSTD, AES };
@@ -56,29 +61,81 @@ enum class PipeStage : uint8_t { ZSTD, AES };
 class PipeOperation {
 protected:
 	twrpTar&    tw_;
-	int         pipes_[4] = {-1, -1, -1, -1};   // max 2 stages -> max 2 pipes (4 fds)
 	PipeStage   stages_[2];
 	int         n_stages_ = 0;
-	const char* err_key_;                       // gui_err key for abort() (backup_/restore_error)
+	const char* err_key_;                       // gui_err key for abort_setup() (backup_/restore_error)
+
+	// The pipeline stages run IN-PROCESS as threads. Heap-owned HERE:
+	// spawn_*_stage() creates them, join_stages() joins + frees them in comp->aes
+	// order (delete only after a successful join -- never while a wedged thread
+	// still references it). nullptr = no active thread of that kind.
+	StageThread* comp_stage_ = nullptr;   // zstd (compress + decompress) / gzip (legacy decompress) thread
+	StageThread* aes_stage_  = nullptr;   // BAES AES thread
+	// Inter-stage SPSC ring for COMPRESSED_ENCRYPTED (S0<->S1); 1-stage modes leave
+	// it null. Created in *Pipeline::setup(), freed in join_stages() ONLY after both
+	// stage joins finished (a wedged/timed-out thread may still reference it ->
+	// deliberate leak + the worker _exit()s, same discipline as the StageThreads).
+	StageRing* inter_ring_ = nullptr;
+	// tar-boundary ring (backup: tar -> S0; restore: S_last -> tar) + its registered
+	// pseudo-fd (stage_engine.cpp registry; 0 = none). libtar reaches the ring via
+	// the ring tartype's callbacks (pseudo-fd lookup). Freed in the join_stages()
+	// funnel (registry slot released there FIRST).
+	StageRing* tar_ring_ = nullptr;
+	long tar_ring_pseudo_fd_ = 0;
 
 	PipeOperation(twrpTar& tw, const char* err_key) : tw_(tw), err_key_(err_key) {}
 
 	void build_stages();                                  // stage list from the mode
 	std::vector<int> core_for(PipeStage s) const;         // core slice per stage (mode-dependent)
-	int  make_all_pipes(int k);                           // make_data_pipe loop
-	int  fork_zstd(int in, int out, bool decompress, const char* child_err);
-	int  fork_aes (int in, int out, bool decrypt,    const char* child_err);
+	// Start the zstd (or legacy-gzip) stage as an in-process THREAD. Creates
+	// comp_stage_ (heap), wires its StageIO over the file end (in/out as an fd,
+	// = input_fd/output_fd) or a ring side (in_ring/out_ring, fd arg -1), picks the
+	// leaf loop from the archive type (LEGACY_COMPRESSED decompress -> zlib; else
+	// zstd) + reads level/nbWorkers for compress from DataManager, and starts it.
+	// Returns 0/-1 (on -1 nothing runs and comp_stage_ is cleared).
+	int  spawn_zstd_stage(int in, int out, bool decompress,
+	                      StageRing* in_ring = nullptr, StageRing* out_ring = nullptr);
+	// Start the AES stage as an in-process THREAD. Creates aes_stage_ (heap),
+	// wires its StageIO over the file end (in/out) or a ring side, copies password +
+	// aead_cipher_id + the AES core slice, and starts it. Ring/fd conventions as in
+	// spawn_zstd_stage. Returns 0/-1 (on -1 nothing runs and aes_stage_ is cleared).
+	int  spawn_aes_stage(int in, int out, bool decrypt,
+	                     StageRing* in_ring = nullptr, StageRing* out_ring = nullptr);
 
-	// Unified setup-error cleanup. The object owns pipes_; via friend it uses
-	// the private tw_.reap_subchildren + tw_.output_fd/input_fd/tarfn.
-	// gui_err(err_key_), closes open pipes_, kill+reap comp/crypt, closes+
-	// unlinks the output (backup) and closes the input (restore). Always
+	// Unified setup-error cleanup (only reachable while setup() runs): gui_err
+	// (err_key_), poison + join the stage threads/rings, then via friend close+
+	// unlink the output (backup) and close the input (restore) on tw_. Always
 	// returns -1 (return idiom). log_msg may be NULL.
-	int  abort(const char* log_msg);
+	int  abort_setup(const char* log_msg);
+
+private:
+	// Private stage-teardown primitive (single source of truth, comp->aes order) —
+	// the flags live only here, behind the named intents finish()/abort()/
+	// abort_setup(). poison_first = fail() the rings before the join (abort
+	// paths); timeout_secs>0 = timed join (restore hardening), else blocking;
+	// report_failures -> -1 on a stage rc != 0. Closes NO fds; frees the
+	// pipeline-owned rings.
+	int  join_stages(bool poison_first, int timeout_secs, bool report_failures);
 
 public:
-	virtual ~PipeOperation() {}
+	// Safety net only (frees stages that are not running and rings no thread can
+	// touch; NEVER joins). Every regular path consumes the pipeline via
+	// finish()/abort() first, so this is a no-op there; _exit() paths skip
+	// destructors entirely.
+	virtual ~PipeOperation();
+	PipeOperation(const PipeOperation&) = delete;
+	PipeOperation& operator=(const PipeOperation&) = delete;
+
 	virtual int setup() = 0;
+
+	// Success close: let the stage threads end naturally via EOF (NO poison),
+	// a stage rc cascades onto the return code. timeout_secs > 0 bounds each join
+	// (backup close 120 s, restore close 10 s), <= 0 blocks. Named analogue of
+	// ZstdStream::finish().
+	int  finish(int timeout_secs);
+	// Error/cancel close: poison the rings + join (stage status irrelevant).
+	// Named analogue of ZstdStream::abort().
+	void abort(int timeout_secs);
 };
 
 // Backup: stage list wired FORWARD (tar -> S0 -> ... -> S_{k-1} -> file).

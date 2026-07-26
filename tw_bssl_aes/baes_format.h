@@ -1,11 +1,11 @@
 #ifndef BAES_FORMAT_H
 #define BAES_FORMAT_H
 /*
- * baes_format.h -- BAES v2 encrypted-backup wire format (single source of truth).
+ * baes_format.h -- BAES encrypted-backup wire format (single source of truth).
  *
  * Shared by:
- *   - writer/filter   : tw_bssl_aes/tw_bssl_aes.c  (enc/dec)
- *   - reader/pw probe : twrp-functions.cpp         (Try_Decrypting_File)
+ *   - encrypt/decrypt : tw_bssl_aes/baes_stream.c  (baes_stream_encrypt/decrypt)
+ *   - reader/pw probe : backupheadermanager.cpp    (BackupHeaderManager::Try_Decrypting_File)
  *   - cipher banner   : twrpTar.cpp                (read_baes_cipher_id)
  * The PC tool Tools/twrp_extract.py cannot include a C header — on format
  * changes its constants must be kept in sync with this file manually.

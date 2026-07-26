@@ -9,6 +9,10 @@ LOCAL_SRC_FILES:= \
 	../twrpTar.cpp \
 	../backupheadermanager.cpp \
 	../pipe_operation.cpp \
+	../stage_engine.cpp \
+	../stage_ring.cpp \
+	../stage_io.c \
+	../tw_bssl_aes/baes_stream.c \
 	../tarWrite.c \
 	../exclude.cpp \
 	../progresstracking.cpp \
@@ -17,7 +21,7 @@ LOCAL_CFLAGS:= -g -c -W -DBUILD_TWRPTAR_MAIN -DUSE_FSCRYPT -Wno-unused-parameter
 
 LOCAL_C_INCLUDES += bionic
 # twrpTarMain core: the engine sources (twrpTar/twrp-functions/pipe_operation) pull
-# headers from the recovery tree + prebuilts since the multi-pipe/crypto rework.
+# headers from the recovery tree + prebuilts.
 # Recovery root (tw_atomic.hpp/partitions.hpp), android-base, ziparchive (gui/pages.hpp),
 # boringssl (BAES detection) -- like the main recovery module, ONLY the header paths.
 LOCAL_C_INCLUDES += \
@@ -38,21 +42,24 @@ LOCAL_C_INCLUDES += \
     $(LOCAL_PATH)/../crypto/fscrypt \
     system/core/libcutils/include
 
-# BackupHeaderManager: the dual-compiled class does in-process zstd decode
-# (decode_head -> ZSTD_decompressStream) -> libzstddec_twrp (decode-only static lib,
-# bootable/recovery/zstd; exports <zstd.h>). libcrypto_static = BAES detection (already there).
-LOCAL_STATIC_LIBRARIES := libc libtar_static libz libcrypto_static libzstddec_twrp
+# Full in-process zstd (compress + decompress): BackupHeaderManager decode
+# (decode_head -> ZSTD_decompressStream) AND the pipeline engine
+# (stage_engine.cpp: run_zstd_*) -> libzstd_twrp (bootable/recovery/zstd; exports
+# <zstd.h>). libcrypto_static = BAES detection + baes_stream.c AEAD (already there).
+LOCAL_STATIC_LIBRARIES := libc libtar_static libz libcrypto_static libzstd_twrp
 ifeq ($(shell test $(PLATFORM_SDK_VERSION) -lt 23; echo $$?),0)
     LOCAL_C_INCLUDES += external/stlport/stlport bionic/libstdc++/include
     LOCAL_STATIC_LIBRARIES += libstlport_static
 endif
-# libstdc++ removed: it collides with libc++ (the default STL) on std::nothrow (duplicate symbol
-# at the StaticExecutable link, new.cpp libstdc++ vs libc++).
+# libstdc++ is NOT linked: it collides with libc++ (the default STL) on std::nothrow
+# (duplicate symbol at the StaticExecutable link, new.cpp libstdc++ vs libc++).
 # Crypto: twrpTar_static links libcrypto_static (NON-FIPS static BoringSSL) -> the full
-# EVP/BAES path in twrp-functions.cpp (no more hardcoded -DTW_EXCLUDE_ENCRYPTED_BACKUPS).
+# EVP/BAES path in twrp-functions.cpp (TW_EXCLUDE_ENCRYPTED_BACKUPS is board-gated
+# below, not hardcoded).
 # For that, //bootable/recovery/twrpTarMain was added to libcrypto_static.visibility
 # (external/boringssl/Android.bp); the shared FIPS libcrypto (libcrypto.so, recovery) stays untouched.
-# AES itself = the tw_bssl_aes subprocess (like shared); libcrypto_static is only for in-process detection.
+# AES itself runs IN-PROCESS here too (baes_stream.c on a StageThread, no subprocess);
+# libcrypto_static therefore serves both the detection AND the actual crypto.
 # The board-gated exclude block below (TW_EXCLUDE_ENCRYPTED_BACKUPS=true) is kept as an opt-out.
 
 LOCAL_C_INCLUDES += external/libselinux/include
@@ -64,9 +71,8 @@ endif
 ifeq ($(TW_EXCLUDE_ENCRYPTED_BACKUPS), true)
     LOCAL_CFLAGS += -DTW_EXCLUDE_ENCRYPTED_BACKUPS
 endif
-# OpenAES removed. Standalone twrpTar = UTILITY_EXECUTABLES (not in recovery.img, dormant):
-# with crypto active the BAES path in twrp-functions.cpp would need libcrypto -- deliberately
-# NOT wired here (the utility is not shipped/tested).
+# Standalone twrpTar_static is a UTILITY_EXECUTABLE: not part of recovery.img, not
+# shipped or tested as a product. Crypto IS wired (libcrypto_static above).
 
 LOCAL_MODULE:= twrpTar_static
 LOCAL_FORCE_STATIC_EXECUTABLE := true
@@ -85,6 +91,10 @@ LOCAL_SRC_FILES:= \
 	../twrpTar.cpp \
 	../backupheadermanager.cpp \
 	../pipe_operation.cpp \
+	../stage_engine.cpp \
+	../stage_ring.cpp \
+	../stage_io.c \
+	../tw_bssl_aes/baes_stream.c \
 	../tarWrite.c \
 	../exclude.cpp \
 	../progresstracking.cpp \
@@ -93,7 +103,7 @@ LOCAL_CFLAGS:= -g -c -W -DBUILD_TWRPTAR_MAIN -DUSE_FSCRYPT -Wno-unused-parameter
 
 LOCAL_C_INCLUDES += bionic
 # twrpTarMain core: the engine sources (twrpTar/twrp-functions/pipe_operation) pull
-# headers from the recovery tree + prebuilts since the multi-pipe/crypto rework.
+# headers from the recovery tree + prebuilts.
 # Recovery root (tw_atomic.hpp/partitions.hpp), android-base, ziparchive (gui/pages.hpp),
 # boringssl (BAES detection) -- like the main recovery module, ONLY the header paths.
 LOCAL_C_INCLUDES += \
@@ -118,11 +128,14 @@ ifeq ($(shell test $(PLATFORM_SDK_VERSION) -lt 23; echo $$?),0)
     LOCAL_C_INCLUDES += external/stlport/stlport bionic/libstdc++/include
     LOCAL_SHARED_LIBRARIES += libstlport_static
 endif
-# libstdc++ removed (libc++ = default STL, else a std::nothrow duplicate); libcrypto = BAES detection.
+# libstdc++ is NOT linked (libc++ = default STL, else a std::nothrow duplicate).
+# libcrypto provides both the BAES detection and the actual AEAD implementation
+# (baes_stream.c is in LOCAL_SRC_FILES above).
 LOCAL_SHARED_LIBRARIES += libcrypto
-# BackupHeaderManager: in-process zstd decode (decode_head) -> libzstddec_twrp
-# (decode-only static lib, bootable/recovery/zstd; exports <zstd.h>).
-LOCAL_STATIC_LIBRARIES += libzstddec_twrp
+# Full in-process zstd (compress + decompress): BackupHeaderManager decode
+# (decode_head) + the pipeline engine (stage_engine.cpp) -> libzstd_twrp
+# (bootable/recovery/zstd; exports <zstd.h>).
+LOCAL_STATIC_LIBRARIES += libzstd_twrp
 
 LOCAL_C_INCLUDES += external/libselinux/include
 LOCAL_SHARED_LIBRARIES += libselinux
@@ -133,8 +146,8 @@ endif
 ifeq ($(TW_EXCLUDE_ENCRYPTED_BACKUPS), true)
     LOCAL_CFLAGS += -DTW_EXCLUDE_ENCRYPTED_BACKUPS
 endif
-# OpenAES removed (see above). With crypto active twrpTar would need libcrypto;
-# deliberately not wired (UTILITY, dormant, not shipped).
+# Standalone twrpTar (shared) is a UTILITY_EXECUTABLE: not part of recovery.img,
+# not shipped or tested as a product. Crypto IS wired (libcrypto above).
 
 LOCAL_MODULE:= twrpTar
 LOCAL_MODULE_TAGS:= optional

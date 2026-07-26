@@ -17,7 +17,7 @@
 #include <sys/param.h>
 #include <dirent.h>
 #include <errno.h>
-#include <unistd.h>   /* write() for the DFP-R1 DFP signal in tar_extract_all() */
+#include <unistd.h>   /* write() for the directory-first-processing signal in tar_extract_all() */
 
 #ifdef STDC_HEADERS
 # include <string.h>
@@ -126,10 +126,10 @@ tar_extract_all(TAR *t, char *prefix, const int *progress_fd, int dfp_done_fd, c
 	char *filename;
 	char buf[MAXPATHLEN];
 	int i;
-	/* Directory-First-Processing signal (DFP-R1): with dfp_done_fd >= 0 the first
-	 * non-DIR header of this archive sends 1 byte once -- by that point all
-	 * preceding directories (the full directory pre-run in win000) are already
-	 * extracted + policed. The restore parent then releases the file pipes. */
+	/* Directory-first-processing signal: with dfp_done_fd >= 0 the first non-DIR
+	 * header of this archive sends 1 byte once -- by that point all preceding
+	 * directories (the full directory pre-run in win000) are already extracted +
+	 * policed. The restore parent then releases the file pipes. */
 	int dfp_signaled = 0;
 
 #ifdef DEBUG

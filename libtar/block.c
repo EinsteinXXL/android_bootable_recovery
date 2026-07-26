@@ -56,28 +56,29 @@
 
 /* ---------------------------------------------------------------------------
  * tar_io_read / tar_io_write -- the central robust block-I/O primitive for
- * tar fds (regular files OR pipes). Single source of truth for both the backup
- * AND restore direction (default_type in handle.c, tar_type in twrpTar.cpp, the
- * bulk path in append.c, write_tar_no_buffer in tarWrite.c).
+ * FD-BACKED tar handles. Single source of truth for both the backup AND restore
+ * direction (default_type in handle.c, tar_type in twrpTar.cpp, the bulk path in
+ * append.c, write_tar_no_buffer in tarWrite.c). Ring-backed tar handles do not
+ * pass through here — they use the ring callbacks in stage_engine.cpp, which
+ * honour the same full-read contract.
  *
- * POSIX allows read() on a pipe to return short reads (< requested bytes) at any
- * time whenever the writer (zstd / tw_bssl_aes stage) has not filled the pipe
- * yet. But all libtar callers (th_read_internal, tar_extract_regfile,
- * tar_skip_regfile, ...) treat any result != T_BLOCKSIZE as EOF/truncation ->
- * restore abort. This is a real hazard with the multi-pipe pipelines and the DFP
- * directory pre-run (a dense 512-B header stream with no data blocks: the reader
- * outruns the AES stage).
+ * A tar fd is not always a regular file: on the ADB paths it is a FIFO, and POSIX
+ * allows read() on a FIFO to return short reads (< requested bytes) whenever the
+ * writer has not filled it yet. All libtar callers (th_read_internal,
+ * tar_extract_regfile, tar_skip_regfile, ...) treat any result != T_BLOCKSIZE as
+ * EOF/truncation -> restore abort, so the refill below is what keeps a partially
+ * filled FIFO from looking like a truncated archive.
  *
  * tar_io_read:  fills buf up to count; returns count, and 0..count-1 only on a
- *               real EOF (writer closed fd/pipe), -1 on error. EINTR-safe.
+ *               real EOF (the writer closed the fd), -1 on error. EINTR-safe.
  *               Transient short reads are refilled (a blocking read on an open
- *               pipe waits for data).
+ *               FIFO waits for data).
  * tar_io_write: writes all count bytes; returns count or -1. EINTR- and
  *               partial-write-safe (needed for bulk writes > PIPE_BUF in
  *               tar_append_regfile).
  *
- * Happy path (pipe/file delivers full blocks) = 1 syscall per call,
- * byte-identical to bare read/write -- no performance loss.
+ * Happy path (the fd delivers full blocks) = 1 syscall per call, byte-identical
+ * to bare read/write -- no performance loss.
  */
 ssize_t
 tar_io_read(int fd, void *buf, size_t count)
@@ -483,11 +484,12 @@ read_special_headers:
 
 			/* PAX GLOBAL header (typeflag 'g'): TWRP self-describing markers
 			 * (TWRP.tartype/TWRP.ead) are parsed here into t->th_buf.global_*
-			 * (archive-wide, in-memory, never serialised). NOTE: the P2 type
-			 * detector and P3 restore-peek currently run their OWN early
-			 * detection (the type is needed BEFORE th_read), so these fields are
-			 * presently unread -- kept as clean libtar-level self-describing infra.
-			 * Guarded on 'g' so an 'x' payload cannot false-match "TWRP.*". */
+			 * (archive-wide, in-memory, never serialised). The fields are
+			 * currently unread: the archive type has to be known BEFORE the first
+			 * th_read (it selects the restore pipeline), so BackupHeaderManager
+			 * peeks the records itself. Kept as libtar-level self-describing
+			 * infrastructure. Guarded on 'g' so an 'x' payload cannot false-match
+			 * "TWRP.*". */
 			if (TH_ISGLOBALHEADER(t))
 			{
 				start = strstr(buf, TWRP_TARTYPE_TAG);

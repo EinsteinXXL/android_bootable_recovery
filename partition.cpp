@@ -48,6 +48,7 @@
 #include "data.hpp"
 #include "twrp-functions.hpp"
 #include "twrpTar.hpp"
+#include "stage_engine.hpp"   // ZstdStream (in-process zstd for the dd/image paths)
 #include "twrp_affinity.hpp"
 #include "exclude.hpp"
 #include "infomanager.hpp"
@@ -2840,11 +2841,11 @@ bool TWPartition::Backup_Image(PartitionSettings *part_settings) {
 			return false;
 	}
 
-	// Optionally back up the /super image zstd-compressed (single pipe).
+	// Optionally back up the /super image zstd-compressed (single stage).
 	// Condition: only /super, no ADB backup (own TWIMG stream format), checkbox
-	// on. The filename stays super.emmc.win (dd image); zstd is only a pipe
+	// on. The filename stays super.emmc.win (dd image); zstd is only a stream
 	// stage, the uncompressed size is self-describing in the frame header
-	// (--stream-size). All other image partitions stay raw. Raw and zstd
+	// (Frame_Content_Size). All other image partitions stay raw. Raw and zstd
 	// mechanics are unified in Raw_Read_Write (compress parameter).
 	bool compress_super = !part_settings->adbbackup
 	    && Mount_Point == "/super"
@@ -2860,105 +2861,23 @@ bool TWPartition::Backup_Image(PartitionSettings *part_settings) {
 	return true;
 }
 
-// ---------------------------------------------------------------------------
-// ZstdPipe: shared fork->zstd-pipe->reap mechanics for the two piped image
-// paths (Raw_Read_Write with compress=true = compress; Restore_Image_Test =
-// decompress). ONE zstd child + ONE pipe to the parent — the little sibling of
-// PipeChildRegistry/run_pipe_reap in twrpTar.cpp.
-//   compress   (decompress=false): parent WRITES parent_fd; child reads the pipe
-//              (stdin), writes file_fd (stdout).
-//   decompress (decompress=true) : parent READS parent_fd; child reads file_fd
-//              (stdin), writes the pipe (stdout).
-// extra_close[] = additional parent fds (NOT O_CLOEXEC) the child must close
-// before exec. SIGPIPE is globally SIG_IGN (twrp.cpp) -> a write to a dead pipe
-// returns EPIPE instead of a signal.
-// ---------------------------------------------------------------------------
-struct ZstdPipe {
-	int   parent_fd = -1;   // parent writes (compress) or reads (decompress)
-	pid_t pid = -1;
-};
-
-// pipe2 + fork + child (dup2/close/execv). Returns 0 (zp filled) / -1.
-static int zstd_pipe_spawn(ZstdPipe& zp, bool decompress, int file_fd,
-                           const char* const argv[],
-                           const int* extra_close, int n_extra, const char* tag) {
-	int fds[2] = { -1, -1 };
-	if (pipe2(fds, O_CLOEXEC) < 0) {
-		LOGERR("%s: pipe2 failed (%s)\n", tag, strerror(errno));
-		return -1;
-	}
-	pid_t pid = fork();
-	if (pid < 0) {
-		LOGERR("%s: fork failed (%s)\n", tag, strerror(errno));
-		close(fds[0]); close(fds[1]);
-		return -1;
-	}
-	if (pid == 0) {
-		// Child. dup2 clears O_CLOEXEC on 0/1 -> they survive exec.
-		if (decompress) {
-			if (dup2(file_fd, STDIN_FILENO)  < 0) _exit(127);
-			if (dup2(fds[1],  STDOUT_FILENO) < 0) _exit(127);
-		} else {
-			if (dup2(fds[0],  STDIN_FILENO)  < 0) _exit(127);
-			if (dup2(file_fd, STDOUT_FILENO) < 0) _exit(127);
-		}
-		close(fds[0]); close(fds[1]); close(file_fd);
-		for (int i = 0; i < n_extra; ++i) close(extra_close[i]);
-		execv("/system/bin/zstd", (char* const*)argv);
-		// execv only returns on error -> report async-signal-safe (write to the
-		// inherited log fd 2) + _exit. NO LOGERR (malloc/lock) in the child: the
-		// malloc lock inherited at fork() may be held by a sibling thread
-		// (GUI/MTP) — see the fork-safety fix in pipe_operation.cpp.
-		static const char emsg[] = "execv zstd (super) child ERROR!\n";
-		if (write(STDERR_FILENO, emsg, sizeof(emsg) - 1) < 0) { /* nothing to do */ }
-		_exit(127);
-	}
-	// Parent: close the pipe end used by the child, keep the other.
-	if (decompress) { close(fds[1]); zp.parent_fd = fds[0]; }   // parent reads
-	else            { close(fds[0]); zp.parent_fd = fds[1]; }   // parent writes
-	zp.pid = pid;
-	return 0;
-}
-
-// Clean finish: close parent_fd (compress: EOF to zstd) -> waitpid -> exit
-// status. Returns 0 = clean, -1 = waitpid/exit error. On waitpid<0 pid stays
-// set so zstd_pipe_kill() reaps it later (zombie protection).
-static int zstd_pipe_finish(ZstdPipe& zp, const char* tag) {
-	if (zp.parent_fd >= 0) { close(zp.parent_fd); zp.parent_fd = -1; }
-	int status = 0;
-	if (waitpid(zp.pid, &status, 0) < 0) {
-		LOGERR("%s: waitpid failed (%s)\n", tag, strerror(errno));
-		return -1;
-	}
-	zp.pid = -1;
-	if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-		LOGERR("%s: zstd exited abnormally (status=0x%x)\n", tag, status);
-		return -1;
-	}
-	return 0;
-}
-
-// Abort cleanup (exit: path): close parent_fd, hard-kill a live child + reap.
-// No-op if nothing was spawned (parent_fd==-1 && pid<=0).
-static void zstd_pipe_kill(ZstdPipe& zp) {
-	if (zp.parent_fd >= 0) { close(zp.parent_fd); zp.parent_fd = -1; }
-	if (zp.pid > 0) {
-		int status = 0;
-		kill(zp.pid, SIGKILL);
-		waitpid(zp.pid, &status, 0);
-		zp.pid = -1;
-	}
-}
+// The two image paths that need compression (Raw_Read_Write with compress=true,
+// and Restore_Image_Test) drive zstd through an in-process ZstdStream
+// (stage_engine.hpp):
+//   compress:   caller --write_all()--> [ring] --> stage thread --> .win file
+//   decompress: .win file --> stage thread --> [ring] --read_full()--> caller
+// The caller keeps its own loop (progress, cancel, hashing) and only touches the
+// ring. finish() returns the stage's error status; abort() cancels the stage on
+// the exit: paths.
 
 // Bidirectional dd path for image partitions: backup (block device ->
 // .win file/ADB FIFO), restore/flash (file/FIFO -> block device). With
-// compress=true (GUI backup ONLY, /super) the stream is piped through the
-// prebuilt 'zstd' binary into the .win file (single pipe). Self-describing:
-// --stream-size writes the uncompressed size into the zstd frame header
-// (Frame_Content_Size), which the restore reads later — NO .info dependency.
-// Deadlock-free (parent only reads the block device + writes the pipe; child
-// reads the pipe + writes the file -> no cyclic wait). SIGPIPE is globally
-// SIG_IGN (twrp.cpp) -> a write to a dead pipe returns EPIPE.
+// compress=true (GUI backup ONLY, /super) the stream runs through an in-process
+// zstd stage into the .win file. Self-describing: the announced
+// frame_content_size lands in the zstd frame header (Frame_Content_Size), which
+// the restore reads later — NO .info dependency. Deadlock-free (the caller only
+// reads the block device + fills the ring; the stage drains it and writes the
+// file -> no cyclic wait).
 bool TWPartition::Raw_Read_Write(PartitionSettings *part_settings, bool compress) {
 	unsigned long long RW_Block_Size, Remain = Backup_Size;
 	int src_fd = -1, dest_fd = -1;
@@ -2967,7 +2886,7 @@ bool TWPartition::Raw_Read_Write(PartitionSettings *part_settings, bool compress
 	void* buffer = NULL;
 	unsigned long long backedup_size = 0;
 	string srcfn, destfn;
-	ZstdPipe zp;
+	ZstdStream zstream;
 	const char* op = (part_settings->PM_Method == PM_RESTORE) ? "Restore" : "Backup"; // GUI/log context for LOGERR
 	// ADB RESTORE is the only case with a FIFO SOURCE (srcfn = TW_ADB_RESTORE)
 	// and an already-rolled stream counter (twrpAdbBuFifo TWIMG branch) — both
@@ -3022,28 +2941,21 @@ bool TWPartition::Raw_Read_Write(PartitionSettings *part_settings, bool compress
 	}
 
 	if (compress) {
-		// zstd child: stdin <- pipe (parent writes), stdout -> .win file.
-		// --stream-size writes the uncompressed size into the zstd frame header
-		// (Frame_Content_Size) -> self-describing, NO .info at restore.
-		// Level = GUI slider tw_zstd_level (default 1), -T = multithread (compressor budget, below).
-		char sizearg[64];
-		snprintf(sizearg, sizeof(sizearg), "--stream-size=%llu", (unsigned long long)Backup_Size);
-		// Thread count from the compressor budget (TW_MAX_COMPRESSOR_THREADS)
-		// instead of a hardcoded "-T4": /super is single-pipe -> full budget
-		// (active=1); fallback MAX_PIPES when unset.
-		char targ[16];
-		snprintf(targ, sizeof(targ), "-T%d", tw_affinity::compute_compressor_threads(1, 0));
-		// Compression level from the GUI slider (tw_zstd_level, 1-19) instead of
-		// a hardcoded "-1" — identical to the file-based path (fork_zstd).
-		// Default 1 == old "-1".
+		// In-process zstd stage: this loop fills the ring, the stage writes dest_fd.
+		// The announced frame_content_size == Backup_Size lands in the zstd frame
+		// header -> self-describing, NO .info at restore (and zstd enforces it, so a
+		// short/long stream fails instead of producing a silently wrong image).
+		// Thread count from the compressor budget (TW_MAX_COMPRESSOR_THREADS,
+		// falling back to MAX_PIPES when unset): /super is single-pipe, so it gets
+		// the full budget (active=1).
+		int worker_count = tw_affinity::compute_compressor_threads(1, 0);
+		// Compression level from the GUI slider (tw_zstd_level, 1-19); default 1.
+		// Read HERE in the caller (DataManager is recovery-only and must not be
+		// touched from the stage thread) — identical to the file-based backup path.
 		int lev = DataManager::GetIntValue("tw_zstd_level");
 		if (lev < 1 || lev > 19) lev = 1;
-		char levelarg[8];
-		snprintf(levelarg, sizeof(levelarg), "-%d", lev);
-		const char* argv[] = { "zstd", sizearg, levelarg, targ, "-c", (char*)NULL };
-		int extra[] = { src_fd };   // child inherits src_fd (not CLOEXEC) -> close it
-		if (zstd_pipe_spawn(zp, /*decompress=*/false, dest_fd, argv, extra, 1,
-		                    "Raw_Read_Write") < 0)
+		if (zstream.start_compress(dest_fd, lev, worker_count,
+		                           (unsigned long long)Backup_Size, "Raw_Read_Write") < 0)
 			goto exit;
 		LOGINFO("Reading '%s', compressing (zstd) to '%s'\n", srcfn.c_str(), destfn.c_str());
 	} else {
@@ -3055,9 +2967,9 @@ bool TWPartition::Raw_Read_Write(PartitionSettings *part_settings, bool compress
 		bs = MAX_ADB_READ;
 	}
 	else {
-		// 4 MB read/write chunks: cuts the read()/write() syscall count by 4x vs
-		// the old 1 MB buffer. RAM budget is uncritical (1 buffer per
-		// Raw_Read_Write call, no multi-pipe multiplication).
+		// 4 MB read/write chunks keep the read()/write() syscall count low. RAM
+		// budget is uncritical (1 buffer per Raw_Read_Write call, no multi-pipe
+		// multiplication).
 		RW_Block_Size = 4ULL * 1024ULL * 1024ULL;
 		bs = (ssize_t)(RW_Block_Size);
 	}
@@ -3105,17 +3017,12 @@ bool TWPartition::Raw_Read_Write(PartitionSettings *part_settings, bool compress
 			goto exit;
 		}
 		if (compress) {
-			// Write it all out: a pipe write can be partial. EPIPE = zstd dead.
-			ssize_t off = 0;
-			while (off < bs) {
-				ssize_t w = write(zp.parent_fd, (char*)buffer + off, (size_t)(bs - off));
-				if (w < 0) {
-					if (errno == EINTR)
-						continue;
-					LOGERR("%s: Error writing to zstd pipe (%s)\n", op, strerror(errno));
-					goto exit;
-				}
-				off += w;
+			// write_all() transfers the WHOLE block (the ring loops internally) and
+			// returns -1 only if the stage failed, so no partial-write/EINTR retry
+			// loop is needed here.
+			if (zstream.write_all(buffer, (size_t)bs) != 0) {
+				LOGERR("%s: Error writing to zstd stage\n", op);
+				goto exit;
 			}
 		} else if (write(dest_fd, buffer, bs) != bs) {
 			LOGERR("%s: Error writing destination fd (%s)\n", op, strerror(errno));
@@ -3130,7 +3037,7 @@ bool TWPartition::Raw_Read_Write(PartitionSettings *part_settings, bool compress
 		// (file -> block device, via Restore_Image). On restore the dd writes to
 		// a live block device (e.g. boot, modem, dtbo). A cancel mid-write would
 		// leave a half-flashed image -> softbrick.
-		// The user-facing cancel lock for restore is enforced on two levels (see
+		// The cancel lock for restore is enforced on two levels (see
 		// partitionmanager.cpp Run_Restore + Cancel_Restore):
 		//   1. GUI: the cancel button on the restore_run page is locked via
 		//      tw_restore_cancelable=0 for RAW partitions (shows an info page
@@ -3145,9 +3052,10 @@ bool TWPartition::Raw_Read_Write(PartitionSettings *part_settings, bool compress
 	if (part_settings->progress)
 		part_settings->progress->UpdateDisplayDetails(true);
 
-	// compress: close the write end (zstd sees EOF) -> waitpid (flush + exit)
-	// -> THEN fsync. Order encapsulated in the helper; on error -> exit: cleanup.
-	if (compress && zstd_pipe_finish(zp, "Raw_Read_Write") < 0)
+	// compress: signal EOF to the stage (ring write side) -> join it (flush of the
+	// final frame + error status) -> THEN fsync. Order encapsulated in finish();
+	// on error -> exit: cleanup.
+	if (compress && zstream.finish("Raw_Read_Write") < 0)
 		goto exit;
 
 	fsync(dest_fd);
@@ -3159,10 +3067,10 @@ bool TWPartition::Raw_Read_Write(PartitionSettings *part_settings, bool compress
 
 	ret = true;
 exit:
-	// On abort with a still-live zstd child: close the write end (EOF/EPIPE),
-	// then hard-kill + reap -> no zombie. No-op in the raw case and after a
-	// clean zstd_pipe_finish (parent_fd==-1 && pid<=0). (encapsulated in the helper)
-	zstd_pipe_kill(zp);
+	// On abort with a still-live stage: poison the ring (wakes it) + join. MUST run
+	// BEFORE the close()s below — the stage writes dest_fd until it is joined.
+	// No-op in the raw case and after a clean finish().
+	zstream.abort();
 	if (src_fd >= 0)
 		close(src_fd);
 	if (dest_fd >= 0) {
@@ -3236,7 +3144,7 @@ static bool parse_zstd_frame_content_size(const unsigned char* buf, size_t n, ui
 		default: fcs_size = 8u; break; // flag 3
 	}
 	if (fcs_size == 0)
-		return false; // no size in the header (impossible for --stream-size backups)
+		return false; // no size in the header (impossible for our image backups: they announce frame_content_size)
 	size_t offset = 5u + (single_seg ? 0u : 1u) /*Window_Descriptor*/ + did_size;
 	if (offset + fcs_size > n)
 		return false;
@@ -3250,9 +3158,9 @@ static bool parse_zstd_frame_content_size(const unsigned char* buf, size_t n, ui
 }
 
 // Opens an image backup, reads the first bytes and returns — if it is a zstd
-// frame with an embedded Frame_Content_Size (our --stream-size backups) — the
-// uncompressed size. Else false (raw/not zstd/no FCS). Serves the correct
-// restore progress (denominator = decompressed bytes), NO .info.
+// frame with an embedded Frame_Content_Size (which our image backups always
+// announce) — the uncompressed size. Else false (raw/not zstd/no FCS). Serves the
+// correct restore progress (denominator = decompressed bytes), NO .info.
 static bool peek_zstd_uncompressed_size(const string& path, uint64_t& out_size) {
 	out_size = 0;
 	int fd = open(path.c_str(), O_RDONLY | O_LARGEFILE);
@@ -3308,7 +3216,7 @@ Restore_Validity TWPartition::Probe_Restore_Backup(PartitionSettings *part_setti
 	Archive_Type magic = hdr.GetType();   // outer type (even on reject)
 	if (out_ead) *out_ead = hdr.GetEad(); // ead marker for the /data checkbox (caller uses it ONLY for /data)
 
-	// OpenAES (legacy, removed from TWRP 3.7+): hdr.Load scanned ALL segments of
+	// OpenAES (legacy, unsupported): hdr.Load scanned ALL segments of
 	// the partition via Get_Archive_Type_From_Segments (heterogeneous: win000
 	// often plain gzip, "OA" only from win100..), so the outer type is reliably
 	// LEGACY_ENCRYPTED here. Reject directly; the specific message is made by
@@ -3371,7 +3279,7 @@ unsigned long long TWPartition::Get_Restore_Size(PartitionSettings *part_setting
 	}
 
 	// Self-describing: a zstd-compressed image backup (e.g. super.emmc.win)
-	// carries its uncompressed size in the zstd frame header (--stream-size).
+	// carries its uncompressed size in the zstd frame header (Frame_Content_Size).
 	// Return that as the restore size so the progress bar uses the DECOMPRESSED
 	// bytes as denominator — not the compressed file size or a .info value.
 	// (Raw images fall through via false to the legacy logic.)
@@ -3566,12 +3474,12 @@ bool TWPartition::Restore_Tar(PartitionSettings *part_settings) {
 	tar.setfn(Full_FileName);
 
 	// Self-describing: the archive type is NOT read from `.info backup_type` but
-	// determined directly from the archive in extractTarFork()/
-	// detect_archive_type() (4-byte magic + PAX-g marker for RAW + BAES inner
-	// sniff 5<->7). Legacy vs DFP follows from is_legacy_type(). The `.info` is gone
-	// entirely — the restore size also comes from the PAX g-header now
-	// (Get_Restore_Size, TWRP.backup_size). setpassword() below sets
-	// this->password BEFORE detection.
+	// determined directly from the archive by BackupHeaderManager::Load, driven
+	// from extractTarFork() (4-byte magic + PAX-g marker for RAW + BAES inner sniff
+	// 5<->7). Legacy vs this build's own layout follows from is_legacy_type(). For
+	// this build's archives the restore size likewise comes from the PAX g-header
+	// (Get_Restore_Size, TWRP.backup_size); only legacy backups still read a
+	// `.info`. setpassword() below sets this->password BEFORE detection.
 
 #ifndef TW_EXCLUDE_ENCRYPTED_BACKUPS
 	string Password;
@@ -3633,10 +3541,11 @@ bool TWPartition::Restore_Tar(PartitionSettings *part_settings) {
 }
 
 #ifdef TWRP_RESTORE_DEMO_MODE
-// Demo/test-only restore for ANY image partition (super/boot/modem/dtbo/...)
-// (PHASE A): NEVER writes to the block device. Two sources:
+// Demo/test-only restore for ANY image partition (super/boot/modem/dtbo/...):
+// NEVER writes to the block device. Two sources:
 //  - GUI/file: reads the backup (<name>.emmc.win), detects the zstd magic; if
-//    compressed it is decompressed via a 'zstd -d' pipe, else copied raw (to EOF).
+//    compressed it is decompressed through an in-process ZstdStream stage, else
+//    copied raw (to EOF).
 //  - ADB stream (part_settings->adbbackup): reads exactly partition_size
 //    (= twimghdr.size, set by twrpAdbBuFifo) bytes from the data FIFO
 //    TW_ADB_RESTORE — ALWAYS raw (Backup_Image streams images over adb only via
@@ -3649,14 +3558,14 @@ bool TWPartition::Restore_Tar(PartitionSettings *part_settings) {
 // The image lands at /data/TestRestore/<Backup_Name>/<name>.emmc.win.raw and is
 // hashed inline with SHA256 while writing. The result (hash + byte count) is
 // stored in Demo_Test_*; the comparison against the live partition is done by
-// phase B (Verify_Image_Test) AFTER the restore end, untimed (GUI: Run_Restore
-// after rStop; ADB: Restore_ADB_Backup after TWENDADB). The size comes from the
-// zstd frame header or the TWIMG stream header, NOT from a .info.
+// Verify_Image_Test() AFTER the restore end, untimed (GUI: Run_Restore after
+// rStop; ADB: Restore_ADB_Backup after TWENDADB). The size comes from the zstd
+// frame header or the TWIMG stream header, NOT from a .info.
 bool TWPartition::Restore_Image_Test(PartitionSettings *part_settings) {
 	const unsigned long long RW_Block_Size = 4ULL * 1024ULL * 1024ULL;
 	bool ret = false;
 	int in_fd = -1, out_fd = -1;
-	ZstdPipe zp;
+	ZstdStream zstream;
 	void* buffer = NULL;
 	twrpDigest* digest_out = NULL;
 	bool is_zstd = false, have_size = false;
@@ -3851,19 +3760,18 @@ bool TWPartition::Restore_Image_Test(PartitionSettings *part_settings) {
 			goto exit;
 		}
 	} else {
-		// ZSTD: child = 'zstd -d', stdin <- backup file (in_fd), stdout -> pipe;
-		// parent reads the pipe -> writes the test file + hashes inline
-		// (deadlock-free). No -T: zstd ignores thread args when decompressing
-		// (always single-threaded).
-		const char* argv[] = { "zstd", "-d", "-c", (char*)NULL };
-		if (zstd_pipe_spawn(zp, /*decompress=*/true, in_fd, argv, NULL, 0,
-		                    "Restore_Image_Test") < 0)
+		// ZSTD: an in-process stage reads the backup file (in_fd) and pushes the
+		// plaintext through the ring; this loop pulls it, writes the test file and
+		// hashes inline (deadlock-free). zstd decompression is single-threaded by
+		// design, so there is no worker count to pass.
+		if (zstream.start_decompress(in_fd, "Restore_Image_Test") < 0)
 			goto exit;
-		// The parent no longer needs in_fd (the child duped it as stdin).
-		close(in_fd);
-		in_fd = -1;
+		// NOTE: in_fd stays OPEN here — the stage THREAD reads this very fd until
+		// finish()/abort() joins it, so closing it now would yank it out from under
+		// a live thread.
+		// The exit: path closes it, and only AFTER zstream.abort()/finish().
 		ssize_t rb;
-		while ((rb = read(zp.parent_fd, buffer, (size_t)RW_Block_Size)) > 0) {
+		while ((rb = zstream.read_full(buffer, (size_t)RW_Block_Size)) > 0) {
 			if (write(out_fd, buffer, (size_t)rb) != rb) {
 				LOGERR("Restore: Error writing test file (%s)\n", strerror(errno));
 				goto exit;
@@ -3877,10 +3785,10 @@ bool TWPartition::Restore_Image_Test(PartitionSettings *part_settings) {
 				goto exit;
 		}
 		if (rb < 0) {
-			LOGERR("Restore: Error reading from zstd pipe (%s)\n", strerror(errno));
+			LOGERR("Restore: Error reading from zstd stage\n");
 			goto exit;
 		}
-		if (zstd_pipe_finish(zp, "Restore_Image_Test") < 0)
+		if (zstream.finish("Restore_Image_Test") < 0)
 			goto exit;
 	}
 
@@ -3895,19 +3803,21 @@ bool TWPartition::Restore_Image_Test(PartitionSettings *part_settings) {
 	hash_out = digest_out->return_digest_string();
 	LOGINFO("Restore_Image_Test: extracted %llu bytes, sha256=%s\n", done_size, hash_out.c_str());
 
-	// Phase A ends here (decompress + write + inline hash). The live-partition
-	// hash + comparison no longer runs in this timed restore region — that would
-	// distort "done (X seconds)" and avg_restore_rate (a second 14-GB read).
-	// Instead phase A only stores the result; the verification is done by
-	// Verify_Image_Test(), called from Run_Restore AFTER rStop, or on ADB
-	// restore from Restore_ADB_Backup AFTER the stream end (TWENDADB), untimed.
+	// This function ends here (decompress + write + inline hash) and only stores
+	// the result. The live-partition hash + comparison runs separately in
+	// Verify_Image_Test(), called from Run_Restore AFTER rStop, or on ADB restore
+	// from Restore_ADB_Backup AFTER the stream end (TWENDADB), untimed — keeping
+	// the second 14-GB read out of this timed region, which would otherwise distort
+	// "done (X seconds)" and avg_restore_rate.
 	Demo_Test_Hash = hash_out;
 	Demo_Test_Size = done_size;
 	Demo_Test_Pending = true;
 	ret = true;
 
 exit:
-	zstd_pipe_kill(zp);
+	// Poison + join the stage FIRST: it reads in_fd and writes nothing else, so it
+	// must be gone before in_fd is closed below. No-op after a clean finish().
+	zstream.abort();
 	if (in_fd >= 0)
 		close(in_fd);
 	if (out_fd >= 0) {
@@ -3930,11 +3840,12 @@ exit:
 	return ret;
 }
 
-// Phase B (UNTIMED): verify the live partition against the hash decompressed in
-// phase A. Called from Run_Restore AFTER rStop so the second 14-GB read does not
-// distort the restore time/rate ("done (X seconds)" / avg_restore_rate). Reads
-// the partition ONLY O_RDONLY — never writes to the block device. Size/hash
-// source: exclusively the Demo_Test_* values recorded in phase A (NO .info).
+// UNTIMED verification step: compares the live partition against the hash that
+// Restore_Image_Test() computed while writing. Called from Run_Restore AFTER
+// rStop so the second 14-GB read does not distort the restore time/rate ("done
+// (X seconds)" / avg_restore_rate). Reads the partition ONLY O_RDONLY — never
+// writes to the block device. Size/hash source: exclusively the Demo_Test_*
+// values recorded by Restore_Image_Test() (NO .info).
 bool TWPartition::Verify_Image_Test() {
 	const unsigned long long RW_Block_Size = 4ULL * 1024ULL * 1024ULL;
 	bool ret = false;
@@ -4014,10 +3925,10 @@ bool TWPartition::Restore_Image(PartitionSettings *part_settings) {
 	// NO real dd restore on the daily driver: EVERY image partition (super,
 	// boot, modem, dtbo, ...) is instead test-restored into a file under
 	// /data/TestRestore/<Backup_Name>/ (Restore_Image_Test) + a SHA256 round-trip
-	// comparison against the live partition (phase B, O_RDONLY only). NEVER
-	// writes to the block device. Applies to GUI AND ADB restores: the ADB
+	// comparison against the live partition (Verify_Image_Test, O_RDONLY only).
+	// NEVER writes to the block device. Applies to GUI AND ADB restores: the ADB
 	// branch reads raw from the data FIFO TW_ADB_RESTORE (details in the
-	// Restore_Image_Test header); phase B is triggered there by
+	// Restore_Image_Test header); the verification is triggered there by
 	// Restore_ADB_Backup after the stream end. The destructive
 	// Raw_Read_Write/BlkDiscard path below is unreachable for images in demo mode.
 	if (!Restore_Image_Test(part_settings))

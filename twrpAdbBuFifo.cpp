@@ -347,7 +347,7 @@ bool twrpAdbBuFifo::Restore_ADB_Backup(bool gui_stream) {
 	// bar/counters jump back to 0 each partition). The grand denominator comes from
 	// the stream header (total_size = estimate sum; 0 for old backups -> built up
 	// incrementally per twfilehdr below). The bar is trued up per partition via
-	// Finish_Partition_Exact() (restore-side P4 mirror, see progresstracking.cpp).
+	// Finish_Partition_Exact() (restore-side counterpart, see progresstracking.cpp).
 	ProgressTracking progress(0);
 	bool have_stream_total = false;
 	part_settings.progress = &progress;

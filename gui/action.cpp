@@ -203,7 +203,7 @@ GUIAction::GUIAction(xml_node<>* node)
 		ADD_ACTION(startmtp);
 		ADD_ACTION(stopmtp);
 		ADD_ACTION(cancelbackup);
-		ADD_ACTION(cancelrestore);     // Phase 5a (Restore_Konzept.md Sec. 9.2)
+		ADD_ACTION(cancelrestore);
 		ADD_ACTION(checkpartitionlifetimewrites);
 		ADD_ACTION(mountsystemtoggle);
 		ADD_ACTION(setlanguage);

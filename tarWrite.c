@@ -24,9 +24,10 @@
 /*
  * Delegates to tar_io_write (libtar/block.c), the shared block-I/O primitive
  * for backup and restore: it hardens EINTR/partial writes, while the common
- * case — atomic 512-byte pipe writes (T_BLOCKSIZE < PIPE_BUF) — never iterates
- * the loop, staying a single syscall. Returns -1 on a real error, which the
- * caller detects as != T_BLOCKSIZE in block.c.
+ * case — one 512-byte block per call, and on the ADB FIFO an atomic write
+ * because T_BLOCKSIZE < PIPE_BUF — never iterates the loop, staying a single
+ * syscall. Returns -1 on a real error, which the caller detects as
+ * != T_BLOCKSIZE in block.c.
  */
 ssize_t write_libtar_no_buffer(int fd, const void *buffer, size_t size) {
 	return tar_io_write(fd, buffer, size);

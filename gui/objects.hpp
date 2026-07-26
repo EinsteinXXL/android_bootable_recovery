@@ -389,7 +389,7 @@ protected:
 	int stopmtp(std::string arg);
 	int flashimage(std::string arg);
 	int cancelbackup(std::string arg);
-	int cancelrestore(std::string arg);  // Phase 5a (Restore_Konzept.md Sec. 9.2)
+	int cancelrestore(std::string arg);
 	int checkpartitionlifetimewrites(std::string arg);
 	int mountsystemtoggle(std::string arg);
 	int setlanguage(std::string arg);
