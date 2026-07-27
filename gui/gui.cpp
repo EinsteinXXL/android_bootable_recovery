@@ -123,6 +123,9 @@ public:
 		// tw_has_touch_gesture is a const value decided in DataManager::SetDefaultValues()
 		// (which runs before the GUI starts), so it is safe to cache it here.
 		has_touch_gesture = DataManager::GetIntValue("tw_has_touch_gesture") == 1;
+		screen_off_touch_down = false;
+		have_last_tap = false;
+		last_tap_x = last_tap_y = 0;
 
 #ifndef TW_NO_SCREEN_TIMEOUT
 		{
@@ -170,12 +173,20 @@ private:
 	int x, y; // x and y coordinates of last touch
 	struct timeval touchStart; // used to track time for long press / key repeat
 
-	bool has_touch_gesture; // cached tw_has_touch_gesture
+	// double-tap-to-wake, only used while the screen is blanked
+	static const int double_tap_max_ms = 500;   // max gap between the two taps
+	static const int double_tap_max_dist = 150; // max travel between them, in pixels
+	bool has_touch_gesture;    // cached tw_has_touch_gesture
+	bool screen_off_touch_down; // a finger is currently down while blanked
+	bool have_last_tap;
+	struct timeval last_tap_time;
+	int last_tap_x, last_tap_y;
 
 	void processHoldAndRepeat();
 	void process_EV_REL(input_event& ev);
 	void process_EV_ABS(input_event& ev);
 	void process_EV_KEY(input_event& ev);
+	void processScreenOffTouch(input_event& ev);
 
 	void doTouchStart();
 };
@@ -210,19 +221,29 @@ bool InputHandler::processInput(int timeout_ms)
 	// be swallowed here as well - otherwise it slips past this gate into the generic
 	// wake line below and any single touch (even a swipe) unblanks the screen, which is
 	// exactly what this gate exists to prevent.
-	if (has_touch_gesture && blankTimer.isScreenOff())
+	if (has_touch_gesture)
 	{
-		if (ev.type == EV_ABS)
+		if (blankTimer.isScreenOff())
 		{
-			// Neutralise the touch state machine: a release that arrives once the
-			// screen is back on would otherwise be mistaken for a completed touch
-			// on a widget.
-			state = AS_NO_ACTION;
-			touch_status = TS_NONE;
-			return true;
+			if (ev.type == EV_ABS)
+			{
+				processScreenOffTouch(ev);
+				return true;
+			}
+			if (ev.type == EV_KEY && ev.code == BTN_TOUCH)
+				return true;
 		}
-		if (ev.type == EV_KEY && ev.code == BTN_TOUCH)
-			return true;
+		else if (screen_off_touch_down || have_last_tap)
+		{
+			// The screen is on again. The release of the tap that woke it arrives after
+			// the unblank (measured ~370 ms later) and therefore never reaches the branch
+			// above, so the "finger is down" flag would stay set and swallow the first tap
+			// of the next screen-off period - the double tap then only worked on the
+			// second attempt. Clearing it here also covers wakes by the power key or by a
+			// finished operation.
+			screen_off_touch_down = false;
+			have_last_tap = false;
+		}
 	}
 
 	switch (ev.type)
@@ -244,6 +265,66 @@ bool InputHandler::processInput(int timeout_ms)
 		blankTimer.resetTimerAndUnblank();
 
 	return true;  // we got an event, so there might be more in the queue
+}
+
+// Consume a touch that arrived while the screen was blanked. The event is never
+// forwarded to the GUI. With tw_double_tap_wake enabled, two taps close together in
+// time and space unblank the screen; otherwise touches are dropped and only the
+// power key wakes the device (which is the behaviour users are used to, and it keeps
+// the device from waking up in a pocket).
+void InputHandler::processScreenOffTouch(input_event& ev)
+{
+	// Neutralise the touch state machine: the RELEASE belonging to the waking tap
+	// arrives when the screen is already back on and would otherwise be mistaken for
+	// a completed touch on a widget.
+	state = AS_NO_ACTION;
+	touch_status = TS_NONE;
+
+	if (ev.code == 0) {  // touch release
+		screen_off_touch_down = false;
+		return;
+	}
+
+	// process_EV_ABS() packs both the initial touch AND every movement into code != 0,
+	// so without this the second event of a single swipe (a few ms and a few pixels
+	// after the first) would already look like a second tap. Only the transition from
+	// "no finger down" to "finger down" counts as a tap; movement is ignored.
+	if (screen_off_touch_down)
+		return;
+	screen_off_touch_down = true;
+
+	if (DataManager::GetIntValue("tw_double_tap_wake") != 1) {
+		have_last_tap = false;
+		return;
+	}
+
+	// Same packing as process_EV_ABS()
+	int tap_x = ev.value >> 16;
+	int tap_y = ev.value & 0xFFFF;
+
+	timeval now;
+	gettimeofday(&now, NULL);
+
+	if (have_last_tap) {
+		long ms = (now.tv_sec - last_tap_time.tv_sec) * 1000
+		        + (now.tv_usec - last_tap_time.tv_usec) / 1000;
+		int dx = tap_x - last_tap_x;
+		int dy = tap_y - last_tap_y;
+		if (dx < 0) dx = -dx;
+		if (dy < 0) dy = -dy;
+		if (ms <= double_tap_max_ms && dx <= double_tap_max_dist && dy <= double_tap_max_dist) {
+			LOGINFO("Double tap detected, waking screen\n");
+			have_last_tap = false;
+			blankTimer.resetTimerAndUnblank();
+			return;
+		}
+	}
+
+	// First tap, or the second one was too late / too far away: start over from here.
+	last_tap_time = now;
+	last_tap_x = tap_x;
+	last_tap_y = tap_y;
+	have_last_tap = true;
 }
 
 void InputHandler::processHoldAndRepeat()

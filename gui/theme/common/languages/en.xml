@@ -402,6 +402,7 @@
 		<string name="screen_to_slider">Screen timeout in seconds:</string>
 		<string name="screen_to_slider_s">Screen timeout in seconds (0=disabled): %tw_screen_timeout_secs%</string>
 		<string name="screen_to_na">Screen timeout setting unavailable</string>
+		<string name="double_tap_wake_chk">Wake screen on double tap</string>
 		<string name="screen_bright_slider">Brightness: %tw_brightness_pct%%</string>
 		<string name="screen_bright_na">Brightness setting unavailable</string>
 		<string name="vibration_hdr">Vibration</string>

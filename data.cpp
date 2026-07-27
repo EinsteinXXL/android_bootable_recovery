@@ -826,6 +826,10 @@ void DataManager::SetDefaultValues()
 	mPersist.SetValue("tw_screen_timeout_secs", "60");
 	mPersist.SetValue("tw_no_screen_timeout", "0");
 #endif
+	// Wake the screen on a double tap while it is blanked. Only reachable on devices
+	// whose touch controller stays powered during blank (tw_has_touch_gesture=1).
+	// Default off, so the familiar power-key-only wake behaviour is unchanged.
+	mPersist.SetValue("tw_double_tap_wake", "0");
 	mData.SetValue("tw_gui_done", "0");
 	mData.SetValue("tw_encrypt_backup", "0");
 	mData.SetValue("tw_sleep_total", "5");

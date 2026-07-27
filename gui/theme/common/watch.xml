@@ -4199,6 +4199,10 @@
 					</conditions>
 					<data variable="tw_auto_reflashtwrp"/>
 				</listitem>
+				<listitem name="{@double_tap_wake_chk=Wake screen on double tap}">
+					<condition var1="tw_has_touch_gesture" var2="1"/>
+					<data variable="tw_double_tap_wake"/>
+				</listitem>
 			</listbox>
 
 			<action>

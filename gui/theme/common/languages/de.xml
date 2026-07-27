@@ -400,6 +400,7 @@
 		<string name="screen_to_slider">Zeit bis zum Ausschalten (in Sekunden):</string>
 		<string name="screen_to_slider_s">Ausschalten nach %tw_screen_timeout_secs% Sekunden (0 = deaktiviert): </string>
 		<string name="screen_to_na">Bildschirm-Abschaltung nicht verfügbar</string>
+		<string name="double_tap_wake_chk">Bildschirm per Doppeltipp einschalten</string>
 		<string name="screen_bright_slider">Helligkeit: %tw_brightness_pct% %</string>
 		<string name="screen_bright_na">Helligkeit nicht verfügbar</string>
 		<string name="vibration_hdr">Vibration</string>
