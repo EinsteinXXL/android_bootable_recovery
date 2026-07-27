@@ -913,6 +913,44 @@ void DataManager::SetDefaultValues()
 #endif
 	}
 
+	// Touch gesture (LPWG) handling. On some panels the touch controller shares its
+	// supply rail with the display: blanking the panel cuts power to the controller,
+	// which then has to reboot its firmware on wake and reports nothing for over a
+	// second (measured 1.15-1.4 s on hotdog / sec-s6sy761). That is the touch dead
+	// zone right after a screen wake. Enabling the vendor gesture flag makes the panel
+	// driver keep the rail powered while blanked, so the controller stays alive and
+	// reports immediately. As a side effect it also delivers touches while the screen
+	// is off, which is what makes tap-to-wake possible (gated in gui.cpp).
+	// Devices without such a knob get tw_has_touch_gesture=0 and are left completely
+	// untouched - no write, no UI, no change in input handling.
+	string findgesture;
+#ifdef TW_TOUCH_GESTURE_PATH
+	findgesture = EXPAND(TW_TOUCH_GESTURE_PATH);
+	LOGINFO("TW_TOUCH_GESTURE_PATH := %s\n", findgesture.c_str());
+	if (!TWFunc::Path_Exists(findgesture)) {
+		LOGINFO("Specified touch gesture file '%s' not found.\n", findgesture.c_str());
+		findgesture = "";
+	}
+#endif
+	if (findgesture.empty()) {
+		// Only paths that were actually verified on hardware belong here. Everything
+		// else opts in through TW_TOUCH_GESTURE_PATH rather than by guessing.
+		if (TWFunc::Path_Exists("/proc/touchpanel/gesture_enable"))
+			findgesture = "/proc/touchpanel/gesture_enable";
+	}
+	if (findgesture.empty()) {
+		LOGINFO("No touch gesture file found, touch stays powered down while blanked\n");
+		mConst.SetValue("tw_has_touch_gesture", "0");
+	} else {
+		LOGINFO("Found touch gesture file at '%s'\n", findgesture.c_str());
+		mConst.SetValue("tw_has_touch_gesture", "1");
+		mConst.SetValue("tw_touch_gesture_file", findgesture);
+		// The driver latches this for the whole session - one write at startup is
+		// enough (verified across many blank/unblank cycles).
+		if (!TWFunc::write_to_file(findgesture, "1"))
+			LOGINFO("Failed to enable touch gesture mode via '%s'\n", findgesture.c_str());
+	}
+
 #ifndef TW_EXCLUDE_ENCRYPTED_BACKUPS
 	mConst.SetValue("tw_include_encrypted_backup", "1");
 #else

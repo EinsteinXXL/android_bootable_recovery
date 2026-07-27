@@ -120,6 +120,10 @@ public:
 		state = AS_NO_ACTION;
 		x = y = 0;
 
+		// tw_has_touch_gesture is a const value decided in DataManager::SetDefaultValues()
+		// (which runs before the GUI starts), so it is safe to cache it here.
+		has_touch_gesture = DataManager::GetIntValue("tw_has_touch_gesture") == 1;
+
 #ifndef TW_NO_SCREEN_TIMEOUT
 		{
 			string seconds;
@@ -166,6 +170,8 @@ private:
 	int x, y; // x and y coordinates of last touch
 	struct timeval touchStart; // used to track time for long press / key repeat
 
+	bool has_touch_gesture; // cached tw_has_touch_gesture
+
 	void processHoldAndRepeat();
 	void process_EV_REL(input_event& ev);
 	void process_EV_ABS(input_event& ev);
@@ -190,6 +196,33 @@ bool InputHandler::processInput(int timeout_ms)
 		if (touch_status || key_status)
 			processHoldAndRepeat();
 		return (ret != -2);  // -2 means no more events in the queue
+	}
+
+	// Touch while the screen is blanked. This has to be caught BEFORE the switch
+	// below: process_EV_ABS() hands the touch to the widgets right away, i.e. before
+	// the unblank further down would even run, so a blind tap on a dark screen would
+	// operate whatever sits underneath it. Only devices where we enabled the gesture
+	// mode ourselves get here at all - everywhere else the controller is powered down
+	// while blanked and never delivers anything, and the upstream path stays intact.
+	//
+	// The panel reports every contact TWICE: as EV_ABS coordinates and as an EV_KEY
+	// BTN_TOUCH, which vk_modify() passes through untouched. BTN_TOUCH therefore has to
+	// be swallowed here as well - otherwise it slips past this gate into the generic
+	// wake line below and any single touch (even a swipe) unblanks the screen, which is
+	// exactly what this gate exists to prevent.
+	if (has_touch_gesture && blankTimer.isScreenOff())
+	{
+		if (ev.type == EV_ABS)
+		{
+			// Neutralise the touch state machine: a release that arrives once the
+			// screen is back on would otherwise be mistaken for a completed touch
+			// on a widget.
+			state = AS_NO_ACTION;
+			touch_status = TS_NONE;
+			return true;
+		}
+		if (ev.type == EV_KEY && ev.code == BTN_TOUCH)
+			return true;
 	}
 
 	switch (ev.type)
