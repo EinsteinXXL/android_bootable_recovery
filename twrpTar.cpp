@@ -1302,6 +1302,9 @@ int twrpTar::createTarFork(std::atomic<pid_t> *tar_fork_pid) {
 	// ---- Parent process ----
 	// g_backup_children was populated inside the fork loop.
 	// *tar_fork_pid was already set in the loop at p==0 — no redundancy here.
+	// GUI affinity to the efficiency core for the parallel phase; the paired
+	// false-call sits after the reap.
+	Set_GUI_Efficiency(true);
 	close(progress_pipe[1]);
 	close(msg_pipe[1]);
 
@@ -1327,6 +1330,11 @@ int twrpTar::createTarFork(std::atomic<pid_t> *tar_fork_pid) {
 	sigaction(SIGPIPE, &sigpipe_old, nullptr);
 	// Restore the SIGCHLD mask (idempotent if signalfd setup failed).
 	sigprocmask(SIG_SETMASK, &old_chld_mask, nullptr);
+	// GUI affinity back to the performance core. Runs alongside the
+	// GuiAffinityGuard RAII in Backup_Partition: the guard spans the whole
+	// partition operation, this pair only the parallel phase — so the fast core is
+	// already back for Make_Digest(). Mirrored in extractTarFork.
+	Set_GUI_Efficiency(false);
 	*tar_fork_pid = 0;
 	if (finalize_pipe_log(pp, failed_children, "backup")) {
 		gui_err("backup_error=Error creating backup.");
@@ -1847,11 +1855,10 @@ int twrpTar::extractTarFork() {
 	// there — a double SETMASK on old_chld_mask is idempotent.
 	sigprocmask(SIG_SETMASK, &old_chld_mask, nullptr);
 
-	// GUI affinity back to the performance core (default). The efficiency-core pin
-	// set at the top of the parent section covers exactly the parallel restore
-	// phase, so the parent poll loop leaves the big cores to the pipe workers and
-	// their stage threads. Mirror of the backup path, which implements the same
-	// logic via the GuiAffinityGuard RAII in partitionmanager.cpp.
+	// GUI affinity back to the performance core. Runs alongside the
+	// GuiAffinityGuard RAII in Restore_Partition: the guard spans the whole
+	// partition operation, this pair only the parallel phase. Mirrored in
+	// createTarFork.
 	Set_GUI_Efficiency(false);
 
 #ifndef BUILD_TWRPTAR_MAIN

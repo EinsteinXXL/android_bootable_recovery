@@ -63,6 +63,9 @@ namespace tw_affinity {
 	// --- Single-core pinnings (-1 = no pin) ---
 	extern int gui_performance_core;               // GUI while idle
 	extern int gui_efficiency_core;                // GUI during backup
+	// Separate from gui_performance_core. Resolved in init():
+	// TW_AFFINITY_GUI_TOUCH_BOOST_CORE -> detected prime core -> gui_performance_core.
+	extern int gui_touch_boost_core;               // GUI while a finger is on the glass
 	extern int mtp_core;                           // MTP child
 
 	// One-time init: reads all TW_* defines, validates, clamps, logs.
@@ -128,7 +131,7 @@ namespace tw_affinity {
 	void gui_set_efficiency_pin(bool efficiency);
 	// gui_touch_boost_tick(): once per runPages iteration from the GUI thread
 	// (gui.cpp). input_recent==true (last input <= 5 s ago) during the
-	// efficiency phase -> temporarily lift the GUI to gui_performance_core
+	// efficiency phase -> temporarily lift the GUI to gui_touch_boost_core
 	// (touch boost: lock swipe/buttons stay fluid under backup load);
 	// input_recent==false -> restore the efficiency pin. If the operation ends
 	// during a boost, gui_set_efficiency_pin(false) clears both flags and pins

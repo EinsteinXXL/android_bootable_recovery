@@ -49,6 +49,7 @@ namespace tw_affinity {
 
 	int gui_performance_core = -1;
 	int gui_efficiency_core  = -1;
+	int gui_touch_boost_core = -1;   // resolved in init(), see twrp_affinity.hpp
 	int mtp_core             = -1;
 
 	int active_pipes = 1;   // runtime; init() defaults it to compute_pipe_count()
@@ -185,9 +186,9 @@ namespace tw_affinity {
 		LOGINFO("[tw_affinity] cluster-flags tar_worker=%d zstd=%d enc_only_aes=%d enc_and_comp_aes=%d (1=Range/Soft, 0=Comma/Hard)\n",
 		        tar_worker_is_cluster, zstd_is_cluster, enc_only_aes_is_cluster, enc_and_comp_aes_is_cluster);
 
-		// Prime-core diagnostics (cpu_capacity per core, fallback cpuinfo_max_freq).
-		// PURELY INFORMATIONAL — does not influence pinning (BoardConfig is the
-		// basis); helps config tuning by showing which core is the strongest.
+		// Prime-core detection (cpu_capacity per core, fallback cpuinfo_max_freq).
+		// Informational for every list except gui_touch_boost_core below, whose
+		// default it supplies.
 		{
 			int prime = -1; long best = -1;
 			for (long c = 0; c < nproc; c++) {
@@ -202,9 +203,31 @@ namespace tw_affinity {
 				if (val > best) { best = val; prime = (int)c; }
 			}
 			if (prime >= 0)
-				LOGINFO("[tw_affinity] detected prime core = %d (capacity/freq %ld) -- diagnostic only\n", prime, best);
+				LOGINFO("[tw_affinity] detected prime core = %d (capacity/freq %ld)\n", prime, best);
 			else
 				LOGINFO("[tw_affinity] prime core detection unavailable (no cpu_capacity/max_freq sysfs)\n");
+
+			// Touch-boost target: BoardConfig, else the detected prime core, else
+			// gui_performance_core.
+			const char* boost_src;
+#ifdef TW_AFFINITY_GUI_TOUCH_BOOST_CORE
+			gui_touch_boost_core = TW_AFFINITY_GUI_TOUCH_BOOST_CORE;
+			boost_src = "BoardConfig";
+#else
+			if (prime >= 0) {
+				gui_touch_boost_core = prime;
+				boost_src = "detected prime";
+			} else {
+				gui_touch_boost_core = gui_performance_core;
+				boost_src = "fallback to gui_perf";
+			}
+#endif
+			if (gui_touch_boost_core >= (int)nproc) {
+				LOGERR("[tw_affinity] WARNING: gui_touch_boost_core=%d >= nproc=%ld -- disabling the touch boost\n",
+				       gui_touch_boost_core, nproc);
+				gui_touch_boost_core = -1;
+			}
+			LOGINFO("[tw_affinity] gui_touch_boost=%d (%s)\n", gui_touch_boost_core, boost_src);
 		}
 
 		// active_pipes default = MAX budget -> compute_compressor_threads(MAX, *)
@@ -358,11 +381,9 @@ namespace tw_affinity {
 
 	// --- GUI pin state machine ------------------------------------------------
 	// During backup/restore the GUI sits on gui_efficiency_core so the big
-	// cluster belongs to the pipe workers. Measured on-device, a lock-swipe
-	// frame there costs 60-70 ms under load vs ~14 ms on the performance core —
-	// touch interaction stutters. The touch boost lifts the GUI to
-	// gui_performance_core for the touch duration (+5 s tail, gui.cpp) and then
-	// restores the efficiency pin. The worker lists stay untouched by design.
+	// cluster belongs to the pipe workers. The touch boost lifts the GUI to
+	// gui_touch_boost_core for the touch duration (+5 s tail, gui.cpp) and then
+	// restores the efficiency pin. The worker lists stay untouched.
 	//
 	// Thread model: gui_set_efficiency_pin runs in the action/FIFO thread
 	// (GuiAffinityGuard, extractTarFork parent), gui_touch_boost_tick ONLY in
@@ -397,21 +418,18 @@ namespace tw_affinity {
 	void gui_touch_boost_tick(bool input_recent) {
 		if (!use_cpu_affinity)
 			return;
-		// Kein Boost, wenn die GUI-Cores nicht konfiguriert sind (perf ODER eff < 0).
-		// Der Boost braucht ein P-Ziel (ON) UND ein E-Ziel (OFF-Rueckkehr); fehlt eines,
-		// wuerde apply_single_core_pin(-1) nur reset_to_default (un-pin) aufrufen ->
-		// Leerlauf-Syscalls + irrefuehrende "core -1"-Logs bei jedem Touch, ohne etwas zu
-		// bewegen. In dieser Config regelt der Scheduler die GUI ohnehin (gui_set_efficiency_pin
-		// haelt seinen originalen reset_to_default) -> No-op ist korrekt. hotdog (7/2) unberuehrt.
-		if (gui_performance_core < 0 || gui_efficiency_core < 0)
+		// The boost needs an ON target (gui_touch_boost_core) and an OFF target
+		// (gui_efficiency_core). Without both, apply_single_core_pin(-1) would only
+		// un-pin on every touch -- no-op instead.
+		if (gui_touch_boost_core < 0 || gui_efficiency_core < 0)
 			return;
 		if (input_recent) {
 			if (s_gui_on_efficiency.load() && !s_gui_touch_boosted.load()) {
 				if (s_gui_tid == 0)
 					s_gui_tid = getpid();
-				apply_single_core_pin(gui_performance_core, s_gui_tid);
+				apply_single_core_pin(gui_touch_boost_core, s_gui_tid);
 				s_gui_touch_boosted.store(true);
-				LOGINFO("[tw_affinity] gui touch boost ON (core %d)\n", gui_performance_core);
+				LOGINFO("[tw_affinity] gui touch boost ON (core %d)\n", gui_touch_boost_core);
 			}
 		} else if (s_gui_touch_boosted.load()) {
 			s_gui_touch_boosted.store(false);
