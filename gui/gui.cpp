@@ -47,7 +47,7 @@ extern "C"
 #include "../variables.h"
 #include "../partitions.hpp"
 #include "../twrp-functions.hpp"
-#include "../twrp_affinity.hpp"   // Touch-Performance-Boost (gui_touch_boost_tick, 2026-07-16)
+#include "../twrp_affinity.hpp"   // Touch-Performance-Boost (gui_touch_boost_tick)
 #include "../openrecoveryscript.hpp"
 #include "../orscmd/orscmd.h"
 #include "blanktimer.hpp"

@@ -1872,9 +1872,9 @@ void TWPartitionManager::Set_Restore_Files(string Restore_Name) {
 
 	// Only a regular file can be an .ab stream: folder backups (every .win
 	// selection, ORS folders, the /data mount-point calls from the ADB stream
-	// restore) skip the probe entirely. Probing a directory always failed with
-	// EISDIR and, since the short-read guard (2026-07-08), logged a bogus
-	// "Unable to read adb backup header" line on every folder selection.
+	// restore) skip the probe entirely. Probing a directory fails with EISDIR,
+	// which the short-read guard turns into a bogus "Unable to read adb backup
+	// header" line on every folder selection.
 	struct stat rn_st;
 	bool rn_is_reg = (stat(Restore_Name.c_str(), &rn_st) == 0 && S_ISREG(rn_st.st_mode));
 
