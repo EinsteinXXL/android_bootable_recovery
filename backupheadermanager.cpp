@@ -490,9 +490,8 @@ void BackupHeaderManager::parse(const string &tarhead) {
 // Detects type + status via detect_archive_type (ONE detection; extractTarFork
 // consumes the result through GetType()/GetStatus()) and parses the TWRP.*
 // g-records — only for this build's own types, which carry them.
-// detect_archive_type sets mType ALWAYS (outer type even on reject) so
-// Get_Restore_Size picks its own/legacy branch without a second segment scan on
-// the reject path. Returns true only if a g-header was parsed
+// detect_archive_type sets mType ALWAYS (outer type even on reject).
+// Returns true only if a g-header was parsed
 // (DFP 4-7). Exactly ONE BAES decrypt: detect delivers the plaintext chunk in
 // plain; decode_head reuses it.
 bool BackupHeaderManager::Load(const string &segment, const string &password) {

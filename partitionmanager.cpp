@@ -1536,7 +1536,7 @@ void TWPartitionManager::Emit_Restore_Validity_Error(Restore_Validity rv, const 
 // gate the probe themselves (RV_VALID). The loop-1 guard in Run_Restore remains
 // as a backstop (CLI/ORS bypass this GUI firewall).
 bool TWPartitionManager::Preflight_Restore_Backup(const string& Restore_Name) {
-	// Probe_Restore_Backup detects OpenAES itself via the outer type
+	// Probe_Restore_Backup detects OpenAES itself via the detection status
 	// (Get_Archive_Type_From_Segments scans all segments) -> RV_REJECT_OPENAES
 	// per partition. SSoT = HeaderManager.
 	PartitionSettings part_settings;

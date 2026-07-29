@@ -3183,8 +3183,7 @@ static bool peek_zstd_uncompressed_size(const string& path, uint64_t& out_size) 
 // (Preflight_Restore_Backup) from the return enum. Factored out of
 // Get_Restore_Size (DRY): Get_Restore_Size delegates the reject here, the early
 // GUI firewall uses the same primitive. The valid/invalid decision mirrors
-// Get_Restore_Size 1:1 (OpenAES-with-.info -> valid size here, reject only at
-// extraction); the reject subtypes differentiate ONLY the message.
+// Get_Restore_Size 1:1; the reject subtypes differentiate ONLY the message.
 // Images/super (dd) + ADB the method gates itself (-> RV_VALID), so it is safe
 // to call for ANY partition.
 //   out_size    (optional): self-described size if known — DFP g-header
@@ -3216,13 +3215,28 @@ Restore_Validity TWPartition::Probe_Restore_Backup(PartitionSettings *part_setti
 	Archive_Type magic = hdr.GetType();   // outer type (even on reject)
 	if (out_ead) *out_ead = hdr.GetEad(); // ead marker for the /data checkbox (caller uses it ONLY for /data)
 
-	// OpenAES (legacy, unsupported): hdr.Load scanned ALL segments of
-	// the partition via Get_Archive_Type_From_Segments (heterogeneous: win000
-	// often plain gzip, "OA" only from win100..), so the outer type is reliably
-	// LEGACY_ENCRYPTED here. Reject directly; the specific message is made by
-	// the caller (Preflight or the Run_Restore guard via Emit_Restore_Validity_Error).
-	if (magic == LEGACY_ENCRYPTED)
-		return RV_REJECT_OPENAES;
+	// The detection status decides FIRST: whatever the detector did not
+	// positively accept is rejected here — before the branches below could
+	// validate it from side data (a stray .info next to a foreign archive would
+	// otherwise supply a size and wave the archive through to the wipe).
+	// OpenAES is reliable at this point because hdr.Load scanned ALL segments
+	// via Get_Archive_Type_From_Segments (heterogeneous legacy sets: win000
+	// plain gzip or plain tar, "OA" only from win100..). The specific message is
+	// made by the caller (Preflight or the Run_Restore guard via
+	// Emit_Restore_Validity_Error).
+	switch (hdr.GetStatus()) {
+		case DET_OK:
+			break;
+		case DET_REJECT_OPENAES:
+			return RV_REJECT_OPENAES;
+		case DET_WRONG_PASSWORD:
+			LOGINFO("Probe_Restore_Backup: '%s' decrypt probe failed -> reject\n", Backup_Name.c_str());
+			return RV_WRONG_PASSWORD;
+		case DET_REJECT_UNKNOWN:
+		default:
+			LOGINFO("Probe_Restore_Backup: '%s' unknown/corrupt format -> reject\n", Backup_Name.c_str());
+			return RV_REJECT_UNKNOWN;
+	}
 
 	if (!hdr.IsLegacy()) {
 		// DFP is self-describing: the size MUST come from the g-header, else incomplete.
@@ -3248,18 +3262,8 @@ Restore_Validity TWPartition::Probe_Restore_Backup(PartitionSettings *part_setti
 
 	// No usable `.info`: ONLY gzip may fall back to pigz -l (unambiguous magic,
 	// reliable gzip footer) -> RV_VALID with out_size=0 (caller: tar.get_size()).
-	// Same valid/invalid decision as Get_Restore_Size `magic != LEGACY_COMPRESSED`; the
-	// reject subtypes are only differentiated for the GUI console.
 	if (magic == LEGACY_COMPRESSED)
 		return RV_VALID;
-	if (hdr.GetStatus() == DET_WRONG_PASSWORD) {
-		LOGINFO("Probe_Restore_Backup: '%s' decrypt probe failed -> reject\n", Backup_Name.c_str());
-		return RV_WRONG_PASSWORD;
-	}
-	if (hdr.GetStatus() == DET_REJECT_UNKNOWN) {
-		LOGINFO("Probe_Restore_Backup: '%s' unknown/corrupt format -> reject\n", Backup_Name.c_str());
-		return RV_REJECT_UNKNOWN;
-	}
 	LOGINFO("Probe_Restore_Backup: legacy plain-tar '%s' without usable .info backup_size -> reject\n", Backup_Name.c_str());
 	return RV_LEGACY_NO_INFO;
 }

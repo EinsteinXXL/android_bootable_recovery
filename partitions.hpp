@@ -49,9 +49,9 @@ enum Restore_Validity {
 	RV_VALID = 0,            // restorable: DFP backup_size>0 / legacy gzip / legacy plain-tar .info>0
 	RV_NO_BACKUP_SIZE,       // this build (4-7) without g-header backup_size -> self-describing incomplete
 	RV_LEGACY_NO_INFO,       // legacy plain tar (0) without a usable .info backup_size
-	RV_REJECT_OPENAES,       // OpenAES (removed from TWRP 3.7+) -> unsupported (probe detects it via the outer type)
+	RV_REJECT_OPENAES,       // OpenAES (removed from TWRP 3.7+) -> unsupported (probe detects it via the detection status)
 	RV_REJECT_UNKNOWN,       // unknown/corrupt format (no ustar / 'g' without tartype)
-	RV_WRONG_PASSWORD        // decrypt probe failed (not expected post-decrypt; defensive)
+	RV_WRONG_PASSWORD        // decrypt probe failed (BAES: wrong password or corrupt first chunk)
 };
 
 // BasePartition is used for overriding so we can run custom, device
