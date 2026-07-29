@@ -81,6 +81,22 @@ mkdirhier(char *path)
 	char src[MAXPATHLEN], dst[MAXPATHLEN] = "";
 	char *dirp, *nextp = src;
 	int retval = 1;
+	struct stat s;
+
+	/* Fast path: the whole hierarchy already exists -> ONE stat instead of one
+	 * mkdir(EEXIST) per path component. That is the NORMAL case on restore:
+	 * Directory-First-Processing creates every directory in the win000 lead
+	 * before a single file is extracted, so the component walk below would fire
+	 * ~8 pointless EEXIST-mkdirs per extracted file. mkdir() is not merely a
+	 * wasted syscall here -- it takes the PARENT directory's i_rwsem
+	 * EXCLUSIVELY before it even notices the entry exists, which serialises the
+	 * parallel pipe workers on their shared parent directories.
+	 * Returns 1 = "nothing created", identical to the walk's result when every
+	 * component already exists. A non-directory in the way falls through to the
+	 * walk, which then fails on mkdir with EEXIST-on-non-dir semantics as
+	 * before. */
+	if (stat(path, &s) == 0 && S_ISDIR(s.st_mode))
+		return 1;
 
 	if (strlcpy(src, path, sizeof(src)) > sizeof(src))
 	{
