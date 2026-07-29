@@ -18,6 +18,7 @@
 #include "stage_io.h"
 
 #include <errno.h>
+#include <fcntl.h>    /* posix_fadvise64 (rolling readahead source) */
 #include <unistd.h>
 
 /* Reads exactly `want` bytes unless a real EOF (read()==0) occurs. On a pipe,
@@ -37,6 +38,28 @@ ssize_t stage_io_fd_read_full(void* ctx, void* buf, size_t want) {
 		total += (size_t)r;
 	}
 	return (ssize_t)total;
+}
+
+/* Rolling-readahead source (ctx = StageIoFdRa*, see stage_io.h): a plain full
+ * read, then keep `window` bytes of async WILLNEED queued ahead of the read
+ * position. Re-arm gate 8 MB -> one posix_fadvise64 per ~8 MB read, not per
+ * read() call. The frontier starts wherever the caller pre-queued the initial
+ * window (RestorePipeline::setup), so the first re-arm fires after ~8 MB. */
+#define STAGE_IO_RA_REARM (8LL << 20)
+
+ssize_t stage_io_fd_ra_read_full(void* ctx, void* buf, size_t want) {
+	StageIoFdRa* ra = (StageIoFdRa*)ctx;
+	ssize_t got = stage_io_fd_read_full(&ra->fd, buf, want);
+	if (got > 0 && ra->window > 0) {
+		ra->pos += got;
+		if (ra->pos + ra->window >= ra->frontier + STAGE_IO_RA_REARM) {
+			long long target = ra->pos + ra->window;
+			posix_fadvise64(ra->fd, ra->frontier, target - ra->frontier,
+			                POSIX_FADV_WILLNEED);
+			ra->frontier = target;
+		}
+	}
+	return got;
 }
 
 /* Writes ALL n bytes. Returns 0 on success, -1 on a real error. EINTR- and

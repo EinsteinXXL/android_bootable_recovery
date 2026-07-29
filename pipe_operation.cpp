@@ -110,7 +110,8 @@ std::vector<int> PipeOperation::core_for(PipeStage s) const {
 // pipeline object itself spans the whole segment cycle (twrpTar::pipeline_). See
 // pipe_operation.hpp.
 int PipeOperation::spawn_aes_stage(int in, int out, bool decrypt,
-                                   StageRing* in_ring, StageRing* out_ring) {
+                                   StageRing* in_ring, StageRing* out_ring,
+                                   long long in_ra_window) {
 	StageThread* st = new (std::nothrow) StageThread();
 	if (!st) {
 		LOGERR("spawn_aes_stage: out of memory\n");
@@ -129,7 +130,18 @@ int PipeOperation::spawn_aes_stage(int in, int out, bool decrypt,
 	st->out_fd = out;
 	st->in_ring  = in_ring;                     // ring backing per side (fd arg is -1 then)
 	st->out_ring = out_ring;
-	st->in  = in_ring  ? stage_io_from_ring(in_ring)  : stage_io_from_fd(&st->in_fd);
+	// Restore source prefetch: a file-backed IN side (the .win segment) with a
+	// budget reads through the rolling-WILLNEED reader; the frontier starts at
+	// the initial window RestorePipeline::setup() already queued. Ring sides and
+	// budget-less fds keep the plain readers.
+	if (in_ra_window > 0 && !in_ring && in >= 0) {
+		st->in_ra.fd       = in;
+		st->in_ra.window   = in_ra_window;
+		st->in_ra.frontier = in_ra_window;
+		st->in = stage_io_from_fd_ra(&st->in_ra);
+	} else {
+		st->in = in_ring ? stage_io_from_ring(in_ring) : stage_io_from_fd(&st->in_fd);
+	}
 	st->out = out_ring ? stage_io_from_ring(out_ring) : stage_io_from_fd(&st->out_fd);
 	aes_stage_ = st;
 	if (stage_thread_start(st) != 0) {
@@ -145,7 +157,8 @@ int PipeOperation::spawn_aes_stage(int in, int out, bool decrypt,
 // pipe_operation.hpp. The StageThread is heap-owned by comp_stage_ until
 // join_stages() joins + frees it.
 int PipeOperation::spawn_zstd_stage(int in, int out, bool decompress,
-                                    StageRing* in_ring, StageRing* out_ring) {
+                                    StageRing* in_ring, StageRing* out_ring,
+                                    long long in_ra_window) {
 	StageThread* st = new (std::nothrow) StageThread();
 	if (!st) {
 		LOGERR("spawn_zstd_stage: out of memory\n");
@@ -177,7 +190,15 @@ int PipeOperation::spawn_zstd_stage(int in, int out, bool decompress,
 	st->out_fd = out;
 	st->in_ring  = in_ring;                      // ring backing per side (fd arg is -1 then)
 	st->out_ring = out_ring;
-	st->in  = in_ring  ? stage_io_from_ring(in_ring)  : stage_io_from_fd(&st->in_fd);
+	// Restore source prefetch: same wiring rule as spawn_aes_stage (see there).
+	if (in_ra_window > 0 && !in_ring && in >= 0) {
+		st->in_ra.fd       = in;
+		st->in_ra.window   = in_ra_window;
+		st->in_ra.frontier = in_ra_window;
+		st->in = stage_io_from_fd_ra(&st->in_ra);
+	} else {
+		st->in = in_ring ? stage_io_from_ring(in_ring) : stage_io_from_fd(&st->in_fd);
+	}
 	st->out = out_ring ? stage_io_from_ring(out_ring) : stage_io_from_fd(&st->out_fd);
 	comp_stage_ = st;
 	if (stage_thread_start(st) != 0) {
@@ -477,6 +498,20 @@ int RestorePipeline::setup() {
 	// .win segment or ADB FIFO) is a real fd. stage_count is always >= 1 here.
 	if (open_input() < 0)
 		return -1;
+	// Restore source prefetch (seekable .win segment only -- the ADB FIFO is
+	// not): SEQUENTIAL doubles the kernel readahead window, the initial WILLNEED
+	// queues the first `ra_budget` bytes async while the rings/stage threads are
+	// still being set up. The rolling re-arm runs in the file-adjacent stage's
+	// reader (stage_io_fd_ra, wired below with its frontier starting at this
+	// initial window). Knob: twrp.restore_prefetch via
+	// twrpTar::restore_prefetch_budget() (0 = off, WILLNEED skipped).
+	long long ra_budget = 0;
+	if (!tw_.part_settings->adbbackup) {
+		posix_fadvise64(tw_.input_fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+		ra_budget = tw_.restore_prefetch_budget();
+		if (ra_budget > 0)
+			posix_fadvise64(tw_.input_fd, 0, ra_budget, POSIX_FADV_WILLNEED);
+	}
 	tar_ring_ = StageRing::create(STAGE_RING_CAP);
 	if (tar_ring_ == nullptr)
 		return abort_setup("Error creating stage ring");
@@ -500,9 +535,12 @@ int RestorePipeline::setup() {
 		int in = in_is_ring ? -1 : tw_.input_fd;
 		StageRing* in_ring  = in_is_ring ? inter_ring_ : nullptr;
 		StageRing* out_ring = (j == stage_count - 1) ? tar_ring_ : inter_ring_;
+		// ra_budget reaches only the file-adjacent stage (j==0, in = input_fd);
+		// ring-backed IN sides get 0 (the spawn guard would ignore it anyway).
+		long long ra = in_is_ring ? 0 : ra_budget;
 		int rc = (kind == PipeStage::ZSTD)
-			? spawn_zstd_stage(in, -1, /*decompress=*/true, in_ring, out_ring)
-			: spawn_aes_stage (in, -1, /*decrypt=*/true,    in_ring, out_ring);
+			? spawn_zstd_stage(in, -1, /*decompress=*/true, in_ring, out_ring, ra)
+			: spawn_aes_stage (in, -1, /*decrypt=*/true,    in_ring, out_ring, ra);
 		if (rc < 0)
 			return abort_setup("pipeline stage setup failed");
 	}

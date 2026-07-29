@@ -188,6 +188,19 @@ typedef struct
 	off64_t input_trim_off;
 	off64_t input_since;
 
+	/* TWRP restore input read-ahead (RAW plain tar only): rolling WILLNEED
+	 * window kept queued ahead of the sequential .win read position, re-armed
+	 * by extract.c every ~8 MB read. input_ra_window = budget in bytes, set by
+	 * openTar() ONLY for the seekable plain-tar FILE restore (stays 0 for the
+	 * ADB FIFO and the engine modes -- those prefetch in the stage reader,
+	 * stage_io_fd_ra); input_ra_pos = cumulative content bytes read (heuristic
+	 * position, same approximation as input_since); input_ra_frontier =
+	 * absolute offset up to which WILLNEED is queued. Auto-0 via calloc in
+	 * tar_init. */
+	off64_t input_ra_window;
+	off64_t input_ra_pos;
+	off64_t input_ra_frontier;
+
 	/* fd ring (restore write side): do NOT close extracted fds immediately, keep
 	 * them in a ring -> when they fall out they are written back (clean) -> FADV
 	 * really drops (instead of fizzling at close because smallfiles are still dirty).

@@ -135,6 +135,12 @@ private:
 	int abort_pipeline(int timeout_secs);
 	string Strip_Root_Dir(string Path);
 	int openTar();
+	// Restore source prefetch: resolved twrp.restore_prefetch budget in bytes
+	// (rolling WILLNEED window ahead of the .win read position; 0 = off). Lazy,
+	// cached ONCE per worker (CLI: fixed default). Callers: RestorePipeline::
+	// setup (engine modes), the RAW plain-tar branch of openTar() and the
+	// next-segment warm-up in extractTarFork().
+	long long restore_prefetch_budget();
 	int Generate_TarList(string Path, std::vector<TarListStruct> *TarList);
 	static void* createList(void *cookie);
 	int tarList(std::vector<TarListStruct> *TarList, unsigned thread_id);
@@ -150,7 +156,7 @@ private:
 		// (input_fd/output_fd via open_output/open_input), tarfn (open/unlink), t
 		// (tar_fdopen), write_global_headers and the wiring params (password,
 		// aead_cipher_id, thread_id, verbose_log, current_archive_type, tardir,
-		// part_settings). Defined in pipe_operation.cpp.
+		// part_settings, restore_prefetch_budget). Defined in pipe_operation.cpp.
 		friend class PipeOperation;
 		friend class BackupPipeline;
 		friend class RestorePipeline;
@@ -187,6 +193,8 @@ private:
 	// TW_ADB_RESTORE FIFO). Also set for a plain-tar ADB restore, which has no
 	// pipeline at all; only the plain-tar FILE restore leaves it at -1.
 	int input_fd;
+	// Cache for restore_prefetch_budget(): -1 = unresolved, else bytes (0 = off).
+	long long restore_prefetch_budget_ = -1;
 	// Pipeline of the CURRENT segment: PipeOperation owns
 	// the stage threads + rings. Created per segment in createTar()/openTar()
 	// (engine modes only), consumed (finish/abort + reset) in finish_pipeline()/

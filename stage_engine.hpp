@@ -162,6 +162,11 @@ struct StageThread {
 	// they must live as long as the thread -> members, not spawner locals.
 	int         in_fd  = -1;
 	int         out_fd = -1;
+	// Rolling-readahead context for a file-backed IN side (restore source
+	// prefetch, stage_io.h). Wired by spawn_*_stage when it gets an in_ra_window
+	// budget: `in` then points at THIS member (stage_io_from_fd_ra) instead of
+	// &in_fd -- same lifetime rule as in_fd. window 0 = unused.
+	StageIoFdRa in_ra{};
 	// Ring backing per side (alternative to in_fd/out_fd; fd stays -1 then).
 	// NON-owning: the ring belongs to whoever owns this StageThread --
 	// PipeOperation::tar_ring_/inter_ring_ (freed by join_stages once BOTH stage

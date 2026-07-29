@@ -64,6 +64,34 @@ static inline StageIO stage_io_from_fd(int* fd_ptr) {
 	return io;
 }
 
+/* fd-backed source with a rolling POSIX_FADV_WILLNEED window (restore source
+ * prefetch). Wraps stage_io_fd_read_full and keeps `window` bytes of async
+ * readahead queued ahead of the sequential read position: every read advances
+ * `pos`; once pos+window outruns the queued `frontier` by >= 8 MB, the gap is
+ * re-armed in ONE fadvise call. Sequential reads only (the frontier assumes no
+ * seeks); a window past EOF is clamped by the kernel; the advise only QUEUES
+ * readahead -- correctness is untouched if it is ignored. window <= 0 behaves
+ * exactly like stage_io_fd_read_full. */
+typedef struct StageIoFdRa {
+	int       fd;        /* segment fd (owned by the caller, like fd_ptr above) */
+	long long window;    /* bytes to keep queued ahead of pos (<= 0 = plain read) */
+	long long pos;       /* cumulative bytes handed to the reader */
+	long long frontier;  /* absolute offset up to which WILLNEED is queued */
+} StageIoFdRa;
+
+ssize_t stage_io_fd_ra_read_full(void* ctx, void* buf, size_t want);
+
+/* Convenience constructor. ra must outlive the returned StageIO (stored as
+ * ctx). Source side only (write_all = NULL -- same pattern as the buffer
+ * source in stage_engine.hpp). */
+static inline StageIO stage_io_from_fd_ra(StageIoFdRa* ra) {
+	StageIO io;
+	io.read_full = stage_io_fd_ra_read_full;
+	io.write_all = 0;   /* source only */
+	io.ctx       = (void*)ra;
+	return io;
+}
+
 #ifdef __cplusplus
 }
 #endif

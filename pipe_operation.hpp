@@ -92,15 +92,21 @@ protected:
 	// = input_fd/output_fd) or a ring side (in_ring/out_ring, fd arg -1), picks the
 	// leaf loop from the archive type (LEGACY_COMPRESSED decompress -> zlib; else
 	// zstd) + reads level/nbWorkers for compress from DataManager, and starts it.
-	// Returns 0/-1 (on -1 nothing runs and comp_stage_ is cleared).
+	// in_ra_window > 0 on a file-backed IN side wires the rolling-readahead reader
+	// (restore source prefetch, stage_io_fd_ra) instead of the plain fd reader;
+	// ring-backed sides ignore it. Returns 0/-1 (on -1 nothing runs and
+	// comp_stage_ is cleared).
 	int  spawn_zstd_stage(int in, int out, bool decompress,
-	                      StageRing* in_ring = nullptr, StageRing* out_ring = nullptr);
+	                      StageRing* in_ring = nullptr, StageRing* out_ring = nullptr,
+	                      long long in_ra_window = 0);
 	// Start the AES stage as an in-process THREAD. Creates aes_stage_ (heap),
 	// wires its StageIO over the file end (in/out) or a ring side, copies password +
-	// aead_cipher_id + the AES core slice, and starts it. Ring/fd conventions as in
-	// spawn_zstd_stage. Returns 0/-1 (on -1 nothing runs and aes_stage_ is cleared).
+	// aead_cipher_id + the AES core slice, and starts it. Ring/fd/in_ra_window
+	// conventions as in spawn_zstd_stage. Returns 0/-1 (on -1 nothing runs and
+	// aes_stage_ is cleared).
 	int  spawn_aes_stage(int in, int out, bool decrypt,
-	                     StageRing* in_ring = nullptr, StageRing* out_ring = nullptr);
+	                     StageRing* in_ring = nullptr, StageRing* out_ring = nullptr,
+	                     long long in_ra_window = 0);
 
 	// Unified setup-error cleanup (only reachable while setup() runs): gui_err
 	// (err_key_), poison + join the stage threads/rings, then via friend close+

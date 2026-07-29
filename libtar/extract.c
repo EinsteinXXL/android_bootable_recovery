@@ -407,6 +407,22 @@ tar_extract_regfile(TAR *t, const char *realname, const int *progress_fd)
 			t->output_trim_cb(fdout, &out_trim);
 			since_trim = 0;
 		}
+		/* TWRP restore input read-ahead (RAW only: input_ra_window is set solely
+		 * when libtar itself reads the seekable .win, see libtar.h): keep the
+		 * WILLNEED window queued ahead of the (heuristic, counter-based) read
+		 * position. 8-MB re-arm gate -> one fadvise per ~8 MB read, not per
+		 * chunk; a window past EOF is clamped by the kernel. Together with the
+		 * DONTNEED trim below: warm ahead of the read head, cold behind it. */
+		if (t->input_ra_window > 0 && t->input_fd <= 0)
+		{
+			t->input_ra_pos += to_write;
+			if (t->input_ra_pos + t->input_ra_window >= t->input_ra_frontier + (8LL << 20))
+			{
+				off64_t ra_target = t->input_ra_pos + t->input_ra_window;
+				posix_fadvise64(t->fd, t->input_ra_frontier, ra_target - t->input_ra_frontier, POSIX_FADV_WILLNEED);
+				t->input_ra_frontier = ra_target;
+			}
+		}
 		/* Part 2: .win input trim, 128-MB-gated (symmetric to the backup
 		 * tar_append_regfile). The counter is cumulative over files (TAR struct) ->
 		 * covers smallfile streams too. RAW (input_fd<=0): the .win IS t->fd, the

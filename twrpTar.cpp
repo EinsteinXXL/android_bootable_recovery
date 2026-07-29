@@ -84,13 +84,20 @@ namespace {
 	// Array dimension for pipeline-related data structures. The real pipe count per
 	// backup/restore run comes from tw_affinity::compute_pipe_count().
 	constexpr int MAX_PIPELINES = tw_affinity::MAX_PIPELINES_HARDCAP;
-	// Source read-ahead window for tarList. Kernel readahead cannot cross file
-	// boundaries, so a stream of small files stalls on cold data pages. A budgeted
+	// Source read-ahead windows. Kernel readahead cannot cross file boundaries, so
+	// a stream of small files stalls on cold data pages. A budgeted
 	// POSIX_FADV_WILLNEED over the upcoming TarList entries warms them in advance.
 	// Cap per file: large files only need their head warmed, the rest is covered by
 	// the POSIX_FADV_SEQUENTIAL that tar_append_regfile sets (libtar/append.c).
-	constexpr long long PREFETCH_PER_FILE_CAP   = 4LL  << 20;  // 4 MB per file
-	constexpr long long PREFETCH_DEFAULT_BUDGET = 32LL << 20;  // 32 MB in-flight (0 = off)
+	// The cap is shared with the RESTORE side, where it sizes the next-segment
+	// head warm-up in extractTarFork(). The budgets are separate: backup feeds
+	// tarList (twrp.tar_prefetch), restore the rolling WILLNEED window ahead of
+	// the .win read position (twrp.restore_prefetch). Restore uses the smaller
+	// window -- it reads against the concurrent write stream, and every active
+	// pipe holds its own budget in page cache.
+	constexpr long long PREFETCH_PER_FILE_CAP           = 4LL  << 20;  // 4 MB per file (both paths)
+	constexpr long long BACKUP_PREFETCH_DEFAULT_BUDGET  = 32LL << 20;  // 32 MB in-flight (0 = off)
+	constexpr long long RESTORE_PREFETCH_DEFAULT_BUDGET = 16LL << 20;  // 16 MB in-flight (0 = off)
 	// Stage-join budget for the backup segment close (closeTar). Deliberately not
 	// blocking: if a stage ever wedged — e.g. an ADB reader that stopped draining
 	// the data FIFO, leaving the last stage stuck in write() — the worker would
@@ -1328,6 +1335,39 @@ int twrpTar::createTarFork(std::atomic<pid_t> *tar_fork_pid) {
 	return 0;
 }
 
+// Resolve the restore source-prefetch budget ONCE per worker (lazy, cached in
+// restore_prefetch_budget_). Runtime knob: twrp.restore_prefetch = off|0 |
+// <MB ahead>, default 16 MB — the restore mirror of twrp.tar_prefetch
+// (tarList, default 32 MB). CLI (BUILD_TWRPTAR_MAIN): no property read -> fixed
+// default. The budget is the rolling WILLNEED window kept queued ahead of the
+// sequential .win read position (engine modes: stage_io_fd_ra reader wired in
+// RestorePipeline::setup; RAW plain tar: extract.c re-arms via the TAR
+// input_ra fields) and gates the next-segment head warm-up in the
+// extractTarFork() multi-archive loop.
+long long twrpTar::restore_prefetch_budget() {
+	if (restore_prefetch_budget_ >= 0)
+		return restore_prefetch_budget_;
+	long long budget = RESTORE_PREFETCH_DEFAULT_BUDGET;
+#ifndef BUILD_TWRPTAR_MAIN
+	{
+		char pfp[PROPERTY_VALUE_MAX] = {0};
+		property_get("twrp.restore_prefetch", pfp, "");
+		if (pfp[0]) {
+			if (strcasecmp(pfp, "off") == 0) {
+				budget = 0;
+			} else {
+				long v = atol(pfp);
+				budget = (v <= 0) ? 0 : ((long long)v << 20);   // MB -> bytes
+			}
+		}
+	}
+#endif
+	restore_prefetch_budget_ = budget;
+	if (budget > 0)
+		LOGINFO("restore source prefetch window %lld MB\n", budget >> 20);
+	return budget;
+}
+
 // Multi-pipe extractTarFork() — mirror of createTarFork().
 //
 // Flow:
@@ -1707,6 +1747,21 @@ int twrpTar::extractTarFork() {
 			tarfn = segments[idx];
 			claimed++;
 
+			// Restore source prefetch, next-segment warm-up (the tarList
+			// analogue): queue async readahead for the HEAD of the next segment
+			// while THIS one is processed. The page cache is process-wide, so
+			// whichever pipe claims it later starts on warm pages instead of a
+			// cold open. Best-effort like tarlist_prefetch_ahead: an open
+			// failure just skips (the claiming pipe's real open decides); the
+			// WILLNEED only QUEUES readahead and returns.
+			if (restore_prefetch_budget() > 0 && idx + 1 < n_segments) {
+				int nfd = open(segments[idx + 1].c_str(), O_RDONLY | O_CLOEXEC);
+				if (nfd >= 0) {
+					posix_fadvise64(nfd, 0, PREFETCH_PER_FILE_CAP, POSIX_FADV_WILLNEED);
+					close(nfd);
+				}
+			}
+
 			// extractTar() internally calls openTar() (which starts the stage
 			// threads) and tar_close(). closeTar() must NOT be called here
 			// (tar_append_eof() fails on RDONLY). closeTarRestore() only joins the
@@ -2053,7 +2108,7 @@ int twrpTar::tarList(std::vector<TarListStruct> *TarList, unsigned thread_id) {
 	// twrp.tar_prefetch = off|0 | <MB ahead>, default 32 MB. CLI
 	// (BUILD_TWRPTAR_MAIN): no property read -> fixed default (same pattern as
 	// twrp.force_aead above).
-	long long pf_budget = PREFETCH_DEFAULT_BUDGET;
+	long long pf_budget = BACKUP_PREFETCH_DEFAULT_BUDGET;
 #ifndef BUILD_TWRPTAR_MAIN
 	{
 		char pfp[PROPERTY_VALUE_MAX] = {0};
@@ -2435,6 +2490,22 @@ int twrpTar::openTar() {
 				LOGERR("Unable to open tar archive '%s'\n", charTarFile);
 				gui_err("restore_error=Error during restore process.");
 				return -1;
+			}
+			// Restore source prefetch (RAW plain tar, seekable .win file):
+			// SEQUENTIAL doubles the kernel readahead window; the rolling
+			// WILLNEED window is re-armed inside libtar (extract.c via the TAR
+			// input_ra fields) because libtar reads the .win itself here. The
+			// engine modes (5-7) wire this in RestorePipeline::setup instead;
+			// the ADB FIFO branch above is not seekable -> no prefetch (the
+			// input_ra fields stay 0 from tar_init's calloc).
+			posix_fadvise64(t->fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+			{
+				long long ra_budget = restore_prefetch_budget();
+				if (ra_budget > 0) {
+					posix_fadvise64(t->fd, 0, ra_budget, POSIX_FADV_WILLNEED);
+					t->input_ra_window   = ra_budget;
+					t->input_ra_frontier = ra_budget;
+				}
 			}
 		}
 		return 0;
