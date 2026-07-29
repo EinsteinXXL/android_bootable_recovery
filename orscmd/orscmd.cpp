@@ -149,16 +149,29 @@ int main(int argc, char **argv) {
 	read_fd = open(ORS_OUTPUT_FILE, O_RDONLY);
 	if (read_fd < 0) {
 		printf("Unable to open %s for read.\n", ORS_OUTPUT_FILE);
+		close(write_fd);
 		return -1;
 	}
-	memset(&result, 0, sizeof(result));
-	while (read(read_fd, &result, sizeof(result)) > 0) {
-		result[510] = '\n';
-		result[511] = '\0';
-		printf("%s", result);
-		memset(&result, 0, sizeof(result));
+	// Read line by line, not in fixed blocks: fgets stops at the newline, so the
+	// recovery's status line always begins a fresh read and can never be split
+	// across two buffers. Everything else is passed through unchanged.
+	FILE* out = fdopen(read_fd, "r");
+	if (out == NULL) {
+		printf("Unable to read %s.\n", ORS_OUTPUT_FILE);
+		close(read_fd);
+		close(write_fd);
+		return -1;
 	}
+	int exit_code = 0;
+	const size_t prefix_len = strlen(ORS_RESULT_PREFIX);
+	while (fgets(result, sizeof(result), out) != NULL) {
+		if (strncmp(result, ORS_RESULT_PREFIX, prefix_len) == 0) {
+			exit_code = atoi(result + prefix_len);   // consumed as the exit status, never printed
+			continue;
+		}
+		printf("%s", result);
+	}
+	fclose(out);   // closes read_fd
 	close(write_fd);
-	close(read_fd);
-	return 0;
+	return exit_code;
 }

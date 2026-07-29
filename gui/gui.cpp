@@ -546,9 +546,13 @@ static void setup_ors_command()
 }
 
 // callback called after a CLI command was executed
-static void ors_command_done()
+static void ors_command_done(int status)
 {
 	gui_set_FILE(NULL);
+	// Machine-readable status as the LAST line into the FIFO, written after the
+	// mirror is detached so it never shows up in the GUI console. The twrp binary
+	// strips this line from its own output and exits with the value.
+	fprintf(orsout, "%s%d\n", ORS_RESULT_PREFIX, status);
 	fclose(orsout);
 	orsout = NULL;
 
@@ -582,20 +586,21 @@ static void ors_command_read()
 		}
 		if (DataManager::GetIntValue("tw_busy") != 0) {
 			fputs("Failed, operation in progress\n", orsout);
+			fprintf(orsout, "%s%d\n", ORS_RESULT_PREFIX, 1);   // rejected -> the caller must see a failure
 			LOGINFO("Command cannot be performed, operation in progress.\n");
 			fclose(orsout);
 		} else {
 			if (strlen(command) == 11 && strncmp(command, "dumpstrings", 11) == 0) {
 				gui_set_FILE(orsout);
 				PageManager::GetResources()->DumpStrings();
-				ors_command_done();
+				ors_command_done(0);
 			} else if (strlen(command) == 11 && strncmp(command, "reloadtheme", 11) == 0) {
 				PageManager::RequestReload();
-				ors_command_done();
+				ors_command_done(0);
 			} else if (strlen(command) > 11 && strncmp(command, "changepage=", 11) == 0) {
 				char* pg = &command[11];
 				gui_changePage(pg);
-				ors_command_done();
+				ors_command_done(0);
 			} else {
 				// mirror output messages
 				gui_set_FILE(orsout);

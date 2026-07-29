@@ -58,7 +58,7 @@ extern "C" {
 	#include "cutils/properties.h"
 }
 
-OpenRecoveryScript::VoidFunction OpenRecoveryScript::call_after_cli_command;
+OpenRecoveryScript::StatusFunction OpenRecoveryScript::call_after_cli_command;
 
 #define SCRIPT_COMMAND_SIZE 512
 
@@ -850,7 +850,14 @@ int OpenRecoveryScript::Run_OpenRecoveryScript_Action() {
 }
 
 // this is called by the "twcmd" GUI action when a command is received via FIFO from the "twrp" command line tool
-void OpenRecoveryScript::Run_CLI_Command(const char* command) {
+// Returns the command status (0 = success, non-zero = failure). The status
+// reaches the twrp binary as the last line of the ORS output FIFO, written by
+// the GUI callback because the FIFO handle lives there. Mind the mixed contracts
+// of the helpers below: run_script_file() is exit-code-like (0 = every command
+// succeeded), copy_script_file() and Insert_ORS_Command() are bool-like
+// (1 = success).
+int OpenRecoveryScript::Run_CLI_Command(const char* command) {
+	int ret = 0;
 	string tmp = command;
 	std::vector<string> parts =
 		TWFunc::Split_String(tmp, " ");  // pats[0] is cmd, parts[1...] is args
@@ -861,11 +868,13 @@ void OpenRecoveryScript::Run_CLI_Command(const char* command) {
 			string filename = parts[1];
 			if (OpenRecoveryScript::copy_script_file(filename) == 0) {
 				LOGINFO("Unable to copy script file\n");
+				ret = 1;
 			} else {
-				OpenRecoveryScript::run_script_file();
+				ret = OpenRecoveryScript::run_script_file();
 			}
 		} else {
 			LOGINFO("Missing parameter: script file name\n");
+			ret = 1;
 		}
 	} else if (cmd_str == "get") {
 		if (parts.size() > 1) {
@@ -875,11 +884,13 @@ void OpenRecoveryScript::Run_CLI_Command(const char* command) {
 			gui_print("%s = %s\n", varname.c_str(), value.c_str());
 		} else {
 			LOGINFO("Missing parameter: var name\n");
+			ret = 1;
 		}
 	} else if (cmd_str == "decrypt") {
 		// twrp cmd cannot decrypt a password with space, should decrypt on gui
 		if (parts.size() == 1) {
 			gui_err("no_pwd=No password provided.");
+			ret = 1;
 		} else {
 			string pass = parts[1];
 			string userid = "0";
@@ -891,17 +902,26 @@ void OpenRecoveryScript::Run_CLI_Command(const char* command) {
 				// set_page_done = 1;  // done by singleaction_page anyway
 				std::string orsFile = TWFunc::get_log_dir() + "/openrecoveryscript";
 				if (TWFunc::Path_Exists(orsFile)) {
+					// The status stays that of the decrypt: this helper starts at
+					// op_status = 1 and only clears it when one of ITS OWN script
+					// paths ran, which are not the file probed above — folding it in
+					// would report a failure for a successful decrypt.
 					Run_OpenRecoveryScript_Action();
 				}
+			} else {
+				ret = 1;
 			}
 		}
 	} else if (OpenRecoveryScript::Insert_ORS_Command(command)) {
-		OpenRecoveryScript::run_script_file();
+		ret = OpenRecoveryScript::run_script_file();
+	} else {
+		ret = 1;   // the command could not even be appended to the script file
 	}
 
 	// let the GUI close the output fd and restart the command listener
-	call_after_cli_command();
+	call_after_cli_command(ret);
 	LOGINFO("Done reading ORS command from command line\n");
+	return ret;
 }
 
 int OpenRecoveryScript::remountrw(void)

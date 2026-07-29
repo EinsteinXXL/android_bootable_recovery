@@ -19,4 +19,11 @@
 #define ORS_INPUT_FILE "/system/bin/orsin"
 #define ORS_OUTPUT_FILE "/system/bin/orsout"
 
+// Status line the recovery writes into ORS_OUTPUT_FILE as the LAST line before
+// closing it: "<prefix><decimal status>\n", 0 = success. The twrp binary
+// consumes that line, keeps it out of its own output and exits with the value.
+// Shared by both sides of the FIFO, so the wire format has one definition.
+// A missing line means no status was reported -> the binary exits 0.
+#define ORS_RESULT_PREFIX "TWRP_ORS_RESULT:"
+
 #endif //__ORSCMD_H

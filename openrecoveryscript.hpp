@@ -25,8 +25,8 @@ using namespace std;
 
 class OpenRecoveryScript
 {
-	typedef void (*VoidFunction)();
-	static VoidFunction call_after_cli_command;                                    // callback to GUI after Run_CLI_Command
+	typedef void (*StatusFunction)(int);
+	static StatusFunction call_after_cli_command;                                  // callback to GUI after Run_CLI_Command; receives the command status (0 = success)
 
 	static int check_for_script_file();                                            // Checks to see if the ORS file is present in /cache
 	static int copy_script_file(string filename);                                  // Copies a script file to the temp folder
@@ -38,8 +38,8 @@ public:
 	static int Insert_ORS_Command(string Command);                                 // Inserts the Command into the SCRIPT_FILE_TMP file
 	static void Run_OpenRecoveryScript();                                          // Starts the GUI Page for running OpenRecoveryScript
 	static int Run_OpenRecoveryScript_Action();                                    // Actually runs the ORS scripts for the GUI action
-	static void Call_After_CLI_Command(VoidFunction fn) { call_after_cli_command = fn; }
-	static void Run_CLI_Command(const char* command);                              // Runs a command for orscmd (twrp binary)
+	static void Call_After_CLI_Command(StatusFunction fn) { call_after_cli_command = fn; }
+	static int Run_CLI_Command(const char* command);                               // Runs a command for orscmd (twrp binary); returns 0 = success, non-zero = failure
 	static int remountrw();                                                        // Remount system and vendor rw
 };
 

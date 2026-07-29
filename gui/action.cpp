@@ -1892,11 +1892,12 @@ int GUIAction::flashimage(std::string arg __unused)
 int GUIAction::twcmd(std::string arg)
 {
 	operation_start("TWRP CLI Command");
+	int op_status = 0;
 	if (simulate)
 		simulate_progress_bar();
-	else
-		OpenRecoveryScript::Run_CLI_Command(arg.c_str());
-	operation_end(0);
+	else if (OpenRecoveryScript::Run_CLI_Command(arg.c_str()) != 0)
+		op_status = 1;
+	operation_end(op_status);
 	return 0;
 }
 
