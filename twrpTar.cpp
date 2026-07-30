@@ -1497,7 +1497,6 @@ int twrpTar::extractTarFork() {
 			pipe_count = 1;
 			LOGINFO("extractTarFork: legacy backup (%s), %d archive(s) -> single-pipe restore\n",
 			        current_archive_type == LEGACY_COMPRESSED ? "gzip" : "plain tar", legacy_count);
-			gui_msg(Msg(msg::kHighlight, "restore_legacy_detected=Legacy backup detected! Restoring in single pipe mode."));
 		} else {
 			segments = discover_segments(basefn_local);
 			int n_seg = (int)segments.size();
@@ -1567,6 +1566,15 @@ int twrpTar::extractTarFork() {
 		}
 		Set_Archive_Type(at);
 	}
+
+	// Legacy notice ONCE in the parent, after both detection branches have fixed
+	// the type: it holds for a multi-segment set and for a single unsplit archive
+	// alike -- with one archive a single pipe is trivially given. adbbackup is
+	// excluded because there the type is set in the child (extract()), so here it
+	// still carries the pre-detection sentinel LEGACY_UNCOMPRESSED and would fire
+	// a false notice on every adb restore.
+	if (!part_settings->adbbackup && TWFunc::is_legacy_type(current_archive_type))
+		gui_msg(Msg(msg::kHighlight, "restore_legacy_detected=Legacy backup detected! Restoring in single pipe mode."));
 
 	// AES banner ONCE in the parent before the fork loop (like the backup
 	// createTarFork). In the child each of the N pipe children would fire it ->
